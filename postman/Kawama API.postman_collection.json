@@ -1,0 +1,194 @@
+{
+  "info": {
+    "name": "Kawama API",
+    "description": "Local API checks for the Kawama storefront and owner administration. Run Admin Login first; its test script stores the JWT in the collection automatically.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{adminToken}}", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "adminLogin", "value": "kawamagh.gmail.com" },
+    { "key": "adminPassword", "value": "" },
+    { "key": "adminToken", "value": "" },
+    { "key": "categoryId", "value": "" },
+    { "key": "productId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "System and authentication",
+      "item": [
+        {
+          "name": "Database readiness",
+          "auth": { "type": "noauth" },
+          "request": { "method": "GET", "url": "{{baseUrl}}/health/ready" }
+        },
+        {
+          "name": "Admin Login",
+          "auth": { "type": "noauth" },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Login succeeds', () => pm.response.to.have.status(200));",
+                  "const payload = pm.response.json();",
+                  "if (payload.data?.token) pm.collectionVariables.set('adminToken', payload.data.token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{adminLogin}}\",\n  \"password\": \"{{adminPassword}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/admin/login"
+          }
+        },
+        {
+          "name": "OpenAPI contract",
+          "auth": { "type": "noauth" },
+          "request": { "method": "GET", "url": "{{baseUrl}}/openapi.json" }
+        }
+      ]
+    },
+    {
+      "name": "Public storefront",
+      "auth": { "type": "noauth" },
+      "item": [
+        {
+          "name": "List active categories",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/product/categories" }
+        },
+        {
+          "name": "List active products",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/product?page=1&limit=24" }
+        }
+      ]
+    },
+    {
+      "name": "Admin categories",
+      "item": [
+        {
+          "name": "List categories",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/categories" }
+        },
+        {
+          "name": "Create test category",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Category created', () => pm.response.to.have.status(201));",
+                  "const payload = pm.response.json();",
+                  "if (payload.data?.id) pm.collectionVariables.set('categoryId', payload.data.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Postman Test Category\",\n  \"slug\": \"postman-test-category\",\n  \"description\": \"A temporary category created from Postman.\",\n  \"displayOrder\": 99\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/admin/categories"
+          }
+        },
+        {
+          "name": "Update test category",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"description\": \"Updated from Postman.\"\n}" },
+            "url": "{{baseUrl}}/api/v1/admin/categories/{{categoryId}}"
+          }
+        },
+        {
+          "name": "Archive test category",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/v1/admin/categories/{{categoryId}}" }
+        },
+        {
+          "name": "Restore test category",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/v1/admin/categories/{{categoryId}}/restore" }
+        }
+      ]
+    },
+    {
+      "name": "Admin products",
+      "item": [
+        {
+          "name": "List products",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/products?page=1&limit=24" }
+        },
+        {
+          "name": "Create draft product",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Product created', () => pm.response.to.have.status(201));",
+                  "const payload = pm.response.json();",
+                  "if (payload.data?.id) pm.collectionVariables.set('productId', payload.data.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"slug\": \"postman-test-product\",\n  \"name\": \"Postman Test Product\",\n  \"categoryId\": \"{{categoryId}}\",\n  \"price\": 125.5,\n  \"stockQuantity\": 5,\n  \"status\": \"draft\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/admin/products"
+          }
+        },
+        {
+          "name": "Get product",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/products/{{productId}}" }
+        },
+        {
+          "name": "Update product",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"stockQuantity\": 10,\n  \"featured\": true\n}" },
+            "url": "{{baseUrl}}/api/v1/admin/products/{{productId}}"
+          }
+        },
+        {
+          "name": "Archive product",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/v1/admin/products/{{productId}}" }
+        },
+        {
+          "name": "Restore product as draft",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/v1/admin/products/{{productId}}/restore" }
+        }
+      ]
+    },
+    {
+      "name": "Admin reviews and uploads",
+      "item": [
+        {
+          "name": "List pending reviews",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/reviews?status=pending&page=1&limit=24" }
+        },
+        {
+          "name": "Create Cloudinary upload signature",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/v1/admin/uploads/signature" }
+        }
+      ]
+    }
+  ]
+}
