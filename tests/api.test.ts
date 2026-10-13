@@ -107,6 +107,25 @@ describe('Kawama API', () => {
     expect(simplifiedRoute.body.data[0].slug).toBe('ceramic-pan');
   });
 
+  it('allows public storefront requests from any browser origin while protecting admin routes', async () => {
+    const storefrontOrigin = 'https://storefront.example.com';
+    const categories = await request(app).get('/api/v1/categories').set('origin', storefrontOrigin);
+    expect(categories.status).toBe(200);
+    expect(categories.headers['access-control-allow-origin']).toBe(storefrontOrigin);
+
+    const reviewPreflight = await request(app)
+      .options('/api/v1/products/example-product/reviews')
+      .set('origin', storefrontOrigin)
+      .set('access-control-request-method', 'POST')
+      .set('access-control-request-headers', 'content-type');
+    expect(reviewPreflight.status).toBe(204);
+    expect(reviewPreflight.headers['access-control-allow-origin']).toBe(storefrontOrigin);
+
+    const admin = await request(app).get('/api/v1/admin/products').set('origin', storefrontOrigin);
+    expect(admin.status).toBe(403);
+    expect(admin.body.error.code).toBe('CORS_ORIGIN_DENIED');
+  });
+
   it('queues reviews until an administrator approves them', async () => {
     const selectedProduct = await product();
     const submitted = await request(app)

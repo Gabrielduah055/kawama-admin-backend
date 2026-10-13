@@ -1,5 +1,5 @@
-import cors from 'cors';
-import express from 'express';
+import cors, { type CorsOptions, type CorsOptionsDelegate } from 'cors';
+import express, { type Request } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { getEnvironment } from './config/environment.js';
@@ -21,12 +21,39 @@ export interface ApplicationDependencies {
   mediaService?: MediaService;
 }
 
+const corsOptions: Omit<CorsOptions, 'origin'> = {
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Request-Id'],
+  maxAge: 86_400,
+};
+
+function isPublicStorefrontRequest(request: Request): boolean {
+  const method = request.method === 'OPTIONS'
+    ? request.header('access-control-request-method')?.toUpperCase() ?? request.method
+    : request.method;
+  const { path } = request;
+  if (method === 'GET' && (path === '/' || path.startsWith('/health/') || path === '/openapi.json')) return true;
+  if (method === 'GET' && (path === '/api/product' || path.startsWith('/api/product/'))) return true;
+  if (method === 'GET' && (path === '/api/v1/categories' || path === '/api/v1/products' || path.startsWith('/api/v1/products/'))) return true;
+  return method === 'POST' && /^\/api\/v1\/products\/[^/]+\/reviews$/.test(path);
+}
+
 export function createApp(dependencies: ApplicationDependencies = {}) {
   const environment = getEnvironment();
   const app = express();
   const allowedOrigins = new Set(
     environment.FRONTEND_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean),
   );
+  const corsDelegate: CorsOptionsDelegate<Request> = (request, callback) => {
+    const publicStorefrontRequest = isPublicStorefrontRequest(request);
+    callback(null, {
+      ...corsOptions,
+      origin(origin, originCallback) {
+        if (publicStorefrontRequest || !origin || allowedOrigins.has(origin)) originCallback(null, true);
+        else originCallback(new AppError(403, 'CORS_ORIGIN_DENIED', 'This origin is not allowed to call the API.'));
+      },
+    });
+  };
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.use(requestContext);
@@ -34,17 +61,7 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
     contentSecurityPolicy: false,
     ...(environment.NODE_ENV === 'production' ? {} : { strictTransportSecurity: false }),
   }));
-  app.use(
-    cors({
-      origin(origin, callback) {
-        if (!origin || allowedOrigins.has(origin)) callback(null, true);
-        else callback(new AppError(403, 'CORS_ORIGIN_DENIED', 'This origin is not allowed to call the API.'));
-      },
-      methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Authorization', 'Content-Type', 'X-Request-Id'],
-      maxAge: 86_400,
-    }),
-  );
+  app.use(cors(corsDelegate));
   app.use(express.json({ limit: '1mb' }));
   app.use(
     rateLimit({
