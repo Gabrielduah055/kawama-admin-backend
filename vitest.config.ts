@@ -14,6 +14,7 @@ export default defineConfig({
       NODE_ENV: 'test',
       LOG_LEVEL: 'silent',
       CLOUDINARY_FOLDER: 'kawama',
+      SEED_ASSET_BASE_URL: 'https://raw.githubusercontent.com/Gabrielduah055/Kawama/9306e51587963f5f4616eab6db7c49d1e4df0ea0/public/images',
       JWT_SECRET: 'test-only-jwt-secret-at-least-32-characters',
       JWT_EXPIRES_IN: '43200',
     },

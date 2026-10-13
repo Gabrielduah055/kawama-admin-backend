@@ -10,7 +10,9 @@ import { cloudinaryMediaService } from '../services/cloudinary.service.js';
 import { seedCategories, seedProducts, seedReviews } from '../data/seed-data.js';
 
 const dryRun = process.argv.includes('--dry-run');
-const assetDirectory = path.resolve(process.cwd(), getEnvironment().SEED_ASSET_DIR);
+const environment = getEnvironment();
+const assetDirectory = path.resolve(process.cwd(), environment.SEED_ASSET_DIR);
+const seedAssetBaseUrl = environment.SEED_ASSET_BASE_URL?.replace(/\/$/, '');
 
 async function assetPath(filename: string): Promise<string> {
   const resolved = path.join(assetDirectory, filename);
@@ -19,7 +21,10 @@ async function assetPath(filename: string): Promise<string> {
 }
 
 async function uploadImage(filename: string, publicId: string, alt: string, position = 0) {
-  const uploaded = await cloudinaryMediaService.uploadFile(await assetPath(filename), publicId);
+  const localPath = await assetPath(filename);
+  const uploaded = seedAssetBaseUrl
+    ? { src: `${seedAssetBaseUrl}/${encodeURIComponent(filename)}` }
+    : await cloudinaryMediaService.uploadFile(localPath, publicId);
   return { ...uploaded, alt, position };
 }
 

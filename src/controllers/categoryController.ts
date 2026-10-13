@@ -1,7 +1,7 @@
 import type { RequestHandler } from 'express';
 import { z } from 'zod';
-import { getEnvironment } from '../config/environment.js';
 import { AppError } from '../errors/AppError.js';
+import { isManagedMedia } from '../lib/media.js';
 import { CategoryModel } from '../models/CategorySchema.js';
 import { ProductModel } from '../models/ProductSchema.js';
 import { categoryCreateSchema, categoryUpdateSchema, objectIdSchema } from '../validation/schemas.js';
@@ -25,11 +25,10 @@ function categoryDto(category: Record<string, any>) {
   };
 }
 
-function assertManagedImage(image?: { publicId?: string | undefined }): void {
+function assertManagedImage(image?: { publicId?: string | undefined; src: string }): void {
   if (!image) return;
-  const prefix = `${getEnvironment().CLOUDINARY_FOLDER}/`;
-  if (!image.publicId?.startsWith(prefix)) {
-    throw new AppError(400, 'INVALID_MEDIA_ASSET', 'The category image must be uploaded to the Kawama Cloudinary folder.');
+  if (!isManagedMedia(image)) {
+    throw new AppError(400, 'INVALID_MEDIA_ASSET', 'The category image must be a Kawama-managed media asset.');
   }
 }
 
