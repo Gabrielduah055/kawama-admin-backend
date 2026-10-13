@@ -17,6 +17,7 @@ const environmentSchema = z.object({
   CLOUDINARY_API_SECRET: z.string().trim().optional(),
   CLOUDINARY_FOLDER: z.string().trim().regex(/^[a-zA-Z0-9_-]+$/).default('kawama'),
   SEED_ASSET_DIR: z.string().trim().default('../kawama/public/images'),
+  SEED_ASSET_BASE_URL: z.string().trim().url().optional(),
 });
 
 export type Environment = z.infer<typeof environmentSchema>;

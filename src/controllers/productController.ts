@@ -1,16 +1,15 @@
 import type { RequestHandler } from 'express';
-import { getEnvironment } from '../config/environment.js';
 import { AppError } from '../errors/AppError.js';
 import { escapeRegex, fromPesewas, toAdminProduct, toPublicProduct } from '../lib/catalog.js';
+import { isManagedMedia } from '../lib/media.js';
 import { CategoryModel } from '../models/CategorySchema.js';
 import { ProductModel } from '../models/ProductSchema.js';
 import { assertCategories, loadPopulatedProduct, toProductPersistence } from '../services/product.service.js';
 import { objectIdSchema, paginationSchema, productCreateSchema, productUpdateSchema } from '../validation/schemas.js';
 
-function assertManagedImages(images: Array<{ publicId?: string | undefined }>): void {
-  const prefix = `${getEnvironment().CLOUDINARY_FOLDER}/`;
-  if (images.some((image) => !image.publicId?.startsWith(prefix))) {
-    throw new AppError(400, 'INVALID_MEDIA_ASSET', 'Product images must be uploaded to the Kawama Cloudinary folder.');
+function assertManagedImages(images: Array<{ publicId?: string | undefined; src: string }>): void {
+  if (images.some((image) => !isManagedMedia(image))) {
+    throw new AppError(400, 'INVALID_MEDIA_ASSET', 'Product images must be Kawama-managed media assets.');
   }
 }
 

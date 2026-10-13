@@ -234,6 +234,36 @@ describe('Kawama API', () => {
     expect(restored.body.data.slug).toBe('glass-bowl');
   });
 
+  it('accepts immutable bundled storefront images without treating them as Cloudinary uploads', async () => {
+    const selectedCategory = await category();
+    const src = 'https://raw.githubusercontent.com/Gabrielduah055/Kawama/9306e51587963f5f4616eab6db7c49d1e4df0ea0/public/images/product-mixing-bowls.webp';
+    const created = await request(app)
+      .post('/api/v1/admin/products')
+      .set('authorization', 'Bearer owner')
+      .send({
+        slug: 'mixing-bowls',
+        name: 'Mixing Bowls',
+        categoryId: String(selectedCategory._id),
+        shortDescription: 'A useful set of mixing bowls.',
+        description: 'A useful set of mixing bowls for everyday preparation.',
+        price: 245,
+        images: [{ src, alt: 'Four sea-green ceramic mixing bowls', position: 0 }],
+        stockQuantity: 8,
+        status: 'active',
+      });
+
+    expect(created.status).toBe(201);
+    expect(created.body.data.images[0]).toMatchObject({ src });
+    expect(created.body.data.images[0].publicId).toBeUndefined();
+
+    const updated = await request(app)
+      .patch(`/api/v1/admin/products/${created.body.data.id}`)
+      .set('authorization', 'Bearer owner')
+      .send({ price: 250 });
+    expect(updated.status).toBe(200);
+    expect(updated.body.data.price).toBe(250);
+  });
+
   it('prevents archival of a category still used by a non-archived product', async () => {
     const selectedProduct = await product();
     const response = await request(app)
