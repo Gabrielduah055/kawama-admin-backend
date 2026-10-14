@@ -9,9 +9,13 @@ import { createApp } from '../src/app.js';
 import { AppError } from '../src/errors/AppError.js';
 import { AdminModel } from '../src/models/AdminSchema.js';
 import { CategoryModel } from '../src/models/CategorySchema.js';
+import { CustomerModel } from '../src/models/CustomerSchema.js';
+import { OrderModel } from '../src/models/OrderSchema.js';
 import { ProductModel } from '../src/models/ProductSchema.js';
 import { ReviewModel } from '../src/models/ReviewSchema.js';
 import type { MediaService } from '../src/services/cloudinary.service.js';
+import { buildPendingOrderDraft } from '../src/services/order.service.js';
+import { checkoutCreateSchema } from '../src/validation/schemas.js';
 
 let mongo: MongoMemoryServer | undefined;
 let mongoDataDirectory: string | undefined;
@@ -59,11 +63,25 @@ beforeAll(async () => {
   mongoDataDirectory = await mkdtemp(path.join(cacheRoot, 'kawama-mongo-'));
   mongo = await MongoMemoryServer.create({ instance: { dbPath: mongoDataDirectory, launchTimeout: 30_000 } });
   await mongoose.connect(mongo.getUri());
-  await Promise.all([AdminModel.syncIndexes(), CategoryModel.syncIndexes(), ProductModel.syncIndexes(), ReviewModel.syncIndexes()]);
+  await Promise.all([
+    AdminModel.syncIndexes(),
+    CategoryModel.syncIndexes(),
+    CustomerModel.syncIndexes(),
+    OrderModel.syncIndexes(),
+    ProductModel.syncIndexes(),
+    ReviewModel.syncIndexes(),
+  ]);
 });
 
 beforeEach(async () => {
-  await Promise.all([AdminModel.deleteMany({}), CategoryModel.deleteMany({}), ProductModel.deleteMany({}), ReviewModel.deleteMany({})]);
+  await Promise.all([
+    AdminModel.deleteMany({}),
+    CategoryModel.deleteMany({}),
+    CustomerModel.deleteMany({}),
+    OrderModel.deleteMany({}),
+    ProductModel.deleteMany({}),
+    ReviewModel.deleteMany({}),
+  ]);
 });
 
 afterAll(async () => {
@@ -124,6 +142,73 @@ describe('Kawama API', () => {
     const admin = await request(app).get('/api/v1/admin/products').set('origin', storefrontOrigin);
     expect(admin.status).toBe(403);
     expect(admin.body.error.code).toBe('CORS_ORIGIN_DENIED');
+  });
+
+  it('builds and persists an authoritative pending order snapshot', async () => {
+    const selectedProduct = await product({ pricePesewas: 40_000, stockQuantity: 4 });
+    const checkout = checkoutCreateSchema.parse({
+      customer: {
+        fullName: 'Ama Mensah',
+        email: 'AMA@example.com',
+        whatsappNumber: '024 123 4567',
+        deliveryAddress: 'East Legon, Accra',
+        whatsappConsent: true,
+      },
+      orderNotes: 'Call when you arrive.',
+      items: [{ productId: String(selectedProduct._id), quantity: 2 }],
+    });
+
+    const draft = await buildPendingOrderDraft(checkout);
+    const order = await OrderModel.create(draft);
+
+    expect(order.orderNumber).toMatch(/^KWM-\d{8}-[A-F0-9]{6}$/);
+    expect(order.customer).toMatchObject({
+      fullName: 'Ama Mensah',
+      email: 'ama@example.com',
+      whatsappNumber: '+233241234567',
+      whatsappConsent: true,
+    });
+    expect(order.items[0]).toMatchObject({
+      name: 'Ceramic Pan',
+      unitPricePesewas: 40_000,
+      quantity: 2,
+      lineTotalPesewas: 80_000,
+    });
+    expect(order).toMatchObject({
+      currency: 'GHS',
+      subtotalPesewas: 80_000,
+      productPaymentTotalPesewas: 80_000,
+      deliveryPaymentMethod: 'pay_on_delivery',
+      deliveryFeeStatus: 'not_quoted',
+      paymentStatus: 'pending',
+      fulfillmentStatus: 'awaiting_payment',
+    });
+  });
+
+  it('rejects duplicate cart lines and insufficient inventory before payment starts', async () => {
+    const selectedProduct = await product({ stockQuantity: 1 });
+    const baseCheckout = {
+      customer: {
+        fullName: 'Kojo Owusu',
+        email: 'kojo@example.com',
+        whatsappNumber: '+233201234567',
+        deliveryAddress: 'Adenta, Accra',
+        whatsappConsent: true as const,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 2 }],
+    };
+
+    const duplicateResult = checkoutCreateSchema.safeParse({
+      ...baseCheckout,
+      items: [baseCheckout.items[0], baseCheckout.items[0]],
+    });
+    expect(duplicateResult.success).toBe(false);
+
+    const checkout = checkoutCreateSchema.parse(baseCheckout);
+    await expect(buildPendingOrderDraft(checkout)).rejects.toMatchObject({
+      status: 409,
+      code: 'INSUFFICIENT_STOCK',
+    });
   });
 
   it('queues reviews until an administrator approves them', async () => {
