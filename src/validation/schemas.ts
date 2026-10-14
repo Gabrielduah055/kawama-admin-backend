@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { normalizeWhatsAppNumber } from '../lib/orders.js';
 
 export const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, 'Must be a MongoDB ObjectId.');
 export const slugSchema = z.string().trim().min(2).max(100).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
@@ -69,4 +70,43 @@ export const reviewStatusSchema = z.object({ status: z.enum(['approved', 'reject
 export const paginationSchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   limit: z.coerce.number().int().positive().max(100).default(24),
+});
+
+export const whatsappNumberSchema = z
+  .string()
+  .trim()
+  .min(8)
+  .max(25)
+  .transform(normalizeWhatsAppNumber)
+  .refine((value) => /^\+[1-9]\d{7,14}$/.test(value), {
+    message: 'Enter a valid WhatsApp number with its country code.',
+  });
+
+const checkoutItemSchema = z.object({
+  productId: objectIdSchema,
+  quantity: z.number().int().min(1).max(20),
+}).strict();
+
+export const checkoutCreateSchema = z.object({
+  customer: z.object({
+    fullName: z.string().trim().min(2).max(120),
+    email: z.string().trim().toLowerCase().email().max(254),
+    whatsappNumber: whatsappNumberSchema,
+    deliveryAddress: z.string().trim().min(5).max(500),
+    whatsappConsent: z.literal(true, { message: 'WhatsApp consent is required for receipts and delivery coordination.' }),
+  }).strict(),
+  orderNotes: z.string().trim().max(500).default(''),
+  items: z.array(checkoutItemSchema).min(1).max(20),
+}).strict().superRefine((value, context) => {
+  const seen = new Set<string>();
+  value.items.forEach((item, index) => {
+    if (seen.has(item.productId)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['items', index, 'productId'],
+        message: 'Each product may appear only once. Increase its quantity instead.',
+      });
+    }
+    seen.add(item.productId);
+  });
 });
