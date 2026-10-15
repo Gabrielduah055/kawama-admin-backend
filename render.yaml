@@ -27,3 +27,11 @@ services:
         sync: false
       - key: CLOUDINARY_FOLDER
         value: kawama
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+      - key: PAYSTACK_CALLBACK_URL
+        sync: false
+      - key: PAYSTACK_BASE_URL
+        value: https://api.paystack.co

@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 export function normalizeWhatsAppNumber(value: string): string {
   const compact = value.trim().replace(/[\s().-]/g, '');
@@ -11,4 +11,8 @@ export function normalizeWhatsAppNumber(value: string): string {
 export function createOrderNumber(date = new Date(), suffix = randomBytes(3).toString('hex')): string {
   const day = date.toISOString().slice(0, 10).replaceAll('-', '');
   return `KWM-${day}-${suffix.toUpperCase()}`;
+}
+
+export function hashCheckoutToken(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }

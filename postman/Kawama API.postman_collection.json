@@ -16,7 +16,9 @@
     { "key": "adminPassword", "value": "" },
     { "key": "adminToken", "value": "" },
     { "key": "categoryId", "value": "" },
-    { "key": "productId", "value": "" }
+    { "key": "productId", "value": "" },
+    { "key": "checkoutProductId", "value": "" },
+    { "key": "checkoutToken", "value": "" }
   ],
   "item": [
     {
@@ -70,6 +72,54 @@
         {
           "name": "List active products",
           "request": { "method": "GET", "url": "{{baseUrl}}/api/product?page=1&limit=24" }
+        }
+      ]
+    },
+    {
+      "name": "Paystack checkout",
+      "auth": { "type": "noauth" },
+      "item": [
+        {
+          "name": "Initialize checkout",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "pm.collectionVariables.set('checkoutToken', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Paystack checkout initialized', () => pm.expect(pm.response.code).to.be.oneOf([200, 201]));",
+                  "const payload = pm.response.json();",
+                  "pm.test('Access code returned', () => pm.expect(payload.data?.payment?.accessCode).to.be.a('string'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{checkoutToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customer\": {\n    \"fullName\": \"Postman Customer\",\n    \"email\": \"customer@example.com\",\n    \"whatsappNumber\": \"+233241234567\",\n    \"deliveryAddress\": \"Accra, Ghana\",\n    \"whatsappConsent\": true\n  },\n  \"orderNotes\": \"Test-mode checkout\",\n  \"items\": [\n    {\n      \"productId\": \"{{checkoutProductId}}\",\n      \"quantity\": 1\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/checkout/sessions"
+          }
+        },
+        {
+          "name": "Get checkout status",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/v1/checkout/sessions/{{checkoutToken}}"
+          }
         }
       ]
     },

@@ -6,7 +6,7 @@ const customerSchema = new Schema(
   {
     fullName: { type: String, trim: true, required: true, maxlength: 120 },
     email: { type: String, trim: true, lowercase: true, required: true, maxlength: 254, index: true },
-    whatsappNumber: { type: String, trim: true, required: true, maxlength: 16, index: true },
+    whatsappNumber: { type: String, trim: true, required: true, maxlength: 16, unique: true },
     whatsappConsentAt: { type: Date, required: true },
     defaultDeliveryAddress: { type: String, trim: true, required: true, maxlength: 500 },
     paidOrderCount: { type: Number, min: 0, default: 0 },
@@ -17,7 +17,7 @@ const customerSchema = new Schema(
   { timestamps: true, versionKey: false },
 );
 
-customerSchema.index({ whatsappNumber: 1, email: 1 });
+customerSchema.index({ email: 1, whatsappNumber: 1 });
 customerSchema.index({ lastPaidOrderAt: -1 });
 
 export const CustomerModel = ((models.Customer as Model<any> | undefined) ??

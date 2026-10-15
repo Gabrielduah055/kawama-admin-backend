@@ -11,19 +11,22 @@ import { requestContext } from './middlewares/requestContext.js';
 import { openApiDocument } from './openapi.js';
 import { createAdminRouter } from './route/adminRouter.js';
 import { authRouter } from './route/authRouter.js';
+import { createCheckoutRouter, createPaystackWebhookRouter } from './route/checkoutRouter.js';
 import { createProductRouter } from './route/productRouter.js';
 import { publicRouter } from './route/publicRouter.js';
 import { verifyDatabaseAdminToken, type AdminTokenVerifier } from './services/auth.service.js';
 import { cloudinaryMediaService, type MediaService } from './services/cloudinary.service.js';
+import { paystackGateway, type PaystackGateway } from './services/paystack.service.js';
 
 export interface ApplicationDependencies {
   verifyAdminToken?: AdminTokenVerifier;
   mediaService?: MediaService;
+  paystackGateway?: PaystackGateway;
 }
 
 const corsOptions: Omit<CorsOptions, 'origin'> = {
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'X-Request-Id'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'X-Paystack-Signature', 'X-Request-Id'],
   maxAge: 86_400,
 };
 
@@ -35,6 +38,8 @@ function isPublicStorefrontRequest(request: Request): boolean {
   if (method === 'GET' && (path === '/' || path.startsWith('/health/') || path === '/openapi.json')) return true;
   if (method === 'GET' && (path === '/api/product' || path.startsWith('/api/product/'))) return true;
   if (method === 'GET' && (path === '/api/v1/categories' || path === '/api/v1/products' || path.startsWith('/api/v1/products/'))) return true;
+  if (method === 'GET' && path.startsWith('/api/v1/checkout/sessions/')) return true;
+  if (method === 'POST' && path === '/api/v1/checkout/sessions') return true;
   return method === 'POST' && /^\/api\/v1\/products\/[^/]+\/reviews$/.test(path);
 }
 
@@ -62,7 +67,15 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
     ...(environment.NODE_ENV === 'production' ? {} : { strictTransportSecurity: false }),
   }));
   app.use(cors(corsDelegate));
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({
+    limit: '1mb',
+    verify(request, _response, buffer) {
+      const expressRequest = request as Request;
+      if (expressRequest.originalUrl.startsWith('/api/v1/webhooks/paystack')) {
+        expressRequest.rawBody = Buffer.from(buffer);
+      }
+    },
+  }));
   app.use(
     rateLimit({
       windowMs: 15 * 60 * 1000,
@@ -95,6 +108,9 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
   app.use('/api/admin', authRouter);
   app.use('/api/product', createProductRouter(adminMiddleware));
   app.use('/api/v1/auth', authRouter);
+  const selectedPaystackGateway = dependencies.paystackGateway ?? paystackGateway;
+  app.use('/api/v1/checkout', createCheckoutRouter(selectedPaystackGateway));
+  app.use('/api/v1/webhooks', createPaystackWebhookRouter(selectedPaystackGateway));
   app.use('/api/v1', publicRouter);
   app.use(
     '/api/v1/admin',

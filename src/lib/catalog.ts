@@ -43,7 +43,8 @@ export function toPublicProduct(product: Record<string, any>): Record<string, un
   const complementaryCategories = Array.isArray(product.complementaryCategories)
     ? product.complementaryCategories.map((item: any) => item.name).filter(Boolean)
     : [];
-  const stock = deriveStock(product.stockQuantity, product.lowStockThreshold);
+  const availableQuantity = Math.max(0, product.stockQuantity - (product.reservedQuantity ?? 0));
+  const stock = deriveStock(availableQuantity, product.lowStockThreshold);
   const dto: Record<string, unknown> = {
     id: String(product._id),
     slug: product.slug,
@@ -79,6 +80,8 @@ export function toAdminProduct(product: Record<string, any>): Record<string, unk
     ),
     images: product.images ?? [],
     stockQuantity: product.stockQuantity,
+    reservedQuantity: product.reservedQuantity ?? 0,
+    availableQuantity: Math.max(0, product.stockQuantity - (product.reservedQuantity ?? 0)),
     lowStockThreshold: product.lowStockThreshold,
     status: product.status,
     updatedBy: product.updatedBy,
