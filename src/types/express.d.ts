@@ -3,6 +3,7 @@ declare global {
     interface Request {
       id: string;
       admin?: { uid: string; email: string };
+      rawBody?: Buffer;
     }
   }
 }

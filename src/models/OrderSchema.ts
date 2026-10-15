@@ -2,7 +2,7 @@ import mongoose, { type Model } from 'mongoose';
 
 const { Schema, model, models } = mongoose;
 
-export const paymentStatuses = ['pending', 'paid', 'failed', 'refunded'] as const;
+export const paymentStatuses = ['pending', 'paid', 'failed', 'refunded', 'needs_attention'] as const;
 export const fulfillmentStatuses = [
   'awaiting_payment',
   'paid_awaiting_delivery',
@@ -13,6 +13,7 @@ export const fulfillmentStatuses = [
   'needs_attention',
 ] as const;
 export const deliveryFeeStatuses = ['not_quoted', 'quoted', 'collected', 'waived'] as const;
+export const stockReservationStatuses = ['active', 'committed', 'released'] as const;
 
 const orderCustomerSchema = new Schema(
   {
@@ -75,8 +76,11 @@ const orderSchema = new Schema(
     paystackTransactionId: { type: String, trim: true },
     paymentStatus: { type: String, enum: paymentStatuses, default: 'pending', index: true },
     fulfillmentStatus: { type: String, enum: fulfillmentStatuses, default: 'awaiting_payment', index: true },
+    idempotencyKeyHash: { type: String, required: true, immutable: true, select: false },
+    stockReservationStatus: { type: String, enum: stockReservationStatuses, default: 'active', index: true },
     stockReservationExpiresAt: { type: Date },
     inventoryCommittedAt: { type: Date },
+    paymentVerifiedAt: { type: Date },
     paidAt: { type: Date },
     deliveredAt: { type: Date },
     cancelledAt: { type: Date },
@@ -87,6 +91,7 @@ const orderSchema = new Schema(
 
 orderSchema.index({ orderNumber: 1 }, { unique: true });
 orderSchema.index({ paymentReference: 1 }, { unique: true, sparse: true });
+orderSchema.index({ idempotencyKeyHash: 1 }, { unique: true });
 orderSchema.index({ createdAt: -1 });
 orderSchema.index({ paymentStatus: 1, fulfillmentStatus: 1, createdAt: -1 });
 orderSchema.index({ 'customer.whatsappNumber': 1, createdAt: -1 });

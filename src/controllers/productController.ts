@@ -26,8 +26,12 @@ export const getPublicProducts: RequestHandler = async (request, response) => {
     filter.category = category._id;
   }
   if (request.query.featured === 'true') filter.featured = true;
-  if (request.query.inStock === 'true') filter.stockQuantity = { $gt: 0 };
-  if (request.query.inStock === 'false') filter.stockQuantity = 0;
+  if (request.query.inStock === 'true') {
+    filter.$expr = { $gt: [{ $subtract: ['$stockQuantity', { $ifNull: ['$reservedQuantity', 0] }] }, 0] };
+  }
+  if (request.query.inStock === 'false') {
+    filter.$expr = { $lte: [{ $subtract: ['$stockQuantity', { $ifNull: ['$reservedQuantity', 0] }] }, 0] };
+  }
   const query = typeof request.query.q === 'string' ? request.query.q.trim() : '';
   if (query) {
     const expression = new RegExp(escapeRegex(query), 'i');
@@ -136,6 +140,9 @@ export const updateProduct: RequestHandler = async (request, response) => {
     status: current.status === 'archived' ? 'draft' : current.status,
     ...updates,
   });
+  if (merged.stockQuantity < (current.reservedQuantity ?? 0)) {
+    throw new AppError(409, 'STOCK_RESERVED', 'Stock cannot be reduced below the quantity reserved by active checkouts.');
+  }
   assertManagedImages(merged.images);
   await assertCategories(merged.categoryId, merged.complementaryCategoryIds, merged.status === 'active');
   await ProductModel.findByIdAndUpdate(id, { ...toProductPersistence(merged), updatedBy: request.admin!.email }, { runValidators: true });

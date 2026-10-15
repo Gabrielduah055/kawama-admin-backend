@@ -32,6 +32,7 @@ const productSchema = new Schema(
     currency: { type: String, enum: ['GHS'], default: 'GHS' },
     images: { type: [productImageSchema], default: [] },
     stockQuantity: { type: Number, min: 0, default: 0 },
+    reservedQuantity: { type: Number, min: 0, default: 0 },
     lowStockThreshold: { type: Number, min: 0, default: 5 },
     featured: { type: Boolean, default: false, index: true },
     newArrival: { type: Boolean, default: false },

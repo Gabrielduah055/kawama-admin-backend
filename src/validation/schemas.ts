@@ -110,3 +110,12 @@ export const checkoutCreateSchema = z.object({
     seen.add(item.productId);
   });
 });
+
+export const checkoutIdempotencyKeySchema = z
+  .string()
+  .trim()
+  .min(16)
+  .max(100)
+  .regex(/^[A-Za-z0-9._-]+$/, 'Use letters, numbers, dots, underscores, or hyphens only.');
+
+export const checkoutTokenSchema = checkoutIdempotencyKeySchema;

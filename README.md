@@ -45,6 +45,22 @@ Alternatively, import `postman/Kawama API.postman_collection.json`, set its `adm
 
 For product media, call `POST /api/v1/admin/uploads/signature`, upload directly to Cloudinary with the returned values, then store the returned `secure_url` and `public_id` in the product payload. Asset deletion is rejected while a category or product references it.
 
+## Paystack checkout
+
+Configure `PAYSTACK_SECRET_KEY` and `PAYSTACK_CALLBACK_URL` on the API. The secret key is server-only and must never be placed in Angular source or returned by an endpoint. `PAYSTACK_PUBLIC_KEY` is recorded for the later storefront integration, although the current backend-first flow opens Paystack using the returned access code.
+
+Create a checkout with `POST /api/v1/checkout/sessions`. Send a fresh UUID-like value in the `Idempotency-Key` header and the customer/cart payload in the body. The API recalculates prices from MongoDB, reserves stock for 30 minutes, creates the order, and returns Paystack's `accessCode`. Reusing the same idempotency key returns the same checkout without reserving stock twice.
+
+The storefront can poll `GET /api/v1/checkout/sessions/:checkoutToken`. This endpoint returns limited status information and never treats a browser callback as proof of payment.
+
+In the Paystack test dashboard, set the webhook URL to:
+
+```text
+https://YOUR-API-HOST/api/v1/webhooks/paystack
+```
+
+The webhook handler validates `x-paystack-signature` against the untouched request body, calls Paystack's transaction verification endpoint, and compares the reference, status, amount, currency, and customer email before committing inventory. Repeated webhooks are idempotent. Invalid or mismatched payments are held for manual attention rather than fulfilled.
+
 ## Deployment
 
 `render.yaml` defines the Render web service and readiness health check. Add every secret marked `sync: false` in Render, including `JWT_SECRET`; keep MongoDB Atlas near the Render region, allow Render to connect to Atlas, and set `FRONTEND_ORIGINS` to the comma-separated production/preview storefront origins. Run `npm run seed:admin` from a trusted environment whenever the production owner password must be created or rotated; do not store `ADMIN_PASSWORD` in Render after bootstrap.

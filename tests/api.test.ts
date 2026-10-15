@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import bcrypt from 'bcryptjs';
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
@@ -11,14 +11,24 @@ import { AdminModel } from '../src/models/AdminSchema.js';
 import { CategoryModel } from '../src/models/CategorySchema.js';
 import { CustomerModel } from '../src/models/CustomerSchema.js';
 import { OrderModel } from '../src/models/OrderSchema.js';
+import { PaymentAttemptModel } from '../src/models/PaymentAttemptSchema.js';
 import { ProductModel } from '../src/models/ProductSchema.js';
 import { ReviewModel } from '../src/models/ReviewSchema.js';
 import type { MediaService } from '../src/services/cloudinary.service.js';
 import { buildPendingOrderDraft } from '../src/services/order.service.js';
+import type {
+  InitializePaystackInput,
+  PaystackGateway,
+  PaystackVerification,
+} from '../src/services/paystack.service.js';
 import { checkoutCreateSchema } from '../src/validation/schemas.js';
 
-let mongo: MongoMemoryServer | undefined;
+let mongo: MongoMemoryReplSet | undefined;
 let mongoDataDirectory: string | undefined;
+let paystackInitializationCalls = 0;
+let paystackVerificationOverride: PaystackVerification | undefined;
+let paystackInitializationError: AppError | undefined;
+const initializedPayments = new Map<string, InitializePaystackInput>();
 
 const mediaService: MediaService = {
   createUploadSignature: () => ({ timestamp: 1, signature: 'signed', cloudName: 'demo', apiKey: 'key', folder: 'kawama' }),
@@ -26,14 +36,43 @@ const mediaService: MediaService = {
   uploadFile: async (_path, publicId) => ({ publicId: `kawama/${publicId}`, src: 'https://example.com/image.png' }),
 };
 
+const paystackService: PaystackGateway = {
+  initializeTransaction: async (input) => {
+    paystackInitializationCalls += 1;
+    if (paystackInitializationError) throw paystackInitializationError;
+    initializedPayments.set(input.reference, input);
+    return {
+      reference: input.reference,
+      accessCode: `access-${input.reference}`,
+      authorizationUrl: `https://checkout.paystack.com/${input.reference}`,
+    };
+  },
+  verifyTransaction: async (reference) => {
+    if (paystackVerificationOverride) return paystackVerificationOverride;
+    const initialized = initializedPayments.get(reference);
+    if (!initialized) throw new Error('Payment was not initialized in this test.');
+    return {
+      transactionId: '4099260516',
+      status: 'success',
+      reference,
+      amountPesewas: initialized.amountPesewas,
+      currency: initialized.currency,
+      paidAt: new Date('2026-10-14T12:00:00.000Z'),
+      customerEmail: initialized.email,
+    };
+  },
+  verifyWebhookSignature: (_rawBody, signature) => signature === 'valid-test-signature',
+};
+
 const app = createApp({
   mediaService,
+  paystackGateway: paystackService,
   verifyAdminToken: async (token) => {
     if (token !== 'owner') throw new AppError(401, 'INVALID_ADMIN_TOKEN', 'Invalid token.');
     return { uid: 'owner-uid', email: 'owner@example.com' };
   },
 });
-const databaseAuthApp = createApp({ mediaService });
+const databaseAuthApp = createApp({ mediaService, paystackGateway: paystackService });
 
 async function category() {
   return (await CategoryModel.findOne({ slug: 'cookware' })) ??
@@ -61,24 +100,33 @@ beforeAll(async () => {
   const cacheRoot = path.join(process.cwd(), 'node_modules', '.cache');
   await mkdir(cacheRoot, { recursive: true });
   mongoDataDirectory = await mkdtemp(path.join(cacheRoot, 'kawama-mongo-'));
-  mongo = await MongoMemoryServer.create({ instance: { dbPath: mongoDataDirectory, launchTimeout: 30_000 } });
+  mongo = await MongoMemoryReplSet.create({
+    instanceOpts: [{ dbPath: mongoDataDirectory, launchTimeout: 30_000 }],
+    replSet: { count: 1, storageEngine: 'wiredTiger' },
+  });
   await mongoose.connect(mongo.getUri());
   await Promise.all([
     AdminModel.syncIndexes(),
     CategoryModel.syncIndexes(),
     CustomerModel.syncIndexes(),
     OrderModel.syncIndexes(),
+    PaymentAttemptModel.syncIndexes(),
     ProductModel.syncIndexes(),
     ReviewModel.syncIndexes(),
   ]);
 });
 
 beforeEach(async () => {
+  paystackInitializationCalls = 0;
+  paystackVerificationOverride = undefined;
+  paystackInitializationError = undefined;
+  initializedPayments.clear();
   await Promise.all([
     AdminModel.deleteMany({}),
     CategoryModel.deleteMany({}),
     CustomerModel.deleteMany({}),
     OrderModel.deleteMany({}),
+    PaymentAttemptModel.deleteMany({}),
     ProductModel.deleteMany({}),
     ReviewModel.deleteMany({}),
   ]);
@@ -159,7 +207,11 @@ describe('Kawama API', () => {
     });
 
     const draft = await buildPendingOrderDraft(checkout);
-    const order = await OrderModel.create(draft);
+    const order = await OrderModel.create({
+      ...draft,
+      idempotencyKeyHash: 'a'.repeat(64),
+      stockReservationStatus: 'active',
+    });
 
     expect(order.orderNumber).toMatch(/^KWM-\d{8}-[A-F0-9]{6}$/);
     expect(order.customer).toMatchObject({
@@ -208,6 +260,197 @@ describe('Kawama API', () => {
     await expect(buildPendingOrderDraft(checkout)).rejects.toMatchObject({
       status: 409,
       code: 'INSUFFICIENT_STOCK',
+    });
+  });
+
+  it('initializes an idempotent Paystack checkout and reserves authoritative inventory', async () => {
+    const selectedProduct = await product({ pricePesewas: 40_000, stockQuantity: 4 });
+    const checkoutToken = 'checkout-token-000000000001';
+    const payload = {
+      customer: {
+        fullName: 'Ama Mensah',
+        email: 'ama@example.com',
+        whatsappNumber: '0241234567',
+        deliveryAddress: 'East Legon, Accra',
+        whatsappConsent: true,
+      },
+      orderNotes: 'Call when you arrive.',
+      items: [{ productId: String(selectedProduct._id), quantity: 2 }],
+    };
+
+    const created = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(payload);
+    expect(created.status).toBe(201);
+    expect(created.body.data).toMatchObject({
+      created: true,
+      checkoutToken,
+      amountPesewas: 80_000,
+      currency: 'GHS',
+      paymentStatus: 'pending',
+      payment: {
+        accessCode: expect.stringContaining('access-KWM-'),
+        authorizationUrl: expect.stringContaining('https://checkout.paystack.com/KWM-'),
+      },
+    });
+    expect(paystackInitializationCalls).toBe(1);
+
+    const reservedProduct = await ProductModel.findById(selectedProduct._id).lean();
+    expect(reservedProduct?.stockQuantity).toBe(4);
+    expect(reservedProduct?.reservedQuantity).toBe(2);
+
+    const repeated = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(payload);
+    expect(repeated.status).toBe(200);
+    expect(repeated.body.data).toMatchObject({ created: false, orderNumber: created.body.data.orderNumber });
+    expect(paystackInitializationCalls).toBe(1);
+    expect((await ProductModel.findById(selectedProduct._id).lean())?.reservedQuantity).toBe(2);
+  });
+
+  it('finalizes a verified Paystack webhook exactly once and updates the customer', async () => {
+    const selectedProduct = await product({ pricePesewas: 25_000, stockQuantity: 5 });
+    const checkoutToken = 'checkout-token-000000000002';
+    const created = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send({
+        customer: {
+          fullName: 'Esi Boateng',
+          email: 'esi@example.com',
+          whatsappNumber: '+233501234567',
+          deliveryAddress: 'Osu, Accra',
+          whatsappConsent: true,
+        },
+        items: [{ productId: String(selectedProduct._id), quantity: 2 }],
+      });
+    const reference = created.body.data.payment.reference as string;
+    const event = { event: 'charge.success', data: { reference } };
+
+    const firstWebhook = await request(app)
+      .post('/api/v1/webhooks/paystack')
+      .set('x-paystack-signature', 'valid-test-signature')
+      .send(event);
+    expect(firstWebhook.status).toBe(200);
+
+    const order = await OrderModel.findOne({ paymentReference: reference }).lean();
+    expect(order).toMatchObject({
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'paid_awaiting_delivery',
+      stockReservationStatus: 'committed',
+      paystackTransactionId: '4099260516',
+    });
+    const committedProduct = await ProductModel.findById(selectedProduct._id).lean();
+    expect(committedProduct).toMatchObject({ stockQuantity: 3, reservedQuantity: 0 });
+    expect(await CustomerModel.findOne({ whatsappNumber: '+233501234567' }).lean()).toMatchObject({
+      fullName: 'Esi Boateng',
+      paidOrderCount: 1,
+      lifetimeValuePesewas: 50_000,
+    });
+
+    const duplicateWebhook = await request(app)
+      .post('/api/v1/webhooks/paystack')
+      .set('x-paystack-signature', 'valid-test-signature')
+      .send(event);
+    expect(duplicateWebhook.status).toBe(200);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 3,
+      reservedQuantity: 0,
+    });
+    expect(await CustomerModel.findOne({ whatsappNumber: '+233501234567' }).lean()).toMatchObject({
+      paidOrderCount: 1,
+      lifetimeValuePesewas: 50_000,
+    });
+
+    const status = await request(app).get(`/api/v1/checkout/sessions/${checkoutToken}`);
+    expect(status.status).toBe(200);
+    expect(status.body.data).toMatchObject({
+      orderNumber: created.body.data.orderNumber,
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'paid_awaiting_delivery',
+      amountPesewas: 50_000,
+    });
+  });
+
+  it('rejects forged webhooks and flags verified amount mismatches for review', async () => {
+    const selectedProduct = await product({ pricePesewas: 30_000, stockQuantity: 2 });
+    const created = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', 'checkout-token-000000000003')
+      .send({
+        customer: {
+          fullName: 'Kwame Asare',
+          email: 'kwame@example.com',
+          whatsappNumber: '+233241111111',
+          deliveryAddress: 'Tema Community 12',
+          whatsappConsent: true,
+        },
+        items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+      });
+    const reference = created.body.data.payment.reference as string;
+    const event = { event: 'charge.success', data: { reference } };
+
+    const forged = await request(app)
+      .post('/api/v1/webhooks/paystack')
+      .set('x-paystack-signature', 'forged')
+      .send(event);
+    expect(forged.status).toBe(401);
+    expect(forged.body.error.code).toBe('INVALID_PAYSTACK_SIGNATURE');
+
+    paystackVerificationOverride = {
+      transactionId: '999',
+      status: 'success',
+      reference,
+      amountPesewas: 1,
+      currency: 'GHS',
+      customerEmail: 'kwame@example.com',
+    };
+    const mismatched = await request(app)
+      .post('/api/v1/webhooks/paystack')
+      .set('x-paystack-signature', 'valid-test-signature')
+      .send(event);
+    expect(mismatched.status).toBe(200);
+    expect(await OrderModel.findOne({ paymentReference: reference }).lean()).toMatchObject({
+      paymentStatus: 'needs_attention',
+      fulfillmentStatus: 'needs_attention',
+      stockReservationStatus: 'released',
+    });
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+  });
+
+  it('releases reserved stock when Paystack initialization fails', async () => {
+    const selectedProduct = await product({ stockQuantity: 2 });
+    paystackInitializationError = new AppError(502, 'PAYSTACK_UNAVAILABLE', 'Paystack is unavailable.');
+
+    const response = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', 'checkout-token-000000000004')
+      .send({
+        customer: {
+          fullName: 'Adwoa Nyarko',
+          email: 'adwoa@example.com',
+          whatsappNumber: '+233541111111',
+          deliveryAddress: 'Spintex Road, Accra',
+          whatsappConsent: true,
+        },
+        items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+      });
+
+    expect(response.status).toBe(502);
+    expect(response.body.error.code).toBe('PAYSTACK_UNAVAILABLE');
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+    expect(await OrderModel.findOne({ 'customer.email': 'adwoa@example.com' }).lean()).toMatchObject({
+      paymentStatus: 'failed',
+      fulfillmentStatus: 'cancelled',
+      stockReservationStatus: 'released',
     });
   });
 

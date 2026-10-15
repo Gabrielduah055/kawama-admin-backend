@@ -1,6 +1,9 @@
 import { setServers } from 'node:dns';
 import mongoose from 'mongoose';
 import { getEnvironment, requireEnvironment } from './environment.js';
+import { CustomerModel } from '../models/CustomerSchema.js';
+import { OrderModel } from '../models/OrderSchema.js';
+import { PaymentAttemptModel } from '../models/PaymentAttemptSchema.js';
 import { logger } from '../utils/logger.js';
 
 export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): Promise<void> => {
@@ -14,6 +17,13 @@ export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): 
     autoIndex: process.env.NODE_ENV !== 'production',
     serverSelectionTimeoutMS: 10_000,
   });
+  if (getEnvironment().NODE_ENV === 'production') {
+    await Promise.all([
+      CustomerModel.createIndexes(),
+      OrderModel.createIndexes(),
+      PaymentAttemptModel.createIndexes(),
+    ]);
+  }
   logger.info('mongodb_connected');
 };
 

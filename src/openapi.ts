@@ -10,6 +10,8 @@ export const openApiDocument = {
     { name: 'Authentication' },
     { name: 'Public catalog' },
     { name: 'Public reviews' },
+    { name: 'Public checkout' },
+    { name: 'Paystack webhooks' },
     { name: 'Admin products' },
     { name: 'Admin categories' },
     { name: 'Admin reviews' },
@@ -71,6 +73,33 @@ export const openApiDocument = {
       get: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], responses: { '200': { description: 'Approved reviews.' }, '404': { $ref: '#/components/responses/NotFound' } } },
       post: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ReviewInput' } } } }, responses: { '202': { description: 'Review accepted for moderation.' }, '400': { $ref: '#/components/responses/BadRequest' }, '429': { description: 'Review rate limit exceeded.' } } },
     },
+    '/api/v1/checkout/sessions': {
+      post: {
+        tags: ['Public checkout'],
+        parameters: [{ name: 'Idempotency-Key', in: 'header', required: true, schema: { type: 'string', minLength: 16, maxLength: 100 } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/CheckoutInput' } } } },
+        responses: {
+          '201': { description: 'Order created, stock reserved, and Paystack initialized.' },
+          '200': { description: 'An existing idempotent checkout was returned.' },
+          '409': { description: 'Product unavailable, stock insufficient, or checkout expired.' },
+          '502': { description: 'Paystack initialization failed.' },
+        },
+      },
+    },
+    '/api/v1/checkout/sessions/{checkoutToken}': {
+      get: {
+        tags: ['Public checkout'],
+        parameters: [{ name: 'checkoutToken', in: 'path', required: true, schema: { type: 'string', minLength: 16, maxLength: 100 } }],
+        responses: { '200': { description: 'Current server-authoritative checkout status.' }, '404': { $ref: '#/components/responses/NotFound' } },
+      },
+    },
+    '/api/v1/webhooks/paystack': {
+      post: {
+        tags: ['Paystack webhooks'],
+        description: 'Validates the Paystack HMAC signature and independently verifies successful charges.',
+        responses: { '200': { description: 'Webhook acknowledged.' }, '401': { description: 'Invalid Paystack signature.' }, '502': { description: 'Paystack verification unavailable.' } },
+      },
+    },
     '/api/v1/admin/products': {
       get: { tags: ['Admin products'], security: [{ bearerAuth: [] }], parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/Limit' }, { name: 'status', in: 'query', schema: { enum: ['draft', 'active', 'archived'] } }, { name: 'categoryId', in: 'query', schema: { type: 'string' } }, { name: 'q', in: 'query', schema: { type: 'string' } }], responses: { '200': { description: 'Paginated admin product list.' }, '401': { $ref: '#/components/responses/Unauthorized' } } },
       post: { tags: ['Admin products'], security: [{ bearerAuth: [] }], requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ProductInput' } } } }, responses: { '201': { description: 'Product created.' }, '400': { $ref: '#/components/responses/BadRequest' }, '401': { $ref: '#/components/responses/Unauthorized' }, '409': { $ref: '#/components/responses/Conflict' } } },
@@ -127,6 +156,34 @@ export const openApiDocument = {
       ProductInput: { type: 'object', required: ['slug', 'name', 'categoryId'], properties: { slug: { type: 'string' }, name: { type: 'string' }, categoryId: { type: 'string' }, shortDescription: { type: 'string' }, description: { type: 'string' }, price: { type: 'number', minimum: 0 }, compareAtPrice: { type: 'number' }, images: { type: 'array', maxItems: 8, items: { $ref: '#/components/schemas/Image' } }, stockQuantity: { type: 'integer', minimum: 0 }, lowStockThreshold: { type: 'integer', minimum: 0 }, featured: { type: 'boolean' }, isNew: { type: 'boolean' }, isBestSeller: { type: 'boolean' }, complementaryCategoryIds: { type: 'array', items: { type: 'string' } }, details: { type: 'array', items: { type: 'string' } }, specifications: { type: 'array', items: { type: 'object', required: ['label', 'value'], properties: { label: { type: 'string' }, value: { type: 'string' } } } }, status: { enum: ['draft', 'active'] } } },
       ProductPatch: { allOf: [{ $ref: '#/components/schemas/ProductInput' }], description: 'All properties optional; slug is not accepted.' },
       ReviewInput: { type: 'object', required: ['reviewerName', 'rating', 'comment'], properties: { reviewerName: { type: 'string', minLength: 2, maxLength: 60 }, rating: { type: 'integer', minimum: 1, maximum: 5 }, comment: { type: 'string', minLength: 10, maxLength: 500 } } },
+      CheckoutInput: {
+        type: 'object',
+        required: ['customer', 'items'],
+        properties: {
+          customer: {
+            type: 'object',
+            required: ['fullName', 'email', 'whatsappNumber', 'deliveryAddress', 'whatsappConsent'],
+            properties: {
+              fullName: { type: 'string', minLength: 2, maxLength: 120 },
+              email: { type: 'string', format: 'email' },
+              whatsappNumber: { type: 'string', description: 'Ghana local numbers are normalized to E.164.' },
+              deliveryAddress: { type: 'string', minLength: 5, maxLength: 500 },
+              whatsappConsent: { const: true },
+            },
+          },
+          orderNotes: { type: 'string', maxLength: 500 },
+          items: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              type: 'object',
+              required: ['productId', 'quantity'],
+              properties: { productId: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 20 } },
+            },
+          },
+        },
+      },
     },
   },
 } as const;

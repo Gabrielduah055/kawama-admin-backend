@@ -2,6 +2,7 @@ import { AppError } from '../errors/AppError.js';
 import { createOrderNumber } from '../lib/orders.js';
 import { ProductModel } from '../models/ProductSchema.js';
 import type { checkoutCreateSchema } from '../validation/schemas.js';
+import type { ClientSession } from 'mongoose';
 import type { z } from 'zod';
 
 export type CheckoutInput = z.infer<typeof checkoutCreateSchema>;
@@ -29,9 +30,11 @@ export interface PendingOrderDraft {
   fulfillmentStatus: 'awaiting_payment';
 }
 
-export async function buildPendingOrderDraft(input: CheckoutInput): Promise<PendingOrderDraft> {
+export async function buildPendingOrderDraft(input: CheckoutInput, session?: ClientSession): Promise<PendingOrderDraft> {
   const productIds = input.items.map((item) => item.productId);
-  const products = await ProductModel.find({ _id: { $in: productIds }, status: 'active' }).lean();
+  const query = ProductModel.find({ _id: { $in: productIds }, status: 'active' });
+  if (session) query.session(session);
+  const products = await query.lean();
   const productsById = new Map(products.map((product) => [String(product._id), product]));
 
   const unavailableProductIds = productIds.filter((productId) => !productsById.has(productId));
@@ -43,8 +46,9 @@ export async function buildPendingOrderDraft(input: CheckoutInput): Promise<Pend
 
   const insufficientStock = input.items.flatMap((item) => {
     const product = productsById.get(item.productId)!;
-    return product.stockQuantity < item.quantity
-      ? [{ productId: item.productId, available: product.stockQuantity, requested: item.quantity }]
+    const available = Math.max(0, product.stockQuantity - (product.reservedQuantity ?? 0));
+    return available < item.quantity
+      ? [{ productId: item.productId, available, requested: item.quantity }]
       : [];
   });
   if (insufficientStock.length > 0) {
