@@ -72,6 +72,41 @@ export const paginationSchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(24),
 });
 
+export const adminOrderListQuerySchema = paginationSchema.extend({
+  q: z.string().trim().max(120).optional(),
+  paymentStatus: z.enum(['pending', 'paid', 'failed', 'refunded', 'needs_attention']).optional(),
+  fulfillmentStatus: z.enum([
+    'awaiting_payment',
+    'paid_awaiting_delivery',
+    'processing',
+    'out_for_delivery',
+    'delivered',
+    'cancelled',
+    'needs_attention',
+  ]).optional(),
+  deliveryFeeStatus: z.enum(['not_quoted', 'quoted', 'collected', 'waived']).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+}).superRefine((value, context) => {
+  if (value.from && value.to && value.from > value.to) {
+    context.addIssue({ code: 'custom', path: ['to'], message: 'Must be on or after from.' });
+  }
+});
+
+export const adminCustomerListQuerySchema = paginationSchema.extend({
+  q: z.string().trim().max(120).optional(),
+  status: z.enum(['active', 'blocked']).optional(),
+});
+
+export const fulfillmentUpdateSchema = z.object({
+  status: z.enum(['processing', 'out_for_delivery', 'delivered', 'cancelled']),
+}).strict();
+
+export const deliveryUpdateSchema = z.object({
+  deliveryFeeStatus: z.enum(['not_quoted', 'quoted', 'collected', 'waived']),
+  deliveryFee: moneySchema.optional(),
+}).strict();
+
 export const whatsappNumberSchema = z
   .string()
   .trim()

@@ -96,6 +96,36 @@ async function product(overrides: Record<string, unknown> = {}) {
   });
 }
 
+async function initializeCheckout(
+  selectedProduct: { _id: unknown },
+  token: string,
+  customer: {
+    fullName: string;
+    email: string;
+    whatsappNumber: string;
+    deliveryAddress: string;
+  },
+  quantity = 1,
+) {
+  return request(app)
+    .post('/api/v1/checkout/sessions')
+    .set('idempotency-key', token)
+    .send({
+      customer: { ...customer, whatsappConsent: true },
+      items: [{ productId: String(selectedProduct._id), quantity }],
+    });
+}
+
+async function payCheckout(checkoutResponse: Awaited<ReturnType<typeof initializeCheckout>>) {
+  const reference = checkoutResponse.body.data.payment.reference as string;
+  const webhook = await request(app)
+    .post('/api/v1/webhooks/paystack')
+    .set('x-paystack-signature', 'valid-test-signature')
+    .send({ event: 'charge.success', data: { reference } });
+  expect(webhook.status).toBe(200);
+  return OrderModel.findOne({ paymentReference: reference }).lean();
+}
+
 beforeAll(async () => {
   const cacheRoot = path.join(process.cwd(), 'node_modules', '.cache');
   await mkdir(cacheRoot, { recursive: true });
@@ -451,6 +481,175 @@ describe('Kawama API', () => {
       paymentStatus: 'failed',
       fulfillmentStatus: 'cancelled',
       stockReservationStatus: 'released',
+    });
+  });
+
+  it('lists and retrieves protected admin order records without exposing Paystack checkout credentials', async () => {
+    const selectedProduct = await product({ pricePesewas: 22_500, stockQuantity: 6 });
+    const checkout = await initializeCheckout(
+      selectedProduct,
+      'admin-order-list-token-0001',
+      {
+        fullName: 'Esi Admin Test',
+        email: 'esi.admin@example.com',
+        whatsappNumber: '+233501234560',
+        deliveryAddress: 'Labone, Accra',
+      },
+      2,
+    );
+    const paidOrder = await payCheckout(checkout);
+
+    const listed = await request(app)
+      .get('/api/v1/admin/orders?paymentStatus=paid&q=Esi&from=2020-01-01&to=2030-12-31')
+      .set('authorization', 'Bearer owner');
+    expect(listed.status).toBe(200);
+    expect(listed.body.meta).toMatchObject({ page: 1, limit: 24, total: 1 });
+    expect(listed.body.data[0]).toMatchObject({
+      id: String(paidOrder?._id),
+      customer: { fullName: 'Esi Admin Test', email: 'esi.admin@example.com' },
+      itemCount: 1,
+      unitCount: 2,
+      productPaymentTotalPesewas: 45_000,
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'paid_awaiting_delivery',
+    });
+
+    const detail = await request(app)
+      .get(`/api/v1/admin/orders/${paidOrder?._id}`)
+      .set('authorization', 'Bearer owner');
+    expect(detail.status).toBe(200);
+    expect(detail.body.data).toMatchObject({
+      customer: { deliveryAddress: 'Labone, Accra', whatsappConsent: true },
+      items: [{ productId: String(selectedProduct._id), name: 'Ceramic Pan', quantity: 2 }],
+      paymentAttempts: [{ status: 'success', amountPesewas: 45_000 }],
+    });
+    expect(detail.body.data.paymentAttempts[0].accessCode).toBeUndefined();
+    expect(detail.body.data.paymentAttempts[0].authorizationUrl).toBeUndefined();
+  });
+
+  it('updates delivery and fulfillment safely and releases stock when an unpaid order is cancelled', async () => {
+    const selectedProduct = await product({ pricePesewas: 30_000, stockQuantity: 5 });
+    const checkout = await initializeCheckout(
+      selectedProduct,
+      'admin-fulfillment-token-0001',
+      {
+        fullName: 'Kojo Delivery Test',
+        email: 'kojo.delivery@example.com',
+        whatsappNumber: '+233201234560',
+        deliveryAddress: 'Airport Residential, Accra',
+      },
+    );
+    const paidOrder = await payCheckout(checkout);
+
+    const quoted = await request(app)
+      .patch(`/api/v1/admin/orders/${paidOrder?._id}/delivery`)
+      .set('authorization', 'Bearer owner')
+      .send({ deliveryFeeStatus: 'quoted', deliveryFee: 35.5 });
+    expect(quoted.status).toBe(200);
+    expect(quoted.body.data).toMatchObject({
+      deliveryFeePesewas: 3_550,
+      grandTotalPesewas: 33_550,
+      deliveryFeeStatus: 'quoted',
+    });
+
+    const collected = await request(app)
+      .patch(`/api/v1/admin/orders/${paidOrder?._id}/delivery`)
+      .set('authorization', 'Bearer owner')
+      .send({ deliveryFeeStatus: 'collected' });
+    expect(collected.status).toBe(200);
+    expect(collected.body.data.deliveryFeePesewas).toBe(3_550);
+
+    const rejectedPaidCancellation = await request(app)
+      .patch(`/api/v1/admin/orders/${paidOrder?._id}/fulfillment`)
+      .set('authorization', 'Bearer owner')
+      .send({ status: 'cancelled' });
+    expect(rejectedPaidCancellation.status).toBe(409);
+    expect(rejectedPaidCancellation.body.error.code).toBe('PAID_ORDER_REQUIRES_REFUND');
+
+    for (const status of ['processing', 'out_for_delivery', 'delivered']) {
+      const updated = await request(app)
+        .patch(`/api/v1/admin/orders/${paidOrder?._id}/fulfillment`)
+        .set('authorization', 'Bearer owner')
+        .send({ status });
+      expect(updated.status).toBe(200);
+      expect(updated.body.data.fulfillmentStatus).toBe(status);
+    }
+    expect((await OrderModel.findById(paidOrder?._id).lean())?.deliveredAt).toBeTruthy();
+
+    const pendingProduct = await product({ slug: 'pending-pan', name: 'Pending Pan', stockQuantity: 4 });
+    const pendingCheckout = await initializeCheckout(
+      pendingProduct,
+      'admin-cancel-token-00000001',
+      {
+        fullName: 'Ama Cancel Test',
+        email: 'ama.cancel@example.com',
+        whatsappNumber: '+233241234560',
+        deliveryAddress: 'Adenta, Accra',
+      },
+      2,
+    );
+    const pendingOrder = await OrderModel.findOne({ orderNumber: pendingCheckout.body.data.orderNumber }).lean();
+    expect((await ProductModel.findById(pendingProduct._id).lean())?.reservedQuantity).toBe(2);
+
+    const cancelled = await request(app)
+      .patch(`/api/v1/admin/orders/${pendingOrder?._id}/fulfillment`)
+      .set('authorization', 'Bearer owner')
+      .send({ status: 'cancelled' });
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body.data).toMatchObject({
+      paymentStatus: 'failed',
+      fulfillmentStatus: 'cancelled',
+      stockReservationStatus: 'released',
+    });
+    expect((await ProductModel.findById(pendingProduct._id).lean())?.reservedQuantity).toBe(0);
+  });
+
+  it('lists customer history and returns an operational dashboard summary', async () => {
+    const selectedProduct = await product({ pricePesewas: 18_000, stockQuantity: 5, lowStockThreshold: 4 });
+    const checkout = await initializeCheckout(
+      selectedProduct,
+      'admin-customer-token-000001',
+      {
+        fullName: 'Akosua Customer Test',
+        email: 'akosua.customer@example.com',
+        whatsappNumber: '+233541234560',
+        deliveryAddress: 'East Legon Hills, Accra',
+      },
+      2,
+    );
+    const paidOrder = await payCheckout(checkout);
+    const customer = await CustomerModel.findOne({ email: 'akosua.customer@example.com' }).lean();
+
+    const listed = await request(app)
+      .get('/api/v1/admin/customers?q=Akosua&status=active')
+      .set('authorization', 'Bearer owner');
+    expect(listed.status).toBe(200);
+    expect(listed.body.meta.total).toBe(1);
+    expect(listed.body.data[0]).toMatchObject({
+      id: String(customer?._id),
+      paidOrderCount: 1,
+      lifetimeValuePesewas: 36_000,
+    });
+
+    const detail = await request(app)
+      .get(`/api/v1/admin/customers/${customer?._id}`)
+      .set('authorization', 'Bearer owner');
+    expect(detail.status).toBe(200);
+    expect(detail.body.data).toMatchObject({
+      orderCount: 1,
+      recentOrders: [{ id: String(paidOrder?._id), paymentStatus: 'paid' }],
+    });
+
+    const dashboard = await request(app)
+      .get('/api/v1/admin/dashboard/summary')
+      .set('authorization', 'Bearer owner');
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.data).toMatchObject({
+      orders: { total: 1, paid: 1, awaitingDelivery: 1, needsAttention: 0 },
+      revenue: { currency: 'GHS', grossProductRevenuePesewas: 36_000 },
+      customers: { total: 1, active: 1, repeat: 0 },
+      inventory: { activeProducts: 1, reservedUnits: 0, lowStockProducts: 1 },
+      recentOrders: [{ id: String(paidOrder?._id) }],
     });
   });
 

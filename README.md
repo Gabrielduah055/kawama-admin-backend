@@ -61,6 +61,29 @@ https://YOUR-API-HOST/api/v1/webhooks/paystack
 
 The webhook handler validates `x-paystack-signature` against the untouched request body, calls Paystack's transaction verification endpoint, and compares the reference, status, amount, currency, and customer email before committing inventory. Repeated webhooks are idempotent. Invalid or mismatched payments are held for manual attention rather than fulfilled.
 
+## Admin commerce API
+
+All admin commerce endpoints require the same administrator bearer token as the catalog endpoints.
+
+- `GET /api/v1/admin/orders` lists orders with pagination plus `q`, `paymentStatus`, `fulfillmentStatus`, `deliveryFeeStatus`, `from`, and `to` filters.
+- `GET /api/v1/admin/orders/:id` returns the full order snapshot and sanitized payment-attempt history. Paystack access codes and authorization URLs are never returned.
+- `PATCH /api/v1/admin/orders/:id/fulfillment` accepts `processing`, `out_for_delivery`, `delivered`, or `cancelled`. Only verified paid orders can enter delivery fulfillment. Cancelling an unpaid order releases its stock reservation; paid orders require a separate refund workflow and cannot be cancelled here.
+- `PATCH /api/v1/admin/orders/:id/delivery` accepts a `deliveryFeeStatus` and optional `deliveryFee` in Ghanaian cedis. Returned monetary fields use explicit `Pesewas` suffixes.
+- `GET /api/v1/admin/customers` lists paid customers with pagination plus `q` and `status` filters.
+- `GET /api/v1/admin/customers/:id` returns customer totals and up to 20 recent orders.
+- `GET /api/v1/admin/dashboard/summary` returns order, revenue, customer, inventory, and recent-order metrics for the admin overview.
+
+Example delivery quote:
+
+```json
+{
+  "deliveryFeeStatus": "quoted",
+  "deliveryFee": 35.5
+}
+```
+
+See `/openapi.json` or the Postman collection for the complete request and response contract.
+
 ## Deployment
 
 `render.yaml` defines the Render web service and readiness health check. Add every secret marked `sync: false` in Render, including `JWT_SECRET`; keep MongoDB Atlas near the Render region, allow Render to connect to Atlas, and set `FRONTEND_ORIGINS` to the comma-separated production/preview storefront origins. Run `npm run seed:admin` from a trusted environment whenever the production owner password must be created or rotated; do not store `ADMIN_PASSWORD` in Render after bootstrap.
