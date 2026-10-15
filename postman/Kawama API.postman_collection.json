@@ -18,7 +18,9 @@
     { "key": "categoryId", "value": "" },
     { "key": "productId", "value": "" },
     { "key": "checkoutProductId", "value": "" },
-    { "key": "checkoutToken", "value": "" }
+    { "key": "checkoutToken", "value": "" },
+    { "key": "orderId", "value": "" },
+    { "key": "customerId", "value": "" }
   ],
   "item": [
     {
@@ -120,6 +122,73 @@
             "method": "GET",
             "url": "{{baseUrl}}/api/v1/checkout/sessions/{{checkoutToken}}"
           }
+        }
+      ]
+    },
+    {
+      "name": "Admin commerce",
+      "item": [
+        {
+          "name": "Dashboard summary",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/dashboard/summary" }
+        },
+        {
+          "name": "List orders",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Orders listed', () => pm.response.to.have.status(200));",
+                  "const payload = pm.response.json();",
+                  "if (payload.data?.[0]?.id) pm.collectionVariables.set('orderId', payload.data[0].id);"
+                ]
+              }
+            }
+          ],
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/orders?page=1&limit=24" }
+        },
+        {
+          "name": "Get order",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/orders/{{orderId}}" }
+        },
+        {
+          "name": "Update fulfillment",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"status\": \"processing\"\n}" },
+            "url": "{{baseUrl}}/api/v1/admin/orders/{{orderId}}/fulfillment"
+          }
+        },
+        {
+          "name": "Quote delivery fee",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"deliveryFeeStatus\": \"quoted\",\n  \"deliveryFee\": 35.5\n}" },
+            "url": "{{baseUrl}}/api/v1/admin/orders/{{orderId}}/delivery"
+          }
+        },
+        {
+          "name": "List customers",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Customers listed', () => pm.response.to.have.status(200));",
+                  "const payload = pm.response.json();",
+                  "if (payload.data?.[0]?.id) pm.collectionVariables.set('customerId', payload.data[0].id);"
+                ]
+              }
+            }
+          ],
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/customers?page=1&limit=24" }
+        },
+        {
+          "name": "Get customer",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/admin/customers/{{customerId}}" }
         }
       ]
     },

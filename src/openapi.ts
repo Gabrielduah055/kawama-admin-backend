@@ -12,6 +12,9 @@ export const openApiDocument = {
     { name: 'Public reviews' },
     { name: 'Public checkout' },
     { name: 'Paystack webhooks' },
+    { name: 'Admin dashboard' },
+    { name: 'Admin orders' },
+    { name: 'Admin customers' },
     { name: 'Admin products' },
     { name: 'Admin categories' },
     { name: 'Admin reviews' },
@@ -100,6 +103,103 @@ export const openApiDocument = {
         responses: { '200': { description: 'Webhook acknowledged.' }, '401': { description: 'Invalid Paystack signature.' }, '502': { description: 'Paystack verification unavailable.' } },
       },
     },
+    '/api/v1/admin/dashboard/summary': {
+      get: {
+        tags: ['Admin dashboard'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Order, revenue, customer, inventory, and recent-order summary.' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+        },
+      },
+    },
+    '/api/v1/admin/orders': {
+      get: {
+        tags: ['Admin orders'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { $ref: '#/components/parameters/Page' },
+          { $ref: '#/components/parameters/Limit' },
+          { name: 'q', in: 'query', schema: { type: 'string', maxLength: 120 }, description: 'Order number, payment reference, customer name, email, or WhatsApp number.' },
+          { name: 'paymentStatus', in: 'query', schema: { enum: ['pending', 'paid', 'failed', 'refunded', 'needs_attention'] } },
+          { name: 'fulfillmentStatus', in: 'query', schema: { enum: ['awaiting_payment', 'paid_awaiting_delivery', 'processing', 'out_for_delivery', 'delivered', 'cancelled', 'needs_attention'] } },
+          { name: 'deliveryFeeStatus', in: 'query', schema: { enum: ['not_quoted', 'quoted', 'collected', 'waived'] } },
+          { name: 'from', in: 'query', schema: { type: 'string', format: 'date-time' } },
+          { name: 'to', in: 'query', schema: { type: 'string', format: 'date-time' } },
+        ],
+        responses: {
+          '200': { description: 'Paginated order list.', content: { 'application/json': { schema: { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/AdminOrderSummary' } }, meta: { $ref: '#/components/schemas/Meta' } } } } } },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+        },
+      },
+    },
+    '/api/v1/admin/orders/{id}': {
+      get: {
+        tags: ['Admin orders'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/Id' }],
+        responses: {
+          '200': { description: 'Complete order, customer, item, and sanitized payment-attempt detail.' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/api/v1/admin/orders/{id}/fulfillment': {
+      patch: {
+        tags: ['Admin orders'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/Id' }],
+        description: 'Progresses a verified paid order through fulfillment, or cancels an unpaid order and releases its reservation.',
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['status'], properties: { status: { enum: ['processing', 'out_for_delivery', 'delivered', 'cancelled'] } } } } } },
+        responses: {
+          '200': { description: 'Updated order detail.' },
+          '409': { description: 'Invalid transition, unpaid fulfillment, or unsafe reservation release.' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+        },
+      },
+    },
+    '/api/v1/admin/orders/{id}/delivery': {
+      patch: {
+        tags: ['Admin orders'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/Id' }],
+        description: 'Quotes, collects, waives, or clears the pay-on-delivery fee. Monetary input is in Ghanaian cedis.',
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['deliveryFeeStatus'], properties: { deliveryFeeStatus: { enum: ['not_quoted', 'quoted', 'collected', 'waived'] }, deliveryFee: { type: 'number', minimum: 0, description: 'GHS amount; stored and returned as pesewas.' } } } } } },
+        responses: {
+          '200': { description: 'Updated order detail.' },
+          '409': { description: 'Order is not paid or a required delivery fee is missing.' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+        },
+      },
+    },
+    '/api/v1/admin/customers': {
+      get: {
+        tags: ['Admin customers'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { $ref: '#/components/parameters/Page' },
+          { $ref: '#/components/parameters/Limit' },
+          { name: 'q', in: 'query', schema: { type: 'string', maxLength: 120 }, description: 'Customer name, email, or WhatsApp number.' },
+          { name: 'status', in: 'query', schema: { enum: ['active', 'blocked'] } },
+        ],
+        responses: {
+          '200': { description: 'Paginated customer list.', content: { 'application/json': { schema: { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/AdminCustomer' } }, meta: { $ref: '#/components/schemas/Meta' } } } } } },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+        },
+      },
+    },
+    '/api/v1/admin/customers/{id}': {
+      get: {
+        tags: ['Admin customers'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/Id' }],
+        responses: {
+          '200': { description: 'Customer detail with up to 20 recent orders.' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
     '/api/v1/admin/products': {
       get: { tags: ['Admin products'], security: [{ bearerAuth: [] }], parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/Limit' }, { name: 'status', in: 'query', schema: { enum: ['draft', 'active', 'archived'] } }, { name: 'categoryId', in: 'query', schema: { type: 'string' } }, { name: 'q', in: 'query', schema: { type: 'string' } }], responses: { '200': { description: 'Paginated admin product list.' }, '401': { $ref: '#/components/responses/Unauthorized' } } },
       post: { tags: ['Admin products'], security: [{ bearerAuth: [] }], requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ProductInput' } } } }, responses: { '201': { description: 'Product created.' }, '400': { $ref: '#/components/responses/BadRequest' }, '401': { $ref: '#/components/responses/Unauthorized' }, '409': { $ref: '#/components/responses/Conflict' } } },
@@ -155,6 +255,43 @@ export const openApiDocument = {
       ProductList: { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Product' } }, meta: { $ref: '#/components/schemas/Meta' } } },
       ProductInput: { type: 'object', required: ['slug', 'name', 'categoryId'], properties: { slug: { type: 'string' }, name: { type: 'string' }, categoryId: { type: 'string' }, shortDescription: { type: 'string' }, description: { type: 'string' }, price: { type: 'number', minimum: 0 }, compareAtPrice: { type: 'number' }, images: { type: 'array', maxItems: 8, items: { $ref: '#/components/schemas/Image' } }, stockQuantity: { type: 'integer', minimum: 0 }, lowStockThreshold: { type: 'integer', minimum: 0 }, featured: { type: 'boolean' }, isNew: { type: 'boolean' }, isBestSeller: { type: 'boolean' }, complementaryCategoryIds: { type: 'array', items: { type: 'string' } }, details: { type: 'array', items: { type: 'string' } }, specifications: { type: 'array', items: { type: 'object', required: ['label', 'value'], properties: { label: { type: 'string' }, value: { type: 'string' } } } }, status: { enum: ['draft', 'active'] } } },
       ProductPatch: { allOf: [{ $ref: '#/components/schemas/ProductInput' }], description: 'All properties optional; slug is not accepted.' },
+      AdminOrderSummary: {
+        type: 'object',
+        required: ['id', 'orderNumber', 'customer', 'currency', 'productPaymentTotalPesewas', 'paymentStatus', 'fulfillmentStatus', 'deliveryFeeStatus'],
+        properties: {
+          id: { type: 'string' },
+          orderNumber: { type: 'string' },
+          customer: { type: 'object', properties: { fullName: { type: 'string' }, email: { type: 'string' }, whatsappNumber: { type: 'string' } } },
+          itemCount: { type: 'integer' },
+          unitCount: { type: 'integer' },
+          currency: { const: 'GHS' },
+          subtotalPesewas: { type: 'integer' },
+          productPaymentTotalPesewas: { type: 'integer' },
+          deliveryFeePesewas: { type: ['integer', 'null'] },
+          grandTotalPesewas: { type: 'integer' },
+          paymentStatus: { enum: ['pending', 'paid', 'failed', 'refunded', 'needs_attention'] },
+          fulfillmentStatus: { enum: ['awaiting_payment', 'paid_awaiting_delivery', 'processing', 'out_for_delivery', 'delivered', 'cancelled', 'needs_attention'] },
+          deliveryFeeStatus: { enum: ['not_quoted', 'quoted', 'collected', 'waived'] },
+          stockReservationStatus: { enum: ['active', 'committed', 'released'] },
+          createdAt: { type: 'string', format: 'date-time' },
+          updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      AdminCustomer: {
+        type: 'object',
+        required: ['id', 'fullName', 'email', 'whatsappNumber', 'paidOrderCount', 'lifetimeValuePesewas', 'status'],
+        properties: {
+          id: { type: 'string' },
+          fullName: { type: 'string' },
+          email: { type: 'string', format: 'email' },
+          whatsappNumber: { type: 'string' },
+          defaultDeliveryAddress: { type: 'string' },
+          paidOrderCount: { type: 'integer' },
+          lifetimeValuePesewas: { type: 'integer' },
+          lastPaidOrderAt: { type: 'string', format: 'date-time' },
+          status: { enum: ['active', 'blocked'] },
+        },
+      },
       ReviewInput: { type: 'object', required: ['reviewerName', 'rating', 'comment'], properties: { reviewerName: { type: 'string', minLength: 2, maxLength: 60 }, rating: { type: 'integer', minimum: 1, maximum: 5 }, comment: { type: 'string', minLength: 10, maxLength: 500 } } },
       CheckoutInput: {
         type: 'object',

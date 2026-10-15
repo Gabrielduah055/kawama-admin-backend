@@ -9,6 +9,15 @@ import {
   updateCategoryOrder,
 } from '../controllers/categoryController.js';
 import {
+  getAdminCustomerById,
+  getAdminCustomers,
+  getAdminDashboardSummary,
+  getAdminOrderById,
+  getAdminOrders,
+  updateAdminOrderDelivery,
+  updateAdminOrderFulfillment,
+} from '../controllers/adminCommerceController.js';
+import {
   archiveProduct,
   createProduct,
   getAllProducts,
@@ -22,6 +31,16 @@ import type { MediaService } from '../services/cloudinary.service.js';
 
 export const createAdminRouter = (mediaService: MediaService): Router => {
   const router = Router();
+
+  router.get('/dashboard/summary', getAdminDashboardSummary);
+
+  router.get('/orders', getAdminOrders);
+  router.get('/orders/:id', getAdminOrderById);
+  router.patch('/orders/:id/fulfillment', updateAdminOrderFulfillment);
+  router.patch('/orders/:id/delivery', updateAdminOrderDelivery);
+
+  router.get('/customers', getAdminCustomers);
+  router.get('/customers/:id', getAdminCustomerById);
 
   router.get('/products', getAllProducts);
   router.post('/products', createProduct);
