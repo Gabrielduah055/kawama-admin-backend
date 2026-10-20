@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import mongoose, { type ClientSession } from 'mongoose';
 import { AppError } from '../errors/AppError.js';
 import { hashCheckoutToken } from '../lib/orders.js';
@@ -124,22 +125,81 @@ function uncertainInitializationError(): AppError {
   );
 }
 
-async function cancelAfterInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
+interface OwnedRecoveryLease {
+  attemptId: unknown;
+  leaseId: string;
+}
+
+type ExhaustedRecoveryGuard =
+  | OwnedRecoveryLease
+  | { attemptId: unknown; staleBefore: Date; leaseId?: string }
+  | { attemptId: unknown; completed: true };
+
+function recoveryAttemptFilter(
+  order: any,
+  guard: ExhaustedRecoveryGuard,
+): Record<string, unknown> {
+  const filter: Record<string, unknown> = {
+    _id: guard.attemptId,
+    order: order._id,
+    reference: order.paymentReference,
+  };
+  if ('completed' in guard) {
+    return {
+      ...filter,
+      status: 'uncertain',
+      reconciliationAttempts: { $gte: MAX_RECONCILIATION_ATTEMPTS },
+    };
+  }
+  if ('staleBefore' in guard) {
+    return {
+      ...filter,
+      status: 'reconciling',
+      reconciliationStartedAt: { $lte: guard.staleBefore },
+      reconciliationLeaseId: guard.leaseId ?? { $exists: false },
+    };
+  }
+  return {
+    ...filter,
+    status: 'reconciling',
+    reconciliationLeaseId: guard.leaseId,
+  };
+}
+
+async function cancelAfterInitializationFailure(
+  orderId: unknown,
+  errorCode: string,
+  recoveryLease?: OwnedRecoveryLease,
+): Promise<boolean> {
+  let transitioned = false;
   await mongoose.connection.transaction(async (session) => {
+    transitioned = false;
     const order = await OrderModel.findById(orderId).session(session);
     if (!order || order.paymentStatus !== 'pending') return;
+    const attemptFilter = recoveryLease
+      ? recoveryAttemptFilter(order, recoveryLease)
+      : { order: order._id, reference: order.paymentReference };
+    if (recoveryLease && !(await PaymentAttemptModel.exists(attemptFilter).session(session))) return;
     await releaseReservationInSession(order, session);
     order.stockReservationStatus = 'released';
     order.paymentStatus = 'failed';
     order.fulfillmentStatus = 'cancelled';
     order.cancelledAt = new Date();
     await order.save({ session });
-    await PaymentAttemptModel.updateOne(
-      { order: order._id, reference: order.paymentReference },
-      { status: 'failed', lastErrorCode: errorCode },
+    const attemptUpdate = await PaymentAttemptModel.updateOne(
+      attemptFilter,
+      {
+        $set: { status: 'failed', lastErrorCode: errorCode },
+        $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+      },
       { session },
     );
+    if (recoveryLease && attemptUpdate.matchedCount !== 1) {
+      throw new Error('Recovery lease changed during cancellation.');
+    }
+    transitioned = true;
   });
+  return transitioned;
 }
 
 async function recordUncertainInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
@@ -149,28 +209,39 @@ async function recordUncertainInitializationFailure(orderId: unknown, errorCode:
   );
 }
 
-async function markRecoveryNeedsAttention(orderId: unknown, errorCode: string): Promise<void> {
+async function markRecoveryNeedsAttention(
+  orderId: unknown,
+  errorCode: string,
+  guard: ExhaustedRecoveryGuard,
+): Promise<boolean> {
+  let transitioned = false;
   await mongoose.connection.transaction(async (session) => {
+    transitioned = false;
     const order = await OrderModel.findById(orderId).session(session);
     if (!order || order.paymentStatus === 'paid' || order.paymentStatus === 'needs_attention') return;
+    const attemptFilter = recoveryAttemptFilter(order, guard);
+    if (!(await PaymentAttemptModel.exists(attemptFilter).session(session))) return;
     await releaseReservationInSession(order, session);
     order.stockReservationStatus = 'released';
     order.paymentStatus = 'needs_attention';
     order.fulfillmentStatus = 'needs_attention';
     await order.save({ session });
-    await PaymentAttemptModel.updateOne(
-      { order: order._id, reference: order.paymentReference },
+    const attemptUpdate = await PaymentAttemptModel.updateOne(
+      attemptFilter,
       {
         $set: {
           status: 'needs_attention',
           lastErrorCode: errorCode,
           lastReconciledAt: new Date(),
         },
-        $unset: { reconciliationStartedAt: 1 },
+        $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
       },
       { session },
     );
+    if (attemptUpdate.matchedCount !== 1) throw new Error('Recovery lease changed during escalation.');
+    transitioned = true;
   });
+  return transitioned;
 }
 
 async function loadCheckoutSession(orderId: unknown, checkoutToken: string): Promise<CheckoutSession> {
@@ -192,6 +263,7 @@ async function reconcileUncertainInitialization(
 ): Promise<CheckoutSession> {
   const now = new Date();
   const staleBefore = new Date(now.getTime() - RECONCILIATION_LEASE_MS);
+  const leaseId = randomUUID();
   const acquired = await PaymentAttemptModel.findOneAndUpdate(
     {
       _id: attempt._id,
@@ -213,7 +285,7 @@ async function reconcileUncertainInitialization(
       ],
     },
     {
-      $set: { status: 'reconciling', reconciliationStartedAt: now },
+      $set: { status: 'reconciling', reconciliationStartedAt: now, reconciliationLeaseId: leaseId },
       $inc: { reconciliationAttempts: 1 },
     },
     { returnDocument: 'after' },
@@ -222,7 +294,7 @@ async function reconcileUncertainInitialization(
   if (!acquired) {
     const currentOrder = await OrderModel.findById(order._id).lean();
     const currentAttempt = await PaymentAttemptModel.findById(attempt._id)
-      .select('+accessCode +authorizationUrl')
+      .select('+accessCode +authorizationUrl +reconciliationLeaseId')
       .lean();
     if (!currentOrder) throw new AppError(404, 'CHECKOUT_NOT_FOUND', 'Checkout not found.');
     if (
@@ -232,43 +304,84 @@ async function reconcileUncertainInitialization(
     ) {
       return checkoutSessionFromOrder(currentOrder, checkoutToken, currentAttempt);
     }
+    const reconciliationStartedAt = currentAttempt?.reconciliationStartedAt
+      ? new Date(currentAttempt.reconciliationStartedAt)
+      : undefined;
+    if (
+      currentAttempt?.status === 'reconciling' &&
+      reconciliationStartedAt &&
+      reconciliationStartedAt > staleBefore
+    ) {
+      throw uncertainInitializationError();
+    }
     if ((currentAttempt?.reconciliationAttempts ?? 0) >= MAX_RECONCILIATION_ATTEMPTS) {
-      await markRecoveryNeedsAttention(order._id, currentAttempt?.lastErrorCode ?? 'PAYSTACK_RECOVERY_EXHAUSTED');
-      return loadCheckoutSession(order._id, checkoutToken);
+      const guard: ExhaustedRecoveryGuard | undefined = currentAttempt?.status === 'uncertain'
+        ? { attemptId: currentAttempt._id, completed: true }
+        : currentAttempt?.status === 'reconciling' && reconciliationStartedAt
+          ? {
+              attemptId: currentAttempt._id,
+              staleBefore,
+              ...(typeof currentAttempt.reconciliationLeaseId === 'string'
+                ? { leaseId: currentAttempt.reconciliationLeaseId }
+                : {}),
+            }
+          : undefined;
+      if (guard) {
+        await markRecoveryNeedsAttention(
+          order._id,
+          currentAttempt?.lastErrorCode ?? 'PAYSTACK_RECOVERY_EXHAUSTED',
+          guard,
+        );
+      }
+      const current = await loadCheckoutSession(order._id, checkoutToken);
+      if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
     }
     throw uncertainInitializationError();
   }
+
+  const recoveryLease: OwnedRecoveryLease = { attemptId: acquired._id, leaseId };
 
   let verification: PaystackVerification;
   try {
     verification = await gateway.verifyTransaction(order.paymentReference, requestId);
   } catch (error) {
     const errorCode = error instanceof AppError ? error.code : 'PAYSTACK_VERIFICATION_UNAVAILABLE';
-    await PaymentAttemptModel.updateOne(
-      { _id: acquired._id, status: 'reconciling' },
-      {
-        $set: { status: 'uncertain', lastErrorCode: errorCode, lastReconciledAt: new Date() },
-        $unset: { reconciliationStartedAt: 1 },
-      },
-    );
     if (acquired.reconciliationAttempts >= MAX_RECONCILIATION_ATTEMPTS) {
-      await markRecoveryNeedsAttention(order._id, errorCode);
-      return loadCheckoutSession(order._id, checkoutToken);
+      await markRecoveryNeedsAttention(order._id, errorCode, recoveryLease);
+    } else {
+      await PaymentAttemptModel.updateOne(
+        recoveryAttemptFilter(order, recoveryLease),
+        {
+          $set: { status: 'uncertain', lastErrorCode: errorCode, lastReconciledAt: new Date() },
+          $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+        },
+      );
     }
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
     throw uncertainInitializationError();
   }
 
   const providerStatus = verification.status.toLowerCase();
   if (!verificationIdentityMatches(order, verification)) {
-    await markPaymentNeedsAttention(order._id, verification, 'PAYMENT_VERIFICATION_MISMATCH');
-    return loadCheckoutSession(order._id, checkoutToken);
+    await markPaymentNeedsAttention(order._id, verification, 'PAYMENT_VERIFICATION_MISMATCH', recoveryLease);
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+    throw uncertainInitializationError();
   }
   if (providerStatus === 'success') {
     await finalizeVerifiedPayment(order.paymentReference, verification);
     return loadCheckoutSession(order._id, checkoutToken);
   }
   if (UNSUCCESSFUL_PROVIDER_STATUSES.has(providerStatus)) {
-    await cancelAfterInitializationFailure(order._id, `PAYSTACK_PAYMENT_${providerStatus.toUpperCase()}`);
+    const cancelled = await cancelAfterInitializationFailure(
+      order._id,
+      `PAYSTACK_PAYMENT_${providerStatus.toUpperCase()}`,
+      recoveryLease,
+    );
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (current.paymentStatus === 'paid' || current.paymentStatus === 'needs_attention') return current;
+    if (!cancelled && current.paymentStatus !== 'failed') throw uncertainInitializationError();
     throw new AppError(
       409,
       'CHECKOUT_INITIALIZATION_FAILED',
@@ -276,29 +389,38 @@ async function reconcileUncertainInitialization(
     );
   }
   if (PENDING_PROVIDER_STATUSES.has(providerStatus)) {
-    await PaymentAttemptModel.updateOne(
-      { _id: acquired._id, status: 'reconciling' },
-      {
-        $set: {
-          status: 'uncertain',
-          providerStatus,
-          providerTransactionId: verification.transactionId,
-          verifiedAt: new Date(),
-          lastReconciledAt: new Date(),
-          lastErrorCode: 'PAYSTACK_PAYMENT_PENDING',
-        },
-        $unset: { reconciliationStartedAt: 1 },
-      },
-    );
     if (acquired.reconciliationAttempts >= MAX_RECONCILIATION_ATTEMPTS) {
-      await markPaymentNeedsAttention(order._id, verification, 'PAYSTACK_RECOVERY_EXHAUSTED');
-      return loadCheckoutSession(order._id, checkoutToken);
+      await markPaymentNeedsAttention(
+        order._id,
+        verification,
+        'PAYSTACK_RECOVERY_EXHAUSTED',
+        recoveryLease,
+      );
+    } else {
+      await PaymentAttemptModel.updateOne(
+        recoveryAttemptFilter(order, recoveryLease),
+        {
+          $set: {
+            status: 'uncertain',
+            providerStatus,
+            providerTransactionId: verification.transactionId,
+            verifiedAt: new Date(),
+            lastReconciledAt: new Date(),
+            lastErrorCode: 'PAYSTACK_PAYMENT_PENDING',
+          },
+          $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+        },
+      );
     }
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
     throw uncertainInitializationError();
   }
 
-  await markPaymentNeedsAttention(order._id, verification, 'PAYSTACK_UNKNOWN_PAYMENT_STATUS');
-  return loadCheckoutSession(order._id, checkoutToken);
+  await markPaymentNeedsAttention(order._id, verification, 'PAYSTACK_UNKNOWN_PAYMENT_STATUS', recoveryLease);
+  const current = await loadCheckoutSession(order._id, checkoutToken);
+  if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+  throw uncertainInitializationError();
 }
 
 async function existingCheckoutSession(
@@ -506,10 +628,17 @@ async function markPaymentNeedsAttention(
   orderId: unknown,
   verification: PaystackVerification,
   errorCode: string,
-): Promise<void> {
+  recoveryLease?: OwnedRecoveryLease,
+): Promise<boolean> {
+  let transitioned = false;
   await mongoose.connection.transaction(async (session) => {
+    transitioned = false;
     const order = await OrderModel.findById(orderId).session(session);
     if (!order || order.paymentStatus === 'paid') return;
+    const attemptFilter = recoveryLease
+      ? recoveryAttemptFilter(order, recoveryLease)
+      : { order: order._id, reference: order.paymentReference };
+    if (recoveryLease && !(await PaymentAttemptModel.exists(attemptFilter).session(session))) return;
     await releaseReservationInSession(order, session);
     order.stockReservationStatus = 'released';
     order.paymentStatus = 'needs_attention';
@@ -517,18 +646,26 @@ async function markPaymentNeedsAttention(
     order.paystackTransactionId = verification.transactionId;
     order.paymentVerifiedAt = new Date();
     await order.save({ session });
-    await PaymentAttemptModel.updateOne(
-      { order: order._id, reference: order.paymentReference },
+    const attemptUpdate = await PaymentAttemptModel.updateOne(
+      attemptFilter,
       {
-        status: 'needs_attention',
-        providerStatus: verification.status,
-        providerTransactionId: verification.transactionId,
-        verifiedAt: new Date(),
-        lastErrorCode: errorCode,
+        $set: {
+          status: 'needs_attention',
+          providerStatus: verification.status,
+          providerTransactionId: verification.transactionId,
+          verifiedAt: new Date(),
+          lastErrorCode: errorCode,
+        },
+        $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
       },
       { session },
     );
+    if (recoveryLease && attemptUpdate.matchedCount !== 1) {
+      throw new Error('Recovery lease changed during payment review.');
+    }
+    transitioned = true;
   });
+  return transitioned;
 }
 
 export type PaymentFinalizationResult = 'paid' | 'already_paid' | 'needs_attention' | 'unknown_order';
@@ -583,11 +720,14 @@ export async function finalizeVerifiedPayment(
       await PaymentAttemptModel.updateOne(
         { order: order._id, reference: order.paymentReference },
         {
-          status: 'success',
-          providerStatus: verification.status,
-          providerTransactionId: verification.transactionId,
-          verifiedAt: new Date(),
-          paidAt,
+          $set: {
+            status: 'success',
+            providerStatus: verification.status,
+            providerTransactionId: verification.transactionId,
+            verifiedAt: new Date(),
+            paidAt,
+          },
+          $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
         },
         { session },
       );

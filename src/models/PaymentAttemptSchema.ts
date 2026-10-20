@@ -26,6 +26,7 @@ const paymentAttemptSchema = new Schema(
     providerStatus: { type: String, trim: true },
     lastErrorCode: { type: String, trim: true },
     reconciliationAttempts: { type: Number, min: 0, default: 0 },
+    reconciliationLeaseId: { type: String, trim: true, select: false },
     reconciliationStartedAt: { type: Date },
     lastReconciledAt: { type: Date },
     initializedAt: { type: Date },

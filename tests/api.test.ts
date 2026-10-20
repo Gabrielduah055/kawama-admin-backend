@@ -34,6 +34,7 @@ let paystackConfigurationError: AppError | undefined;
 let recordInitializationBeforeError = false;
 let paystackVerificationGate: Promise<void> | undefined;
 let notifyPaystackVerificationStarted: (() => void) | undefined;
+let paystackVerificationHandler: ((reference: string) => Promise<PaystackVerification>) | undefined;
 const initializedPayments = new Map<string, InitializePaystackInput>();
 
 const mediaService: MediaService = {
@@ -61,6 +62,7 @@ const paystackService: PaystackGateway = {
   },
   verifyTransaction: async (reference) => {
     paystackVerificationCalls += 1;
+    if (paystackVerificationHandler) return paystackVerificationHandler(reference);
     notifyPaystackVerificationStarted?.();
     await paystackVerificationGate;
     if (paystackVerificationError) throw paystackVerificationError;
@@ -172,6 +174,7 @@ beforeEach(async () => {
   recordInitializationBeforeError = false;
   paystackVerificationGate = undefined;
   notifyPaystackVerificationStarted = undefined;
+  paystackVerificationHandler = undefined;
   initializedPayments.clear();
   await Promise.all([
     AdminModel.deleteMany({}),
@@ -715,6 +718,261 @@ describe('Kawama API', () => {
       paidOrderCount: 1,
       lifetimeValuePesewas: 38_000,
     });
+  });
+
+  it('returns the paid checkout when a webhook wins against an older failed recovery response', async () => {
+    const selectedProduct = await product({ pricePesewas: 16_500, stockQuantity: 5 });
+    const checkoutToken = 'webhook-wins-recovery-token-001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Webhook Race Customer',
+        email: 'webhook-race@example.com',
+        whatsappNumber: '+233541111120',
+        deliveryAddress: 'East Legon, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 2 }],
+    };
+    recordInitializationBeforeError = true;
+    paystackInitializationError = new AppError(504, 'PAYSTACK_TIMEOUT', 'The response was lost.');
+    const initial = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(initial.status).toBe(409);
+
+    const order = await OrderModel.findOne({ 'customer.email': 'webhook-race@example.com' }).lean();
+    expect(order).not.toBeNull();
+    let releaseFailedRecovery!: () => void;
+    const failedRecoveryGate = new Promise<void>((resolve) => { releaseFailedRecovery = resolve; });
+    let notifyFailedRecoveryStarted!: () => void;
+    const failedRecoveryStarted = new Promise<void>((resolve) => { notifyFailedRecoveryStarted = resolve; });
+    let verificationNumber = 0;
+    paystackVerificationHandler = async (reference) => {
+      verificationNumber += 1;
+      const initialized = initializedPayments.get(reference);
+      if (!initialized) throw new Error('Expected the synthetic initialization to be recorded.');
+      if (verificationNumber === 1) {
+        notifyFailedRecoveryStarted();
+        await failedRecoveryGate;
+        return {
+          transactionId: 'older-failed-verification',
+          status: 'failed',
+          reference,
+          amountPesewas: initialized.amountPesewas,
+          currency: initialized.currency,
+          customerEmail: initialized.email,
+        };
+      }
+      return {
+        transactionId: 'webhook-confirmed-payment',
+        status: 'success',
+        reference,
+        amountPesewas: initialized.amountPesewas,
+        currency: initialized.currency,
+        paidAt: new Date('2026-10-20T09:00:00.000Z'),
+        customerEmail: initialized.email,
+      };
+    };
+
+    const recoveryPromise = request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload)
+      .then((response) => response);
+    await failedRecoveryStarted;
+
+    const event = { event: 'charge.success', data: { reference: order!.paymentReference } };
+    const webhook = await request(app)
+      .post('/api/v1/webhooks/paystack')
+      .set('x-paystack-signature', 'valid-test-signature')
+      .send(event);
+    expect(webhook.status).toBe(200);
+
+    releaseFailedRecovery();
+    const recovered = await recoveryPromise;
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.data).toMatchObject({
+      orderNumber: order!.orderNumber,
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'paid_awaiting_delivery',
+    });
+    expect(recovered.body.error).toBeUndefined();
+
+    const duplicateWebhook = await request(app)
+      .post('/api/v1/webhooks/paystack')
+      .set('x-paystack-signature', 'valid-test-signature')
+      .send(event);
+    expect(duplicateWebhook.status).toBe(200);
+    const repeatedRetry = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(repeatedRetry.status).toBe(200);
+    expect(repeatedRetry.body.data.paymentStatus).toBe('paid');
+    expect(paystackInitializationCalls).toBe(1);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 3,
+      reservedQuantity: 0,
+    });
+    expect(await CustomerModel.findOne({ whatsappNumber: '+233541111120' }).lean()).toMatchObject({
+      paidOrderCount: 1,
+      lifetimeValuePesewas: 33_000,
+    });
+  });
+
+  it('keeps the reservation active while the third recovery lease is running, then escalates its completed failure', async () => {
+    const selectedProduct = await product({ pricePesewas: 15_000, stockQuantity: 2 });
+    const checkoutToken = 'active-final-recovery-token-0001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Active Lease Customer',
+        email: 'active-lease@example.com',
+        whatsappNumber: '+233541111121',
+        deliveryAddress: 'Adabraka, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+    paystackInitializationError = new AppError(502, 'PAYSTACK_INVALID_RESPONSE', 'The response was invalid.');
+    await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    paystackVerificationError = new AppError(502, 'PAYSTACK_CONNECTION_FAILED', 'Verification is unavailable.');
+
+    for (let recovery = 1; recovery <= 2; recovery += 1) {
+      const response = await request(app)
+        .post('/api/v1/checkout/sessions')
+        .set('idempotency-key', checkoutToken)
+        .send(checkoutPayload);
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
+    }
+
+    let releaseFinalVerification!: () => void;
+    paystackVerificationGate = new Promise<void>((resolve) => { releaseFinalVerification = resolve; });
+    let notifyFinalVerificationStarted!: () => void;
+    const finalVerificationStarted = new Promise<void>((resolve) => { notifyFinalVerificationStarted = resolve; });
+    notifyPaystackVerificationStarted = notifyFinalVerificationStarted;
+    const finalRecoveryPromise = request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload)
+      .then((response) => response);
+    await finalVerificationStarted;
+    const ownedAttempt = await PaymentAttemptModel.findOne({})
+      .select('+reconciliationLeaseId')
+      .lean();
+    expect(ownedAttempt).toMatchObject({ status: 'reconciling', reconciliationAttempts: 3 });
+    expect(typeof ownedAttempt?.reconciliationLeaseId).toBe('string');
+
+    const duplicate = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
+    expect(await OrderModel.findOne({ 'customer.email': 'active-lease@example.com' }).lean()).toMatchObject({
+      paymentStatus: 'pending',
+      stockReservationStatus: 'active',
+    });
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 1,
+    });
+    const activeAttempt = await PaymentAttemptModel.findOne({})
+      .select('+reconciliationLeaseId')
+      .lean();
+    expect(activeAttempt).toMatchObject({ status: 'reconciling', reconciliationAttempts: 3 });
+    expect(activeAttempt?.reconciliationLeaseId).toBe(ownedAttempt?.reconciliationLeaseId);
+    expect(activeAttempt?.reconciliationStartedAt?.getTime()).toBe(ownedAttempt?.reconciliationStartedAt?.getTime());
+
+    releaseFinalVerification();
+    const finalRecovery = await finalRecoveryPromise;
+    expect(finalRecovery.status).toBe(200);
+    expect(finalRecovery.body.data.paymentStatus).toBe('needs_attention');
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+    const completedAttempt = await PaymentAttemptModel.findOne({})
+      .select('+reconciliationLeaseId')
+      .lean();
+    expect(completedAttempt).toMatchObject({ status: 'needs_attention', reconciliationAttempts: 3 });
+    expect(completedAttempt?.reconciliationStartedAt).toBeUndefined();
+    expect(completedAttempt?.reconciliationLeaseId).toBeUndefined();
+  });
+
+  it('expires the final recovery lease without allowing its stale worker to overwrite manual review', async () => {
+    const selectedProduct = await product({ pricePesewas: 14_000, stockQuantity: 2 });
+    const checkoutToken = 'expired-final-recovery-token-001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Expired Lease Customer',
+        email: 'expired-lease@example.com',
+        whatsappNumber: '+233541111122',
+        deliveryAddress: 'North Ridge, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+    paystackInitializationError = new AppError(504, 'PAYSTACK_TIMEOUT', 'The response was lost.');
+    await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    paystackVerificationError = new AppError(502, 'PAYSTACK_CONNECTION_FAILED', 'Verification is unavailable.');
+    for (let recovery = 1; recovery <= 2; recovery += 1) {
+      await request(app)
+        .post('/api/v1/checkout/sessions')
+        .set('idempotency-key', checkoutToken)
+        .send(checkoutPayload);
+    }
+
+    let releaseStaleVerification!: () => void;
+    paystackVerificationGate = new Promise<void>((resolve) => { releaseStaleVerification = resolve; });
+    let notifyStaleVerificationStarted!: () => void;
+    const staleVerificationStarted = new Promise<void>((resolve) => { notifyStaleVerificationStarted = resolve; });
+    notifyPaystackVerificationStarted = notifyStaleVerificationStarted;
+    const staleRecoveryPromise = request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload)
+      .then((response) => response);
+    await staleVerificationStarted;
+
+    const aged = await PaymentAttemptModel.updateOne(
+      { status: 'reconciling', reconciliationAttempts: 3 },
+      { $set: { reconciliationStartedAt: new Date(Date.now() - 60_000) } },
+    );
+    expect(aged.modifiedCount).toBe(1);
+    const expiredLeaseRetry = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(expiredLeaseRetry.status).toBe(200);
+    expect(expiredLeaseRetry.body.data.paymentStatus).toBe('needs_attention');
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+
+    releaseStaleVerification();
+    const staleRecovery = await staleRecoveryPromise;
+    expect(staleRecovery.status).toBe(200);
+    expect(staleRecovery.body.data.paymentStatus).toBe('needs_attention');
+    const finalAttempt = await PaymentAttemptModel.findOne({})
+      .select('+reconciliationLeaseId')
+      .lean();
+    expect(finalAttempt).toMatchObject({
+      status: 'needs_attention',
+      reconciliationAttempts: 3,
+    });
+    expect(finalAttempt?.lastErrorCode).toBe('PAYSTACK_CONNECTION_FAILED');
+    expect(finalAttempt?.reconciliationStartedAt).toBeUndefined();
+    expect(finalAttempt?.reconciliationLeaseId).toBeUndefined();
+    expect(paystackVerificationCalls).toBe(3);
   });
 
   it.each([
