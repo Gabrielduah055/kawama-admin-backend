@@ -51,6 +51,21 @@ function successfulInitializationResponse(responseReference = reference): Respon
   }), { status: 200, headers: { 'content-type': 'application/json' } });
 }
 
+function successfulVerificationResponse(status = 'success'): Response {
+  return new Response(JSON.stringify({
+    status: true,
+    message: 'Verification successful',
+    data: {
+      id: 4099260516,
+      status,
+      reference,
+      amount: 40_000,
+      currency: 'GHS',
+      paid_at: status === 'success' ? '2026-10-14T12:00:00.000Z' : null,
+    },
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
 async function expectAppError(promise: Promise<unknown>, code: string, status: number): Promise<AppError> {
   try {
     await promise;
@@ -81,6 +96,11 @@ describe('Paystack gateway', () => {
 
     await expectAppError(gateway.initializeTransaction(initializationInput()), 'PAYSTACK_NOT_CONFIGURED', 503);
     await expectAppError(gateway.verifyTransaction(reference, 'request-verify'), 'PAYSTACK_NOT_CONFIGURED', 503);
+    expect(() => gateway.verifyWebhookSignature(
+      Buffer.from('{"event":"charge.success"}'),
+      '0'.repeat(128),
+      'request-signature',
+    )).toThrowError(expect.objectContaining({ code: 'PAYSTACK_NOT_CONFIGURED', status: 503 }));
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -107,6 +127,43 @@ describe('Paystack gateway', () => {
     process.env.PAYSTACK_SECRET_KEY = value;
     resetEnvironmentForTests();
     expect(() => new HttpPaystackGateway().assertConfigured('request-config')).not.toThrow();
+  });
+
+  it('validates callback configuration only for checkout initialization', async () => {
+    process.env.PAYSTACK_CALLBACK_URL = 'javascript:invalid-callback';
+    resetEnvironmentForTests();
+    const fetcher = vi.fn<typeof fetch>(async () => successfulVerificationResponse());
+    const gateway = new HttpPaystackGateway(fetcher);
+
+    expect(() => gateway.assertConfigured('request-config')).toThrowError(expect.objectContaining({
+      code: 'PAYSTACK_INVALID_CONFIGURATION',
+    }));
+    await expectAppError(
+      gateway.initializeTransaction(initializationInput()),
+      'PAYSTACK_INVALID_CONFIGURATION',
+      503,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+
+    await expect(gateway.verifyTransaction(reference, 'request-verify')).resolves.toMatchObject({
+      reference,
+      status: 'success',
+      amountPesewas: 40_000,
+      currency: 'GHS',
+    });
+    const rawBody = Buffer.from('{"event":"charge.success"}');
+    const signature = createHmac('sha512', secretKey).update(rawBody).digest('hex');
+    expect(gateway.verifyWebhookSignature(rawBody, signature, 'request-signature')).toBe(true);
+  });
+
+  it('requires only the secret key when checking webhook signatures', () => {
+    process.env.PAYSTACK_BASE_URL = 'not-a-url';
+    process.env.PAYSTACK_CALLBACK_URL = 'not-a-url';
+    resetEnvironmentForTests();
+    const rawBody = Buffer.from('{"event":"charge.success"}');
+    const signature = createHmac('sha512', secretKey).update(rawBody).digest('hex');
+
+    expect(new HttpPaystackGateway().verifyWebhookSignature(rawBody, signature, 'request-signature')).toBe(true);
   });
 
   it('initializes payments on the server with pesewas, GHS, the reference, and callback URL', async () => {
@@ -165,6 +222,19 @@ describe('Paystack gateway', () => {
     expect(logLine).not.toContain(secretKey);
     expect(logLine).not.toContain(providerBody);
     expect(logLine).not.toContain('customer@example.com');
+  });
+
+  it('distinguishes a missing transaction during verification', async () => {
+    const gateway = new HttpPaystackGateway((async () => new Response(
+      JSON.stringify({ status: false, message: 'Transaction reference not found' }),
+      { status: 404, headers: { 'content-type': 'application/json' } },
+    )) as typeof fetch);
+
+    await expectAppError(
+      gateway.verifyTransaction(reference, 'request-verify'),
+      'PAYSTACK_TRANSACTION_NOT_FOUND',
+      502,
+    );
   });
 
   it('distinguishes a timeout from other connection failures', async () => {

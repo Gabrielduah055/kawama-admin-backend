@@ -26,9 +26,14 @@ import { checkoutCreateSchema } from '../src/validation/schemas.js';
 let mongo: MongoMemoryReplSet | undefined;
 let mongoDataDirectory: string | undefined;
 let paystackInitializationCalls = 0;
+let paystackVerificationCalls = 0;
 let paystackVerificationOverride: PaystackVerification | undefined;
 let paystackInitializationError: AppError | undefined;
+let paystackVerificationError: AppError | undefined;
 let paystackConfigurationError: AppError | undefined;
+let recordInitializationBeforeError = false;
+let paystackVerificationGate: Promise<void> | undefined;
+let notifyPaystackVerificationStarted: (() => void) | undefined;
 const initializedPayments = new Map<string, InitializePaystackInput>();
 
 const mediaService: MediaService = {
@@ -43,7 +48,10 @@ const paystackService: PaystackGateway = {
   },
   initializeTransaction: async (input) => {
     paystackInitializationCalls += 1;
-    if (paystackInitializationError) throw paystackInitializationError;
+    if (paystackInitializationError) {
+      if (recordInitializationBeforeError) initializedPayments.set(input.reference, input);
+      throw paystackInitializationError;
+    }
     initializedPayments.set(input.reference, input);
     return {
       reference: input.reference,
@@ -52,6 +60,10 @@ const paystackService: PaystackGateway = {
     };
   },
   verifyTransaction: async (reference) => {
+    paystackVerificationCalls += 1;
+    notifyPaystackVerificationStarted?.();
+    await paystackVerificationGate;
+    if (paystackVerificationError) throw paystackVerificationError;
     if (paystackVerificationOverride) return paystackVerificationOverride;
     const initialized = initializedPayments.get(reference);
     if (!initialized) throw new Error('Payment was not initialized in this test.');
@@ -152,9 +164,14 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   paystackInitializationCalls = 0;
+  paystackVerificationCalls = 0;
   paystackVerificationOverride = undefined;
   paystackInitializationError = undefined;
+  paystackVerificationError = undefined;
   paystackConfigurationError = undefined;
+  recordInitializationBeforeError = false;
+  paystackVerificationGate = undefined;
+  notifyPaystackVerificationStarted = undefined;
   initializedPayments.clear();
   await Promise.all([
     AdminModel.deleteMany({}),
@@ -562,8 +579,8 @@ describe('Kawama API', () => {
       .set('idempotency-key', checkoutToken)
       .send(checkoutPayload);
 
-    expect(response.status).toBe(status);
-    expect(response.body.error.code).toBe(code);
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
     expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
       stockQuantity: 2,
       reservedQuantity: 1,
@@ -575,7 +592,7 @@ describe('Kawama API', () => {
       stockReservationStatus: 'active',
     });
     expect(await PaymentAttemptModel.findOne({ order: order!._id }).lean()).toMatchObject({
-      status: 'initializing',
+      status: 'uncertain',
       lastErrorCode: code,
     });
 
@@ -584,8 +601,257 @@ describe('Kawama API', () => {
       .set('idempotency-key', checkoutToken)
       .send(checkoutPayload);
     expect(replay.status).toBe(409);
-    expect(replay.body.error.code).toBe('CHECKOUT_INITIALIZING');
+    expect(replay.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
     expect(paystackInitializationCalls).toBe(1);
+    expect(paystackVerificationCalls).toBe(1);
+  });
+
+  it('recovers a successful payment after an uncertain initialization without creating another charge', async () => {
+    const selectedProduct = await product({ pricePesewas: 21_000, stockQuantity: 3 });
+    const checkoutToken = 'recovery-success-token-000001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Recovery Customer',
+        email: 'recovery@example.com',
+        whatsappNumber: '+233541111112',
+        deliveryAddress: 'Cantonments, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+    recordInitializationBeforeError = true;
+    paystackInitializationError = new AppError(504, 'PAYSTACK_TIMEOUT', 'The response was lost.');
+
+    const initial = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(initial.status).toBe(409);
+    expect(initial.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
+
+    const recovered = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.data).toMatchObject({
+      created: false,
+      checkoutToken,
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'paid_awaiting_delivery',
+      amountPesewas: 21_000,
+      currency: 'GHS',
+    });
+    expect(paystackInitializationCalls).toBe(1);
+    expect(paystackVerificationCalls).toBe(1);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+    expect(await CustomerModel.findOne({ whatsappNumber: '+233541111112' }).lean()).toMatchObject({
+      paidOrderCount: 1,
+      lifetimeValuePesewas: 21_000,
+    });
+  });
+
+  it('serializes concurrent recovery and finalizes the existing payment exactly once', async () => {
+    const selectedProduct = await product({ pricePesewas: 19_000, stockQuantity: 4 });
+    const checkoutToken = 'concurrent-recovery-token-0001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Concurrent Customer',
+        email: 'concurrent@example.com',
+        whatsappNumber: '+233541111113',
+        deliveryAddress: 'Labadi, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 2 }],
+    };
+    recordInitializationBeforeError = true;
+    paystackInitializationError = new AppError(502, 'PAYSTACK_CONNECTION_FAILED', 'The response was lost.');
+    await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+
+    let releaseVerification!: () => void;
+    paystackVerificationGate = new Promise<void>((resolve) => { releaseVerification = resolve; });
+    let verificationStarted!: () => void;
+    const started = new Promise<void>((resolve) => { verificationStarted = resolve; });
+    notifyPaystackVerificationStarted = verificationStarted;
+
+    const firstReplayPromise = request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload)
+      .then((response) => response);
+    await started;
+    const concurrentReplay = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(concurrentReplay.status).toBe(409);
+    expect(concurrentReplay.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
+
+    releaseVerification();
+    const firstReplay = await firstReplayPromise;
+    expect(firstReplay.status).toBe(200);
+    expect(firstReplay.body.data.paymentStatus).toBe('paid');
+
+    const repeatedReplay = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(repeatedReplay.status).toBe(200);
+    expect(repeatedReplay.body.data.paymentStatus).toBe('paid');
+    expect(paystackInitializationCalls).toBe(1);
+    expect(paystackVerificationCalls).toBe(1);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+    expect(await CustomerModel.findOne({ whatsappNumber: '+233541111113' }).lean()).toMatchObject({
+      paidOrderCount: 1,
+      lifetimeValuePesewas: 38_000,
+    });
+  });
+
+  it.each([
+    ['PAYSTACK_TRANSACTION_NOT_FOUND', 502],
+    ['PAYSTACK_CONNECTION_FAILED', 502],
+  ])('moves an unrecoverable uncertain checkout to manual review after bounded %s checks', async (code, status) => {
+    const selectedProduct = await product({ stockQuantity: 2 });
+    const checkoutToken = `bounded-${code.toLowerCase()}-0001`;
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Review Customer',
+        email: 'review@example.com',
+        whatsappNumber: '+233541111114',
+        deliveryAddress: 'Dzorwulu, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+    paystackInitializationError = new AppError(502, 'PAYSTACK_INVALID_RESPONSE', 'The response was invalid.');
+    await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    paystackVerificationError = new AppError(status, code, 'Verification is unavailable.');
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const retry = await request(app)
+        .post('/api/v1/checkout/sessions')
+        .set('idempotency-key', checkoutToken)
+        .send(checkoutPayload);
+      expect(retry.status).toBe(409);
+      expect(retry.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
+    }
+    const exhausted = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(exhausted.status).toBe(200);
+    expect(exhausted.body.data).toMatchObject({
+      created: false,
+      checkoutToken,
+      paymentStatus: 'needs_attention',
+      fulfillmentStatus: 'needs_attention',
+    });
+    expect(paystackInitializationCalls).toBe(1);
+    expect(paystackVerificationCalls).toBe(3);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+  });
+
+  it('keeps a provider-pending transaction protected, then exposes manual review after bounded checks', async () => {
+    const selectedProduct = await product({ pricePesewas: 18_000, stockQuantity: 2 });
+    const checkoutToken = 'provider-pending-token-000001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Pending Customer',
+        email: 'pending@example.com',
+        whatsappNumber: '+233541111115',
+        deliveryAddress: 'Ridge, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+    paystackInitializationError = new AppError(504, 'PAYSTACK_TIMEOUT', 'The response was lost.');
+    await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    const order = await OrderModel.findOne({ 'customer.email': 'pending@example.com' }).lean();
+    paystackVerificationOverride = {
+      transactionId: 'pending-transaction',
+      status: 'pending',
+      reference: order!.paymentReference,
+      amountPesewas: 18_000,
+      currency: 'GHS',
+      customerEmail: 'pending@example.com',
+    };
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const retry = await request(app)
+        .post('/api/v1/checkout/sessions')
+        .set('idempotency-key', checkoutToken)
+        .send(checkoutPayload);
+      expect(retry.body.error.code).toBe('CHECKOUT_INITIALIZATION_UNCERTAIN');
+    }
+    const exhausted = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(exhausted.status).toBe(200);
+    expect(exhausted.body.data.paymentStatus).toBe('needs_attention');
+    expect(paystackInitializationCalls).toBe(1);
+    expect(paystackVerificationCalls).toBe(3);
+  });
+
+  it('fails and releases a provider-confirmed unsuccessful transaction without re-initializing it', async () => {
+    const selectedProduct = await product({ pricePesewas: 17_000, stockQuantity: 2 });
+    const checkoutToken = 'provider-failed-token-0000001';
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Failed Customer',
+        email: 'failed@example.com',
+        whatsappNumber: '+233541111116',
+        deliveryAddress: 'Achimota, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+    paystackInitializationError = new AppError(502, 'PAYSTACK_INVALID_RESPONSE', 'The response was invalid.');
+    await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    const order = await OrderModel.findOne({ 'customer.email': 'failed@example.com' }).lean();
+    paystackVerificationOverride = {
+      transactionId: 'failed-transaction',
+      status: 'failed',
+      reference: order!.paymentReference,
+      amountPesewas: 17_000,
+      currency: 'GHS',
+      customerEmail: 'failed@example.com',
+    };
+
+    const retry = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(retry.status).toBe(409);
+    expect(retry.body.error.code).toBe('CHECKOUT_INITIALIZATION_FAILED');
+    expect(paystackInitializationCalls).toBe(1);
+    expect(paystackVerificationCalls).toBe(1);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
   });
 
   it('lists and retrieves protected admin order records without exposing Paystack checkout credentials', async () => {

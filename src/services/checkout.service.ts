@@ -9,6 +9,10 @@ import { buildPendingOrderDraft, type CheckoutInput } from './order.service.js';
 import type { PaystackGateway, PaystackVerification } from './paystack.service.js';
 
 const RESERVATION_MINUTES = 30;
+const MAX_RECONCILIATION_ATTEMPTS = 3;
+const RECONCILIATION_LEASE_MS = 15_000;
+const PENDING_PROVIDER_STATUSES = new Set(['ongoing', 'pending', 'processing', 'queued']);
+const UNSUCCESSFUL_PROVIDER_STATUSES = new Set(['abandoned', 'failed', 'reversed']);
 const DEFINITIVE_INITIALIZATION_FAILURE_CODES = new Set([
   'PAYSTACK_NOT_CONFIGURED',
   'PAYSTACK_INVALID_CONFIGURATION',
@@ -91,22 +95,7 @@ export async function releaseExpiredCheckoutReservations(now = new Date()): Prom
   for (const order of expired) await expireOrderReservation(order._id, now);
 }
 
-async function existingCheckoutSession(order: any, checkoutToken: string): Promise<CheckoutSession> {
-  const attempt = await PaymentAttemptModel.findOne({ order: order._id })
-    .sort({ createdAt: -1 })
-    .select('+accessCode +authorizationUrl')
-    .lean();
-
-  if (order.paymentStatus === 'failed' || order.fulfillmentStatus === 'cancelled') {
-    throw new AppError(409, 'CHECKOUT_EXPIRED', 'This checkout can no longer be paid. Start a new checkout.');
-  }
-  if (attempt?.status === 'initializing') {
-    throw new AppError(409, 'CHECKOUT_INITIALIZING', 'This checkout is still being initialized. Please try again shortly.');
-  }
-  if (attempt?.status === 'failed') {
-    throw new AppError(409, 'CHECKOUT_INITIALIZATION_FAILED', 'This checkout could not be initialized. Start a new checkout.');
-  }
-
+function checkoutSessionFromOrder(order: any, checkoutToken: string, attempt?: any): CheckoutSession {
   return {
     created: false,
     checkoutToken,
@@ -125,6 +114,14 @@ async function existingCheckoutSession(order: any, checkoutToken: string): Promi
         }
       : {}),
   };
+}
+
+function uncertainInitializationError(): AppError {
+  return new AppError(
+    409,
+    'CHECKOUT_INITIALIZATION_UNCERTAIN',
+    'Paystack initialization could not be confirmed. Keep this checkout and retry with the same key.',
+  );
 }
 
 async function cancelAfterInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
@@ -148,8 +145,193 @@ async function cancelAfterInitializationFailure(orderId: unknown, errorCode: str
 async function recordUncertainInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
   await PaymentAttemptModel.updateOne(
     { order: orderId, status: 'initializing' },
-    { lastErrorCode: errorCode },
+    { status: 'uncertain', lastErrorCode: errorCode },
   );
+}
+
+async function markRecoveryNeedsAttention(orderId: unknown, errorCode: string): Promise<void> {
+  await mongoose.connection.transaction(async (session) => {
+    const order = await OrderModel.findById(orderId).session(session);
+    if (!order || order.paymentStatus === 'paid' || order.paymentStatus === 'needs_attention') return;
+    await releaseReservationInSession(order, session);
+    order.stockReservationStatus = 'released';
+    order.paymentStatus = 'needs_attention';
+    order.fulfillmentStatus = 'needs_attention';
+    await order.save({ session });
+    await PaymentAttemptModel.updateOne(
+      { order: order._id, reference: order.paymentReference },
+      {
+        $set: {
+          status: 'needs_attention',
+          lastErrorCode: errorCode,
+          lastReconciledAt: new Date(),
+        },
+        $unset: { reconciliationStartedAt: 1 },
+      },
+      { session },
+    );
+  });
+}
+
+async function loadCheckoutSession(orderId: unknown, checkoutToken: string): Promise<CheckoutSession> {
+  const order = await OrderModel.findById(orderId).lean();
+  if (!order) throw new AppError(404, 'CHECKOUT_NOT_FOUND', 'Checkout not found.');
+  const attempt = await PaymentAttemptModel.findOne({ order: order._id })
+    .sort({ createdAt: -1 })
+    .select('+accessCode +authorizationUrl')
+    .lean();
+  return checkoutSessionFromOrder(order, checkoutToken, attempt);
+}
+
+async function reconcileUncertainInitialization(
+  order: any,
+  attempt: any,
+  checkoutToken: string,
+  gateway: PaystackGateway,
+  requestId?: string,
+): Promise<CheckoutSession> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - RECONCILIATION_LEASE_MS);
+  const acquired = await PaymentAttemptModel.findOneAndUpdate(
+    {
+      _id: attempt._id,
+      $and: [
+        {
+          $or: [
+            { reconciliationAttempts: { $exists: false } },
+            { reconciliationAttempts: { $lt: MAX_RECONCILIATION_ATTEMPTS } },
+          ],
+        },
+        {
+          $or: [
+            { status: 'uncertain' },
+            { status: 'reconciling', reconciliationStartedAt: { $lte: staleBefore } },
+            { status: 'initializing', lastErrorCode: { $exists: true } },
+            { status: 'initializing', updatedAt: { $lte: staleBefore } },
+          ],
+        },
+      ],
+    },
+    {
+      $set: { status: 'reconciling', reconciliationStartedAt: now },
+      $inc: { reconciliationAttempts: 1 },
+    },
+    { returnDocument: 'after' },
+  );
+
+  if (!acquired) {
+    const currentOrder = await OrderModel.findById(order._id).lean();
+    const currentAttempt = await PaymentAttemptModel.findById(attempt._id)
+      .select('+accessCode +authorizationUrl')
+      .lean();
+    if (!currentOrder) throw new AppError(404, 'CHECKOUT_NOT_FOUND', 'Checkout not found.');
+    if (
+      currentOrder.paymentStatus === 'paid' ||
+      currentOrder.paymentStatus === 'needs_attention' ||
+      currentOrder.paymentStatus === 'failed'
+    ) {
+      return checkoutSessionFromOrder(currentOrder, checkoutToken, currentAttempt);
+    }
+    if ((currentAttempt?.reconciliationAttempts ?? 0) >= MAX_RECONCILIATION_ATTEMPTS) {
+      await markRecoveryNeedsAttention(order._id, currentAttempt?.lastErrorCode ?? 'PAYSTACK_RECOVERY_EXHAUSTED');
+      return loadCheckoutSession(order._id, checkoutToken);
+    }
+    throw uncertainInitializationError();
+  }
+
+  let verification: PaystackVerification;
+  try {
+    verification = await gateway.verifyTransaction(order.paymentReference, requestId);
+  } catch (error) {
+    const errorCode = error instanceof AppError ? error.code : 'PAYSTACK_VERIFICATION_UNAVAILABLE';
+    await PaymentAttemptModel.updateOne(
+      { _id: acquired._id, status: 'reconciling' },
+      {
+        $set: { status: 'uncertain', lastErrorCode: errorCode, lastReconciledAt: new Date() },
+        $unset: { reconciliationStartedAt: 1 },
+      },
+    );
+    if (acquired.reconciliationAttempts >= MAX_RECONCILIATION_ATTEMPTS) {
+      await markRecoveryNeedsAttention(order._id, errorCode);
+      return loadCheckoutSession(order._id, checkoutToken);
+    }
+    throw uncertainInitializationError();
+  }
+
+  const providerStatus = verification.status.toLowerCase();
+  if (!verificationIdentityMatches(order, verification)) {
+    await markPaymentNeedsAttention(order._id, verification, 'PAYMENT_VERIFICATION_MISMATCH');
+    return loadCheckoutSession(order._id, checkoutToken);
+  }
+  if (providerStatus === 'success') {
+    await finalizeVerifiedPayment(order.paymentReference, verification);
+    return loadCheckoutSession(order._id, checkoutToken);
+  }
+  if (UNSUCCESSFUL_PROVIDER_STATUSES.has(providerStatus)) {
+    await cancelAfterInitializationFailure(order._id, `PAYSTACK_PAYMENT_${providerStatus.toUpperCase()}`);
+    throw new AppError(
+      409,
+      'CHECKOUT_INITIALIZATION_FAILED',
+      'Paystack confirmed that this payment cannot continue. Start a new checkout.',
+    );
+  }
+  if (PENDING_PROVIDER_STATUSES.has(providerStatus)) {
+    await PaymentAttemptModel.updateOne(
+      { _id: acquired._id, status: 'reconciling' },
+      {
+        $set: {
+          status: 'uncertain',
+          providerStatus,
+          providerTransactionId: verification.transactionId,
+          verifiedAt: new Date(),
+          lastReconciledAt: new Date(),
+          lastErrorCode: 'PAYSTACK_PAYMENT_PENDING',
+        },
+        $unset: { reconciliationStartedAt: 1 },
+      },
+    );
+    if (acquired.reconciliationAttempts >= MAX_RECONCILIATION_ATTEMPTS) {
+      await markPaymentNeedsAttention(order._id, verification, 'PAYSTACK_RECOVERY_EXHAUSTED');
+      return loadCheckoutSession(order._id, checkoutToken);
+    }
+    throw uncertainInitializationError();
+  }
+
+  await markPaymentNeedsAttention(order._id, verification, 'PAYSTACK_UNKNOWN_PAYMENT_STATUS');
+  return loadCheckoutSession(order._id, checkoutToken);
+}
+
+async function existingCheckoutSession(
+  order: any,
+  checkoutToken: string,
+  gateway: PaystackGateway,
+  requestId?: string,
+): Promise<CheckoutSession> {
+  const attempt = await PaymentAttemptModel.findOne({ order: order._id })
+    .sort({ createdAt: -1 })
+    .select('+accessCode +authorizationUrl')
+    .lean();
+
+  if (order.paymentStatus === 'failed' || order.fulfillmentStatus === 'cancelled') {
+    throw new AppError(409, 'CHECKOUT_EXPIRED', 'This checkout can no longer be paid. Start a new checkout.');
+  }
+  if (order.paymentStatus === 'paid' || order.paymentStatus === 'needs_attention') {
+    return checkoutSessionFromOrder(order, checkoutToken, attempt);
+  }
+  if (attempt?.status === 'initializing' && !attempt.lastErrorCode) {
+    const updatedAt = attempt.updatedAt instanceof Date ? attempt.updatedAt : new Date(attempt.updatedAt);
+    if (updatedAt.getTime() > Date.now() - RECONCILIATION_LEASE_MS) {
+      throw new AppError(409, 'CHECKOUT_INITIALIZING', 'This checkout is still being initialized. Please try again shortly.');
+    }
+  }
+  if (attempt && ['initializing', 'uncertain', 'reconciling'].includes(attempt.status)) {
+    return reconcileUncertainInitialization(order, attempt, checkoutToken, gateway, requestId);
+  }
+  if (attempt?.status === 'failed') {
+    throw new AppError(409, 'CHECKOUT_INITIALIZATION_FAILED', 'This checkout could not be initialized. Start a new checkout.');
+  }
+
+  return checkoutSessionFromOrder(order, checkoutToken, attempt);
 }
 
 function duplicateKeyError(error: unknown): boolean {
@@ -165,7 +347,7 @@ export async function createCheckoutSession(
   await releaseExpiredCheckoutReservations();
   const idempotencyKeyHash = hashCheckoutToken(checkoutToken);
   const existing = await OrderModel.findOne({ idempotencyKeyHash }).lean();
-  if (existing) return existingCheckoutSession(existing, checkoutToken);
+  if (existing) return existingCheckoutSession(existing, checkoutToken, gateway, requestId);
   // This preflight must run before any new order, payment attempt, or stock reservation is created.
   // Existing idempotent sessions remain recoverable if configuration changes later.
   gateway.assertConfigured(requestId);
@@ -220,7 +402,7 @@ export async function createCheckoutSession(
   } catch (error) {
     if (duplicateKeyError(error)) {
       const duplicate = await OrderModel.findOne({ idempotencyKeyHash }).lean();
-      if (duplicate) return existingCheckoutSession(duplicate, checkoutToken);
+      if (duplicate) return existingCheckoutSession(duplicate, checkoutToken, gateway, requestId);
     }
     throw error;
   }
@@ -246,6 +428,9 @@ export async function createCheckoutSession(
       // Preserve this order/reference and its reservation; an idempotent replay will not
       // create a second attempt, and normal expiry will eventually release the stock.
       await recordUncertainInitializationFailure(order._id, errorCode);
+    }
+    if (!(error instanceof AppError) || !DEFINITIVE_INITIALIZATION_FAILURE_CODES.has(error.code)) {
+      throw uncertainInitializationError();
     }
     throw error;
   }
@@ -306,12 +491,15 @@ export async function getCheckoutStatus(checkoutToken: string): Promise<Checkout
   };
 }
 
-function verificationMatches(order: any, verification: PaystackVerification): boolean {
-  return verification.status === 'success' &&
-    verification.reference === order.paymentReference &&
+function verificationIdentityMatches(order: any, verification: PaystackVerification): boolean {
+  return verification.reference === order.paymentReference &&
     verification.amountPesewas === order.productPaymentTotalPesewas &&
     verification.currency.toUpperCase() === order.currency &&
     (!verification.customerEmail || verification.customerEmail === order.customer.email.toLowerCase());
+}
+
+function verificationMatches(order: any, verification: PaystackVerification): boolean {
+  return verification.status.toLowerCase() === 'success' && verificationIdentityMatches(order, verification);
 }
 
 async function markPaymentNeedsAttention(

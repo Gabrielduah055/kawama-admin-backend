@@ -62,9 +62,12 @@ export interface PaystackGateway {
 
 type PaystackOperation = 'configure_checkout' | 'initialize_transaction' | 'verify_transaction' | 'verify_webhook_signature';
 
-interface PaystackConfiguration {
+interface PaystackApiConfiguration {
   secretKey: string;
   baseUrl: string;
+}
+
+interface PaystackCheckoutConfiguration extends PaystackApiConfiguration {
   callbackUrl?: string;
 }
 
@@ -84,11 +87,11 @@ export class HttpPaystackGateway implements PaystackGateway {
   }
 
   assertConfigured(requestId?: string): void {
-    this.configuration('configure_checkout', requestId);
+    this.checkoutConfiguration('configure_checkout', requestId);
   }
 
   async initializeTransaction(input: InitializePaystackInput): Promise<PaystackInitialization> {
-    const configuration = this.configuration('initialize_transaction', input.requestId);
+    const configuration = this.checkoutConfiguration('initialize_transaction', input.requestId);
     let response: Response;
     try {
       response = await this.fetcher(`${configuration.baseUrl}/transaction/initialize`, {
@@ -150,7 +153,7 @@ export class HttpPaystackGateway implements PaystackGateway {
   }
 
   async verifyTransaction(reference: string, requestId?: string): Promise<PaystackVerification> {
-    const configuration = this.configuration('verify_transaction', requestId);
+    const configuration = this.apiConfiguration('verify_transaction', requestId);
     let response: Response;
     try {
       response = await this.fetcher(
@@ -208,17 +211,17 @@ export class HttpPaystackGateway implements PaystackGateway {
   }
 
   verifyWebhookSignature(rawBody: Buffer, signature: string, requestId?: string): boolean {
+    const secretKey = this.secretKey('verify_webhook_signature', requestId);
     if (!/^[a-f\d]{128}$/i.test(signature)) return false;
-    const configuration = this.configuration('verify_webhook_signature', requestId);
     const expected = Buffer.from(
-      createHmac('sha512', configuration.secretKey).update(rawBody).digest('hex'),
+      createHmac('sha512', secretKey).update(rawBody).digest('hex'),
       'hex',
     );
     const received = Buffer.from(signature, 'hex');
     return expected.length === received.length && timingSafeEqual(expected, received);
   }
 
-  private configuration(operation: PaystackOperation, requestId?: string): PaystackConfiguration {
+  private secretKey(operation: PaystackOperation, requestId?: string): string {
     const environment = getEnvironment();
     const secretKey = environment.PAYSTACK_SECRET_KEY?.trim();
     if (!secretKey) {
@@ -239,12 +242,14 @@ export class HttpPaystackGateway implements PaystackGateway {
         requestId,
       );
     }
+    return secretKey;
+  }
 
+  private apiConfiguration(operation: PaystackOperation, requestId?: string): PaystackApiConfiguration {
+    const environment = getEnvironment();
+    const secretKey = this.secretKey(operation, requestId);
     const baseUrl = this.validHttpsUrl(environment.PAYSTACK_BASE_URL);
-    const callbackUrl = environment.PAYSTACK_CALLBACK_URL
-      ? this.validCallbackUrl(environment.PAYSTACK_CALLBACK_URL)
-      : undefined;
-    if (!baseUrl || (environment.PAYSTACK_CALLBACK_URL && !callbackUrl)) {
+    if (!baseUrl) {
       throw this.failure(
         operation,
         503,
@@ -253,11 +258,28 @@ export class HttpPaystackGateway implements PaystackGateway {
         requestId,
       );
     }
-    return {
-      secretKey,
-      baseUrl: baseUrl.replace(/\/$/, ''),
-      ...(callbackUrl ? { callbackUrl } : {}),
-    };
+    return { secretKey, baseUrl: baseUrl.replace(/\/$/, '') };
+  }
+
+  private checkoutConfiguration(
+    operation: 'configure_checkout' | 'initialize_transaction',
+    requestId?: string,
+  ): PaystackCheckoutConfiguration {
+    const environment = getEnvironment();
+    const configuration = this.apiConfiguration(operation, requestId);
+    const callbackUrl = environment.PAYSTACK_CALLBACK_URL
+      ? this.validCallbackUrl(environment.PAYSTACK_CALLBACK_URL)
+      : undefined;
+    if (environment.PAYSTACK_CALLBACK_URL && !callbackUrl) {
+      throw this.failure(
+        operation,
+        503,
+        'PAYSTACK_INVALID_CONFIGURATION',
+        'Online payment is temporarily unavailable.',
+        requestId,
+      );
+    }
+    return { ...configuration, ...(callbackUrl ? { callbackUrl } : {}) };
   }
 
   private validHttpsUrl(value: string): string | undefined {
@@ -315,6 +337,16 @@ export class HttpPaystackGateway implements PaystackGateway {
         502,
         'PAYSTACK_PROVIDER_ERROR',
         'Paystack could not complete the request. Keep this checkout and try again shortly.',
+        requestId,
+        providerStatus,
+      );
+    }
+    if (operation === 'verify_transaction' && providerStatus === 404) {
+      return this.failure(
+        operation,
+        502,
+        'PAYSTACK_TRANSACTION_NOT_FOUND',
+        'Paystack has no transaction for this payment reference.',
         requestId,
         providerStatus,
       );

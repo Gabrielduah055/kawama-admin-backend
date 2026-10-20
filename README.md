@@ -53,9 +53,11 @@ The API accepts real Paystack test and live secret-key formats (`sk_test_...` an
 
 Create a checkout with `POST /api/v1/checkout/sessions`. Send a fresh UUID-like value in the `Idempotency-Key` header and the customer/cart payload in the body. The API recalculates prices from MongoDB, reserves stock for 30 minutes, creates the order, and returns Paystack's `accessCode`. Reusing the same idempotency key returns the same checkout without reserving stock twice.
 
-A definitive provider rejection (for example, Paystack HTTP 401/403) fails the order and releases its reservation. A timeout, connection loss, provider 5xx, or malformed success response has an uncertain outcome: the API keeps the original order, reference, and reservation instead of risking a second charge. The storefront must retain and reuse the same idempotency key; it must not silently generate a replacement. The reservation expires through the existing 30-minute cleanup path if no verified payment arrives.
+A definitive provider rejection (for example, Paystack HTTP 401/403) fails the order and releases its reservation. A timeout, connection loss, provider 5xx, or malformed success response has an uncertain outcome: the API keeps the original order, reference, and reservation instead of risking a second charge. It returns `CHECKOUT_INITIALIZATION_UNCERTAIN`; the storefront must retain and reuse the same idempotency key and exact payload, never archive that checkout or silently generate a replacement.
 
-The storefront can poll `GET /api/v1/checkout/sessions/:checkoutToken`. This endpoint returns limited status information and never treats a browser callback as proof of payment.
+An idempotent `POST` retry reconciles an uncertain attempt by calling Paystack's transaction-verification endpoint with the existing server-stored reference. It never initializes another transaction. Successful verification uses the same idempotent payment-finalization path as the webhook. Provider-pending, not-found, and unavailable results preserve the checkout for up to three on-demand reconciliation checks; there is no background recovery worker. If those checks cannot establish a safe result, the API returns the checkout with `paymentStatus` and `fulfillmentStatus` set to `needs_attention`, releases the reservation, and the customer must not submit another payment. A provider-confirmed unsuccessful transaction fails the checkout and permits a deliberate new checkout.
+
+The storefront can poll `GET /api/v1/checkout/sessions/:checkoutToken`. This endpoint returns limited status information and never treats a browser callback as proof of payment. Reservations otherwise expire through the existing 30-minute request-triggered cleanup path if no verified payment arrives.
 
 For the currently named deployed test API, set this webhook URL in the Paystack **test mode** dashboard:
 
@@ -88,7 +90,9 @@ In the Render dashboard for the deployed backend, set these service environment 
 
 Save the Render environment changes, then restart or manually redeploy the backend service so the running process reads them. Editing `.env` on a laptop does **not** configure Render. In the Paystack dashboard's matching test/live mode, configure the deployed webhook URL shown above and confirm the selected API keys and webhook belong to the same mode.
 
-Repository code cannot verify the values currently stored in Render or Paystack. Check the failed response's `error.code`/`requestId` and the matching Render log entry to distinguish `PAYSTACK_NOT_CONFIGURED`, `PAYSTACK_INVALID_CONFIGURATION`, `PAYSTACK_AUTHENTICATION_FAILED`, `PAYSTACK_TIMEOUT`, `PAYSTACK_CONNECTION_FAILED`, `PAYSTACK_PROVIDER_ERROR`, and `PAYSTACK_INVALID_RESPONSE` without exposing credentials or provider bodies.
+Repository code cannot verify the values currently stored in Render or Paystack. Check the failed response's `error.code`/`requestId` and the matching Render log entry without exposing credentials or provider bodies. The gateway logs provider-specific configuration, authentication, timeout, connection, HTTP, and malformed-response codes; checkout initialization presents uncertain outcomes to clients as `CHECKOUT_INITIALIZATION_UNCERTAIN` so they cannot be mistaken for permission to replace the checkout.
+
+Configuration is validated per operation: webhook HMAC verification requires only `PAYSTACK_SECRET_KEY`; server-side transaction verification requires the secret key plus a valid HTTPS `PAYSTACK_BASE_URL`; new checkout preflight/initialization also validates `PAYSTACK_CALLBACK_URL` when it is supplied. A bad callback blocks new checkout initialization but does not prevent verification of an existing reference or validation of a signed webhook.
 
 ## Admin commerce API
 

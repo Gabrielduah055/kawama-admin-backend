@@ -4,6 +4,8 @@ const { Schema, model, models } = mongoose;
 
 export const paymentAttemptStatuses = [
   'initializing',
+  'uncertain',
+  'reconciling',
   'initialized',
   'success',
   'failed',
@@ -23,6 +25,9 @@ const paymentAttemptSchema = new Schema(
     providerTransactionId: { type: String, trim: true },
     providerStatus: { type: String, trim: true },
     lastErrorCode: { type: String, trim: true },
+    reconciliationAttempts: { type: Number, min: 0, default: 0 },
+    reconciliationStartedAt: { type: Date },
+    lastReconciledAt: { type: Date },
     initializedAt: { type: Date },
     verifiedAt: { type: Date },
     paidAt: { type: Date },
