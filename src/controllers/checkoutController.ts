@@ -23,7 +23,7 @@ export const createCheckoutSessionHandler = (gateway: PaystackGateway): RequestH
   async (request, response) => {
     const input = checkoutCreateSchema.parse(request.body);
     const checkoutToken = checkoutIdempotencyKeySchema.parse(request.header('idempotency-key'));
-    const session = await createCheckoutSession(input, checkoutToken, gateway);
+    const session = await createCheckoutSession(input, checkoutToken, gateway, request.id);
     response.status(session.created ? 201 : 200).json({
       message: session.created ? 'Checkout initialized successfully' : 'Existing checkout returned successfully',
       data: session,
@@ -39,7 +39,7 @@ export const getCheckoutStatusHandler: RequestHandler = async (request, response
 export const createPaystackWebhookHandler = (gateway: PaystackGateway): RequestHandler =>
   async (request, response) => {
     const signature = request.header('x-paystack-signature');
-    if (!signature || !request.rawBody || !gateway.verifyWebhookSignature(request.rawBody, signature)) {
+    if (!signature || !request.rawBody || !gateway.verifyWebhookSignature(request.rawBody, signature, request.id)) {
       throw new AppError(401, 'INVALID_PAYSTACK_SIGNATURE', 'The Paystack webhook signature is invalid.');
     }
 
@@ -49,7 +49,7 @@ export const createPaystackWebhookHandler = (gateway: PaystackGateway): RequestH
       return;
     }
 
-    const verification = await gateway.verifyTransaction(event.data.reference);
+    const verification = await gateway.verifyTransaction(event.data.reference, request.id);
     const result = await finalizeVerifiedPayment(event.data.reference, verification);
     logger.info('paystack_webhook_processed', { reference: event.data.reference, result });
     response.status(200).json({ received: true });

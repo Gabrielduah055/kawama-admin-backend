@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import mongoose, { type ClientSession } from 'mongoose';
 import { AppError } from '../errors/AppError.js';
 import { hashCheckoutToken } from '../lib/orders.js';
@@ -9,6 +10,18 @@ import { buildPendingOrderDraft, type CheckoutInput } from './order.service.js';
 import type { PaystackGateway, PaystackVerification } from './paystack.service.js';
 
 const RESERVATION_MINUTES = 30;
+const MAX_RECONCILIATION_ATTEMPTS = 3;
+const RECONCILIATION_LEASE_MS = 15_000;
+const PENDING_PROVIDER_STATUSES = new Set(['ongoing', 'pending', 'processing', 'queued']);
+const UNSUCCESSFUL_PROVIDER_STATUSES = new Set(['abandoned', 'failed', 'reversed']);
+const DEFINITIVE_INITIALIZATION_FAILURE_CODES = new Set([
+  'PAYSTACK_NOT_CONFIGURED',
+  'PAYSTACK_INVALID_CONFIGURATION',
+  'PAYSTACK_AUTHENTICATION_FAILED',
+  'PAYSTACK_INITIALIZATION_REJECTED',
+  // Retained for compatibility with injected gateways that use the older code.
+  'PAYSTACK_INITIALIZATION_FAILED',
+]);
 
 export interface CheckoutSession {
   created: boolean;
@@ -83,22 +96,7 @@ export async function releaseExpiredCheckoutReservations(now = new Date()): Prom
   for (const order of expired) await expireOrderReservation(order._id, now);
 }
 
-async function existingCheckoutSession(order: any, checkoutToken: string): Promise<CheckoutSession> {
-  const attempt = await PaymentAttemptModel.findOne({ order: order._id })
-    .sort({ createdAt: -1 })
-    .select('+accessCode +authorizationUrl')
-    .lean();
-
-  if (order.paymentStatus === 'failed' || order.fulfillmentStatus === 'cancelled') {
-    throw new AppError(409, 'CHECKOUT_EXPIRED', 'This checkout can no longer be paid. Start a new checkout.');
-  }
-  if (attempt?.status === 'initializing') {
-    throw new AppError(409, 'CHECKOUT_INITIALIZING', 'This checkout is still being initialized. Please try again shortly.');
-  }
-  if (attempt?.status === 'failed') {
-    throw new AppError(409, 'CHECKOUT_INITIALIZATION_FAILED', 'This checkout could not be initialized. Start a new checkout.');
-  }
-
+function checkoutSessionFromOrder(order: any, checkoutToken: string, attempt?: any): CheckoutSession {
   return {
     created: false,
     checkoutToken,
@@ -119,22 +117,343 @@ async function existingCheckoutSession(order: any, checkoutToken: string): Promi
   };
 }
 
-async function cancelAfterInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
+function uncertainInitializationError(): AppError {
+  return new AppError(
+    409,
+    'CHECKOUT_INITIALIZATION_UNCERTAIN',
+    'Paystack initialization could not be confirmed. Keep this checkout and retry with the same key.',
+  );
+}
+
+interface OwnedRecoveryLease {
+  attemptId: unknown;
+  leaseId: string;
+}
+
+type ExhaustedRecoveryGuard =
+  | OwnedRecoveryLease
+  | { attemptId: unknown; staleBefore: Date; leaseId?: string }
+  | { attemptId: unknown; completed: true };
+
+function recoveryAttemptFilter(
+  order: any,
+  guard: ExhaustedRecoveryGuard,
+): Record<string, unknown> {
+  const filter: Record<string, unknown> = {
+    _id: guard.attemptId,
+    order: order._id,
+    reference: order.paymentReference,
+  };
+  if ('completed' in guard) {
+    return {
+      ...filter,
+      status: 'uncertain',
+      reconciliationAttempts: { $gte: MAX_RECONCILIATION_ATTEMPTS },
+    };
+  }
+  if ('staleBefore' in guard) {
+    return {
+      ...filter,
+      status: 'reconciling',
+      reconciliationStartedAt: { $lte: guard.staleBefore },
+      reconciliationLeaseId: guard.leaseId ?? { $exists: false },
+    };
+  }
+  return {
+    ...filter,
+    status: 'reconciling',
+    reconciliationLeaseId: guard.leaseId,
+  };
+}
+
+async function cancelAfterInitializationFailure(
+  orderId: unknown,
+  errorCode: string,
+  recoveryLease?: OwnedRecoveryLease,
+): Promise<boolean> {
+  let transitioned = false;
   await mongoose.connection.transaction(async (session) => {
+    transitioned = false;
     const order = await OrderModel.findById(orderId).session(session);
     if (!order || order.paymentStatus !== 'pending') return;
+    const attemptFilter = recoveryLease
+      ? recoveryAttemptFilter(order, recoveryLease)
+      : { order: order._id, reference: order.paymentReference };
+    if (recoveryLease && !(await PaymentAttemptModel.exists(attemptFilter).session(session))) return;
     await releaseReservationInSession(order, session);
     order.stockReservationStatus = 'released';
     order.paymentStatus = 'failed';
     order.fulfillmentStatus = 'cancelled';
     order.cancelledAt = new Date();
     await order.save({ session });
-    await PaymentAttemptModel.updateOne(
-      { order: order._id, reference: order.paymentReference },
-      { status: 'failed', lastErrorCode: errorCode },
+    const attemptUpdate = await PaymentAttemptModel.updateOne(
+      attemptFilter,
+      {
+        $set: { status: 'failed', lastErrorCode: errorCode },
+        $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+      },
       { session },
     );
+    if (recoveryLease && attemptUpdate.matchedCount !== 1) {
+      throw new Error('Recovery lease changed during cancellation.');
+    }
+    transitioned = true;
   });
+  return transitioned;
+}
+
+async function recordUncertainInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
+  await PaymentAttemptModel.updateOne(
+    { order: orderId, status: 'initializing' },
+    { status: 'uncertain', lastErrorCode: errorCode },
+  );
+}
+
+async function markRecoveryNeedsAttention(
+  orderId: unknown,
+  errorCode: string,
+  guard: ExhaustedRecoveryGuard,
+): Promise<boolean> {
+  let transitioned = false;
+  await mongoose.connection.transaction(async (session) => {
+    transitioned = false;
+    const order = await OrderModel.findById(orderId).session(session);
+    if (!order || order.paymentStatus === 'paid' || order.paymentStatus === 'needs_attention') return;
+    const attemptFilter = recoveryAttemptFilter(order, guard);
+    if (!(await PaymentAttemptModel.exists(attemptFilter).session(session))) return;
+    await releaseReservationInSession(order, session);
+    order.stockReservationStatus = 'released';
+    order.paymentStatus = 'needs_attention';
+    order.fulfillmentStatus = 'needs_attention';
+    await order.save({ session });
+    const attemptUpdate = await PaymentAttemptModel.updateOne(
+      attemptFilter,
+      {
+        $set: {
+          status: 'needs_attention',
+          lastErrorCode: errorCode,
+          lastReconciledAt: new Date(),
+        },
+        $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+      },
+      { session },
+    );
+    if (attemptUpdate.matchedCount !== 1) throw new Error('Recovery lease changed during escalation.');
+    transitioned = true;
+  });
+  return transitioned;
+}
+
+async function loadCheckoutSession(orderId: unknown, checkoutToken: string): Promise<CheckoutSession> {
+  const order = await OrderModel.findById(orderId).lean();
+  if (!order) throw new AppError(404, 'CHECKOUT_NOT_FOUND', 'Checkout not found.');
+  const attempt = await PaymentAttemptModel.findOne({ order: order._id })
+    .sort({ createdAt: -1 })
+    .select('+accessCode +authorizationUrl')
+    .lean();
+  return checkoutSessionFromOrder(order, checkoutToken, attempt);
+}
+
+async function reconcileUncertainInitialization(
+  order: any,
+  attempt: any,
+  checkoutToken: string,
+  gateway: PaystackGateway,
+  requestId?: string,
+): Promise<CheckoutSession> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - RECONCILIATION_LEASE_MS);
+  const leaseId = randomUUID();
+  const acquired = await PaymentAttemptModel.findOneAndUpdate(
+    {
+      _id: attempt._id,
+      $and: [
+        {
+          $or: [
+            { reconciliationAttempts: { $exists: false } },
+            { reconciliationAttempts: { $lt: MAX_RECONCILIATION_ATTEMPTS } },
+          ],
+        },
+        {
+          $or: [
+            { status: 'uncertain' },
+            { status: 'reconciling', reconciliationStartedAt: { $lte: staleBefore } },
+            { status: 'initializing', lastErrorCode: { $exists: true } },
+            { status: 'initializing', updatedAt: { $lte: staleBefore } },
+          ],
+        },
+      ],
+    },
+    {
+      $set: { status: 'reconciling', reconciliationStartedAt: now, reconciliationLeaseId: leaseId },
+      $inc: { reconciliationAttempts: 1 },
+    },
+    { returnDocument: 'after' },
+  );
+
+  if (!acquired) {
+    const currentOrder = await OrderModel.findById(order._id).lean();
+    const currentAttempt = await PaymentAttemptModel.findById(attempt._id)
+      .select('+accessCode +authorizationUrl +reconciliationLeaseId')
+      .lean();
+    if (!currentOrder) throw new AppError(404, 'CHECKOUT_NOT_FOUND', 'Checkout not found.');
+    if (
+      currentOrder.paymentStatus === 'paid' ||
+      currentOrder.paymentStatus === 'needs_attention' ||
+      currentOrder.paymentStatus === 'failed'
+    ) {
+      return checkoutSessionFromOrder(currentOrder, checkoutToken, currentAttempt);
+    }
+    const reconciliationStartedAt = currentAttempt?.reconciliationStartedAt
+      ? new Date(currentAttempt.reconciliationStartedAt)
+      : undefined;
+    if (
+      currentAttempt?.status === 'reconciling' &&
+      reconciliationStartedAt &&
+      reconciliationStartedAt > staleBefore
+    ) {
+      throw uncertainInitializationError();
+    }
+    if ((currentAttempt?.reconciliationAttempts ?? 0) >= MAX_RECONCILIATION_ATTEMPTS) {
+      const guard: ExhaustedRecoveryGuard | undefined = currentAttempt?.status === 'uncertain'
+        ? { attemptId: currentAttempt._id, completed: true }
+        : currentAttempt?.status === 'reconciling' && reconciliationStartedAt
+          ? {
+              attemptId: currentAttempt._id,
+              staleBefore,
+              ...(typeof currentAttempt.reconciliationLeaseId === 'string'
+                ? { leaseId: currentAttempt.reconciliationLeaseId }
+                : {}),
+            }
+          : undefined;
+      if (guard) {
+        await markRecoveryNeedsAttention(
+          order._id,
+          currentAttempt?.lastErrorCode ?? 'PAYSTACK_RECOVERY_EXHAUSTED',
+          guard,
+        );
+      }
+      const current = await loadCheckoutSession(order._id, checkoutToken);
+      if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+    }
+    throw uncertainInitializationError();
+  }
+
+  const recoveryLease: OwnedRecoveryLease = { attemptId: acquired._id, leaseId };
+
+  let verification: PaystackVerification;
+  try {
+    verification = await gateway.verifyTransaction(order.paymentReference, requestId);
+  } catch (error) {
+    const errorCode = error instanceof AppError ? error.code : 'PAYSTACK_VERIFICATION_UNAVAILABLE';
+    if (acquired.reconciliationAttempts >= MAX_RECONCILIATION_ATTEMPTS) {
+      await markRecoveryNeedsAttention(order._id, errorCode, recoveryLease);
+    } else {
+      await PaymentAttemptModel.updateOne(
+        recoveryAttemptFilter(order, recoveryLease),
+        {
+          $set: { status: 'uncertain', lastErrorCode: errorCode, lastReconciledAt: new Date() },
+          $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+        },
+      );
+    }
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+    throw uncertainInitializationError();
+  }
+
+  const providerStatus = verification.status.toLowerCase();
+  if (!verificationIdentityMatches(order, verification)) {
+    await markPaymentNeedsAttention(order._id, verification, 'PAYMENT_VERIFICATION_MISMATCH', recoveryLease);
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+    throw uncertainInitializationError();
+  }
+  if (providerStatus === 'success') {
+    await finalizeVerifiedPayment(order.paymentReference, verification);
+    return loadCheckoutSession(order._id, checkoutToken);
+  }
+  if (UNSUCCESSFUL_PROVIDER_STATUSES.has(providerStatus)) {
+    const cancelled = await cancelAfterInitializationFailure(
+      order._id,
+      `PAYSTACK_PAYMENT_${providerStatus.toUpperCase()}`,
+      recoveryLease,
+    );
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (current.paymentStatus === 'paid' || current.paymentStatus === 'needs_attention') return current;
+    if (!cancelled && current.paymentStatus !== 'failed') throw uncertainInitializationError();
+    throw new AppError(
+      409,
+      'CHECKOUT_INITIALIZATION_FAILED',
+      'Paystack confirmed that this payment cannot continue. Start a new checkout.',
+    );
+  }
+  if (PENDING_PROVIDER_STATUSES.has(providerStatus)) {
+    if (acquired.reconciliationAttempts >= MAX_RECONCILIATION_ATTEMPTS) {
+      await markPaymentNeedsAttention(
+        order._id,
+        verification,
+        'PAYSTACK_RECOVERY_EXHAUSTED',
+        recoveryLease,
+      );
+    } else {
+      await PaymentAttemptModel.updateOne(
+        recoveryAttemptFilter(order, recoveryLease),
+        {
+          $set: {
+            status: 'uncertain',
+            providerStatus,
+            providerTransactionId: verification.transactionId,
+            verifiedAt: new Date(),
+            lastReconciledAt: new Date(),
+            lastErrorCode: 'PAYSTACK_PAYMENT_PENDING',
+          },
+          $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
+        },
+      );
+    }
+    const current = await loadCheckoutSession(order._id, checkoutToken);
+    if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+    throw uncertainInitializationError();
+  }
+
+  await markPaymentNeedsAttention(order._id, verification, 'PAYSTACK_UNKNOWN_PAYMENT_STATUS', recoveryLease);
+  const current = await loadCheckoutSession(order._id, checkoutToken);
+  if (['paid', 'needs_attention', 'failed'].includes(current.paymentStatus)) return current;
+  throw uncertainInitializationError();
+}
+
+async function existingCheckoutSession(
+  order: any,
+  checkoutToken: string,
+  gateway: PaystackGateway,
+  requestId?: string,
+): Promise<CheckoutSession> {
+  const attempt = await PaymentAttemptModel.findOne({ order: order._id })
+    .sort({ createdAt: -1 })
+    .select('+accessCode +authorizationUrl')
+    .lean();
+
+  if (order.paymentStatus === 'failed' || order.fulfillmentStatus === 'cancelled') {
+    throw new AppError(409, 'CHECKOUT_EXPIRED', 'This checkout can no longer be paid. Start a new checkout.');
+  }
+  if (order.paymentStatus === 'paid' || order.paymentStatus === 'needs_attention') {
+    return checkoutSessionFromOrder(order, checkoutToken, attempt);
+  }
+  if (attempt?.status === 'initializing' && !attempt.lastErrorCode) {
+    const updatedAt = attempt.updatedAt instanceof Date ? attempt.updatedAt : new Date(attempt.updatedAt);
+    if (updatedAt.getTime() > Date.now() - RECONCILIATION_LEASE_MS) {
+      throw new AppError(409, 'CHECKOUT_INITIALIZING', 'This checkout is still being initialized. Please try again shortly.');
+    }
+  }
+  if (attempt && ['initializing', 'uncertain', 'reconciling'].includes(attempt.status)) {
+    return reconcileUncertainInitialization(order, attempt, checkoutToken, gateway, requestId);
+  }
+  if (attempt?.status === 'failed') {
+    throw new AppError(409, 'CHECKOUT_INITIALIZATION_FAILED', 'This checkout could not be initialized. Start a new checkout.');
+  }
+
+  return checkoutSessionFromOrder(order, checkoutToken, attempt);
 }
 
 function duplicateKeyError(error: unknown): boolean {
@@ -145,11 +464,15 @@ export async function createCheckoutSession(
   input: CheckoutInput,
   checkoutToken: string,
   gateway: PaystackGateway,
+  requestId?: string,
 ): Promise<CheckoutSession> {
   await releaseExpiredCheckoutReservations();
   const idempotencyKeyHash = hashCheckoutToken(checkoutToken);
   const existing = await OrderModel.findOne({ idempotencyKeyHash }).lean();
-  if (existing) return existingCheckoutSession(existing, checkoutToken);
+  if (existing) return existingCheckoutSession(existing, checkoutToken, gateway, requestId);
+  // This preflight must run before any new order, payment attempt, or stock reservation is created.
+  // Existing idempotent sessions remain recoverable if configuration changes later.
+  gateway.assertConfigured(requestId);
 
   let order: any;
   let attempt: any;
@@ -201,7 +524,7 @@ export async function createCheckoutSession(
   } catch (error) {
     if (duplicateKeyError(error)) {
       const duplicate = await OrderModel.findOne({ idempotencyKeyHash }).lean();
-      if (duplicate) return existingCheckoutSession(duplicate, checkoutToken);
+      if (duplicate) return existingCheckoutSession(duplicate, checkoutToken, gateway, requestId);
     }
     throw error;
   }
@@ -216,10 +539,21 @@ export async function createCheckoutSession(
       currency: 'GHS',
       reference: order.paymentReference,
       metadata: { order_id: String(order._id), order_number: order.orderNumber, source: 'kawama_storefront' },
+      ...(requestId ? { requestId } : {}),
     });
   } catch (error) {
     const errorCode = error instanceof AppError ? error.code : 'PAYSTACK_INITIALIZATION_FAILED';
-    await cancelAfterInitializationFailure(order._id, errorCode);
+    if (error instanceof AppError && DEFINITIVE_INITIALIZATION_FAILURE_CODES.has(error.code)) {
+      await cancelAfterInitializationFailure(order._id, errorCode);
+    } else {
+      // A request may have reached Paystack even if its response was lost or malformed.
+      // Preserve this order/reference and its reservation; an idempotent replay will not
+      // create a second attempt, and normal expiry will eventually release the stock.
+      await recordUncertainInitializationFailure(order._id, errorCode);
+    }
+    if (!(error instanceof AppError) || !DEFINITIVE_INITIALIZATION_FAILURE_CODES.has(error.code)) {
+      throw uncertainInitializationError();
+    }
     throw error;
   }
 
@@ -279,22 +613,32 @@ export async function getCheckoutStatus(checkoutToken: string): Promise<Checkout
   };
 }
 
-function verificationMatches(order: any, verification: PaystackVerification): boolean {
-  return verification.status === 'success' &&
-    verification.reference === order.paymentReference &&
+function verificationIdentityMatches(order: any, verification: PaystackVerification): boolean {
+  return verification.reference === order.paymentReference &&
     verification.amountPesewas === order.productPaymentTotalPesewas &&
     verification.currency.toUpperCase() === order.currency &&
     (!verification.customerEmail || verification.customerEmail === order.customer.email.toLowerCase());
+}
+
+function verificationMatches(order: any, verification: PaystackVerification): boolean {
+  return verification.status.toLowerCase() === 'success' && verificationIdentityMatches(order, verification);
 }
 
 async function markPaymentNeedsAttention(
   orderId: unknown,
   verification: PaystackVerification,
   errorCode: string,
-): Promise<void> {
+  recoveryLease?: OwnedRecoveryLease,
+): Promise<boolean> {
+  let transitioned = false;
   await mongoose.connection.transaction(async (session) => {
+    transitioned = false;
     const order = await OrderModel.findById(orderId).session(session);
     if (!order || order.paymentStatus === 'paid') return;
+    const attemptFilter = recoveryLease
+      ? recoveryAttemptFilter(order, recoveryLease)
+      : { order: order._id, reference: order.paymentReference };
+    if (recoveryLease && !(await PaymentAttemptModel.exists(attemptFilter).session(session))) return;
     await releaseReservationInSession(order, session);
     order.stockReservationStatus = 'released';
     order.paymentStatus = 'needs_attention';
@@ -302,18 +646,26 @@ async function markPaymentNeedsAttention(
     order.paystackTransactionId = verification.transactionId;
     order.paymentVerifiedAt = new Date();
     await order.save({ session });
-    await PaymentAttemptModel.updateOne(
-      { order: order._id, reference: order.paymentReference },
+    const attemptUpdate = await PaymentAttemptModel.updateOne(
+      attemptFilter,
       {
-        status: 'needs_attention',
-        providerStatus: verification.status,
-        providerTransactionId: verification.transactionId,
-        verifiedAt: new Date(),
-        lastErrorCode: errorCode,
+        $set: {
+          status: 'needs_attention',
+          providerStatus: verification.status,
+          providerTransactionId: verification.transactionId,
+          verifiedAt: new Date(),
+          lastErrorCode: errorCode,
+        },
+        $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
       },
       { session },
     );
+    if (recoveryLease && attemptUpdate.matchedCount !== 1) {
+      throw new Error('Recovery lease changed during payment review.');
+    }
+    transitioned = true;
   });
+  return transitioned;
 }
 
 export type PaymentFinalizationResult = 'paid' | 'already_paid' | 'needs_attention' | 'unknown_order';
@@ -368,11 +720,14 @@ export async function finalizeVerifiedPayment(
       await PaymentAttemptModel.updateOne(
         { order: order._id, reference: order.paymentReference },
         {
-          status: 'success',
-          providerStatus: verification.status,
-          providerTransactionId: verification.transactionId,
-          verifiedAt: new Date(),
-          paidAt,
+          $set: {
+            status: 'success',
+            providerStatus: verification.status,
+            providerTransactionId: verification.transactionId,
+            verifiedAt: new Date(),
+            paidAt,
+          },
+          $unset: { reconciliationStartedAt: 1, reconciliationLeaseId: 1 },
         },
         { session },
       );

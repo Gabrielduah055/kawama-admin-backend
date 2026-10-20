@@ -16,10 +16,12 @@ const environmentSchema = z.object({
   CLOUDINARY_API_KEY: z.string().trim().optional(),
   CLOUDINARY_API_SECRET: z.string().trim().optional(),
   CLOUDINARY_FOLDER: z.string().trim().regex(/^[a-zA-Z0-9_-]+$/).default('kawama'),
-  PAYSTACK_SECRET_KEY: z.string().trim().min(10).optional(),
-  PAYSTACK_PUBLIC_KEY: z.string().trim().min(10).optional(),
-  PAYSTACK_CALLBACK_URL: z.string().trim().url().optional(),
-  PAYSTACK_BASE_URL: z.string().trim().url().default('https://api.paystack.co'),
+  // Payment settings are validated by the Paystack gateway so a bad or missing
+  // payment configuration cannot prevent catalog-only routes from starting.
+  PAYSTACK_SECRET_KEY: z.string().trim().optional(),
+  PAYSTACK_PUBLIC_KEY: z.string().trim().optional(),
+  PAYSTACK_CALLBACK_URL: z.string().trim().optional(),
+  PAYSTACK_BASE_URL: z.string().trim().default('https://api.paystack.co'),
   SEED_ASSET_DIR: z.string().trim().default('../kawama/public/images'),
   SEED_ASSET_BASE_URL: z.string().trim().url().optional(),
 });

@@ -83,9 +83,10 @@ export const openApiDocument = {
         requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/CheckoutInput' } } } },
         responses: {
           '201': { description: 'Order created, stock reserved, and Paystack initialized.' },
-          '200': { description: 'An existing idempotent checkout was returned.' },
-          '409': { description: 'Product unavailable, stock insufficient, or checkout expired.' },
-          '502': { description: 'Paystack initialization failed.' },
+          '200': { description: 'An existing or reconciled idempotent checkout was returned, including paid or needs-attention recovery states.' },
+          '409': { description: 'Product unavailable, stock insufficient, checkout expired, or CHECKOUT_INITIALIZATION_UNCERTAIN. The uncertain code requires reuse of the same Idempotency-Key and payload.' },
+          '502': { description: 'Paystack definitively rejected initialization or rejected the server credentials.' },
+          '503': { description: 'Paystack is missing or invalid local configuration.' },
         },
       },
     },
@@ -100,7 +101,13 @@ export const openApiDocument = {
       post: {
         tags: ['Paystack webhooks'],
         description: 'Validates the Paystack HMAC signature and independently verifies successful charges.',
-        responses: { '200': { description: 'Webhook acknowledged.' }, '401': { description: 'Invalid Paystack signature.' }, '502': { description: 'Paystack verification unavailable.' } },
+        responses: {
+          '200': { description: 'Webhook acknowledged.' },
+          '401': { description: 'Invalid Paystack signature.' },
+          '502': { description: 'Paystack verification unavailable.' },
+          '503': { description: 'Paystack is missing or invalid local configuration.' },
+          '504': { description: 'Paystack verification timed out.' },
+        },
       },
     },
     '/api/v1/admin/dashboard/summary': {
