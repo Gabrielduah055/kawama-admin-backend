@@ -9,6 +9,14 @@ import { buildPendingOrderDraft, type CheckoutInput } from './order.service.js';
 import type { PaystackGateway, PaystackVerification } from './paystack.service.js';
 
 const RESERVATION_MINUTES = 30;
+const DEFINITIVE_INITIALIZATION_FAILURE_CODES = new Set([
+  'PAYSTACK_NOT_CONFIGURED',
+  'PAYSTACK_INVALID_CONFIGURATION',
+  'PAYSTACK_AUTHENTICATION_FAILED',
+  'PAYSTACK_INITIALIZATION_REJECTED',
+  // Retained for compatibility with injected gateways that use the older code.
+  'PAYSTACK_INITIALIZATION_FAILED',
+]);
 
 export interface CheckoutSession {
   created: boolean;
@@ -137,6 +145,13 @@ async function cancelAfterInitializationFailure(orderId: unknown, errorCode: str
   });
 }
 
+async function recordUncertainInitializationFailure(orderId: unknown, errorCode: string): Promise<void> {
+  await PaymentAttemptModel.updateOne(
+    { order: orderId, status: 'initializing' },
+    { lastErrorCode: errorCode },
+  );
+}
+
 function duplicateKeyError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 11000;
 }
@@ -145,11 +160,15 @@ export async function createCheckoutSession(
   input: CheckoutInput,
   checkoutToken: string,
   gateway: PaystackGateway,
+  requestId?: string,
 ): Promise<CheckoutSession> {
   await releaseExpiredCheckoutReservations();
   const idempotencyKeyHash = hashCheckoutToken(checkoutToken);
   const existing = await OrderModel.findOne({ idempotencyKeyHash }).lean();
   if (existing) return existingCheckoutSession(existing, checkoutToken);
+  // This preflight must run before any new order, payment attempt, or stock reservation is created.
+  // Existing idempotent sessions remain recoverable if configuration changes later.
+  gateway.assertConfigured(requestId);
 
   let order: any;
   let attempt: any;
@@ -216,10 +235,18 @@ export async function createCheckoutSession(
       currency: 'GHS',
       reference: order.paymentReference,
       metadata: { order_id: String(order._id), order_number: order.orderNumber, source: 'kawama_storefront' },
+      ...(requestId ? { requestId } : {}),
     });
   } catch (error) {
     const errorCode = error instanceof AppError ? error.code : 'PAYSTACK_INITIALIZATION_FAILED';
-    await cancelAfterInitializationFailure(order._id, errorCode);
+    if (error instanceof AppError && DEFINITIVE_INITIALIZATION_FAILURE_CODES.has(error.code)) {
+      await cancelAfterInitializationFailure(order._id, errorCode);
+    } else {
+      // A request may have reached Paystack even if its response was lost or malformed.
+      // Preserve this order/reference and its reservation; an idempotent replay will not
+      // create a second attempt, and normal expiry will eventually release the stock.
+      await recordUncertainInitializationFailure(order._id, errorCode);
+    }
     throw error;
   }
 

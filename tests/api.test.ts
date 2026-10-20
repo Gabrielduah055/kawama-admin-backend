@@ -28,6 +28,7 @@ let mongoDataDirectory: string | undefined;
 let paystackInitializationCalls = 0;
 let paystackVerificationOverride: PaystackVerification | undefined;
 let paystackInitializationError: AppError | undefined;
+let paystackConfigurationError: AppError | undefined;
 const initializedPayments = new Map<string, InitializePaystackInput>();
 
 const mediaService: MediaService = {
@@ -37,6 +38,9 @@ const mediaService: MediaService = {
 };
 
 const paystackService: PaystackGateway = {
+  assertConfigured: () => {
+    if (paystackConfigurationError) throw paystackConfigurationError;
+  },
   initializeTransaction: async (input) => {
     paystackInitializationCalls += 1;
     if (paystackInitializationError) throw paystackInitializationError;
@@ -150,6 +154,7 @@ beforeEach(async () => {
   paystackInitializationCalls = 0;
   paystackVerificationOverride = undefined;
   paystackInitializationError = undefined;
+  paystackConfigurationError = undefined;
   initializedPayments.clear();
   await Promise.all([
     AdminModel.deleteMany({}),
@@ -330,6 +335,11 @@ describe('Kawama API', () => {
     expect(reservedProduct?.stockQuantity).toBe(4);
     expect(reservedProduct?.reservedQuantity).toBe(2);
 
+    paystackConfigurationError = new AppError(
+      503,
+      'PAYSTACK_NOT_CONFIGURED',
+      'Online payment is temporarily unavailable.',
+    );
     const repeated = await request(app)
       .post('/api/v1/checkout/sessions')
       .set('idempotency-key', checkoutToken)
@@ -453,9 +463,49 @@ describe('Kawama API', () => {
     });
   });
 
-  it('releases reserved stock when Paystack initialization fails', async () => {
+  it('rejects unusable Paystack configuration before creating an order or reserving stock', async () => {
     const selectedProduct = await product({ stockQuantity: 2 });
-    paystackInitializationError = new AppError(502, 'PAYSTACK_UNAVAILABLE', 'Paystack is unavailable.');
+    paystackConfigurationError = new AppError(
+      503,
+      'PAYSTACK_NOT_CONFIGURED',
+      'Online payment is temporarily unavailable.',
+    );
+
+    const response = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', 'checkout-config-token-00000001')
+      .send({
+        customer: {
+          fullName: 'Akosua Owusu',
+          email: 'akosua@example.com',
+          whatsappNumber: '+233541111110',
+          deliveryAddress: 'Airport Residential, Accra',
+          whatsappConsent: true,
+        },
+        items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+      });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('PAYSTACK_NOT_CONFIGURED');
+    expect(paystackInitializationCalls).toBe(0);
+    expect(await OrderModel.countDocuments()).toBe(0);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 0,
+    });
+
+    const catalogResponse = await request(app).get('/api/v1/products');
+    expect(catalogResponse.status).toBe(200);
+  });
+
+  it('releases reserved stock after a definitive Paystack authentication rejection', async () => {
+    const selectedProduct = await product({ stockQuantity: 2 });
+    paystackInitializationError = new AppError(
+      502,
+      'PAYSTACK_AUTHENTICATION_FAILED',
+      'The payment service rejected the server credentials.',
+    );
 
     const response = await request(app)
       .post('/api/v1/checkout/sessions')
@@ -472,7 +522,7 @@ describe('Kawama API', () => {
       });
 
     expect(response.status).toBe(502);
-    expect(response.body.error.code).toBe('PAYSTACK_UNAVAILABLE');
+    expect(response.body.error.code).toBe('PAYSTACK_AUTHENTICATION_FAILED');
     expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
       stockQuantity: 2,
       reservedQuantity: 0,
@@ -482,6 +532,60 @@ describe('Kawama API', () => {
       fulfillmentStatus: 'cancelled',
       stockReservationStatus: 'released',
     });
+  });
+
+  it.each([
+    ['PAYSTACK_TIMEOUT', 504],
+    ['PAYSTACK_CONNECTION_FAILED', 502],
+    ['PAYSTACK_INVALID_RESPONSE', 502],
+  ])('preserves the reservation and idempotency context after uncertain %s', async (code, status) => {
+    const selectedProduct = await product({ stockQuantity: 2 });
+    paystackInitializationError = new AppError(
+      status,
+      code,
+      'The initialization outcome is uncertain.',
+    );
+    const checkoutToken = `uncertain-${code.toLowerCase()}-0001`;
+    const checkoutPayload = {
+      customer: {
+        fullName: 'Adwoa Nyarko',
+        email: 'adwoa@example.com',
+        whatsappNumber: '+233541111111',
+        deliveryAddress: 'Spintex Road, Accra',
+        whatsappConsent: true,
+      },
+      items: [{ productId: String(selectedProduct._id), quantity: 1 }],
+    };
+
+    const response = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+
+    expect(response.status).toBe(status);
+    expect(response.body.error.code).toBe(code);
+    expect(await ProductModel.findById(selectedProduct._id).lean()).toMatchObject({
+      stockQuantity: 2,
+      reservedQuantity: 1,
+    });
+    const order = await OrderModel.findOne({ 'customer.email': 'adwoa@example.com' }).lean();
+    expect(order).toMatchObject({
+      paymentStatus: 'pending',
+      fulfillmentStatus: 'awaiting_payment',
+      stockReservationStatus: 'active',
+    });
+    expect(await PaymentAttemptModel.findOne({ order: order!._id }).lean()).toMatchObject({
+      status: 'initializing',
+      lastErrorCode: code,
+    });
+
+    const replay = await request(app)
+      .post('/api/v1/checkout/sessions')
+      .set('idempotency-key', checkoutToken)
+      .send(checkoutPayload);
+    expect(replay.status).toBe(409);
+    expect(replay.body.error.code).toBe('CHECKOUT_INITIALIZING');
+    expect(paystackInitializationCalls).toBe(1);
   });
 
   it('lists and retrieves protected admin order records without exposing Paystack checkout credentials', async () => {

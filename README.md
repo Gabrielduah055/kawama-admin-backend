@@ -47,19 +47,48 @@ For product media, call `POST /api/v1/admin/uploads/signature`, upload directly 
 
 ## Paystack checkout
 
-Configure `PAYSTACK_SECRET_KEY` and `PAYSTACK_CALLBACK_URL` on the API. The secret key is server-only and must never be placed in Angular source or returned by an endpoint. `PAYSTACK_PUBLIC_KEY` is recorded for the later storefront integration, although the current backend-first flow opens Paystack using the returned access code.
+This is a backend-first hosted checkout. The Angular app calls this API and follows the returned Paystack `authorizationUrl`; it does not need a Paystack public key. `PAYSTACK_SECRET_KEY` is server-only and must never be placed in Angular source, returned by an endpoint, or written to logs.
+
+The API accepts real Paystack test and live secret-key formats (`sk_test_...` and `sk_live_...`). Missing keys, `pk_...` public keys, malformed values, and obvious example placeholders are rejected as local configuration errors before an order is created or inventory is reserved. Catalog and review endpoints remain available when payment is not configured.
 
 Create a checkout with `POST /api/v1/checkout/sessions`. Send a fresh UUID-like value in the `Idempotency-Key` header and the customer/cart payload in the body. The API recalculates prices from MongoDB, reserves stock for 30 minutes, creates the order, and returns Paystack's `accessCode`. Reusing the same idempotency key returns the same checkout without reserving stock twice.
 
+A definitive provider rejection (for example, Paystack HTTP 401/403) fails the order and releases its reservation. A timeout, connection loss, provider 5xx, or malformed success response has an uncertain outcome: the API keeps the original order, reference, and reservation instead of risking a second charge. The storefront must retain and reuse the same idempotency key; it must not silently generate a replacement. The reservation expires through the existing 30-minute cleanup path if no verified payment arrives.
+
 The storefront can poll `GET /api/v1/checkout/sessions/:checkoutToken`. This endpoint returns limited status information and never treats a browser callback as proof of payment.
 
-In the Paystack test dashboard, set the webhook URL to:
+For the currently named deployed test API, set this webhook URL in the Paystack **test mode** dashboard:
 
 ```text
-https://YOUR-API-HOST/api/v1/webhooks/paystack
+https://kawama-admin-backend.onrender.com/api/v1/webhooks/paystack
 ```
 
+For another deployment, replace only the origin and keep `/api/v1/webhooks/paystack`. Paystack cannot call a localhost webhook; local webhook testing requires a trusted HTTPS tunnel to `http://localhost:3000`.
+
 The webhook handler validates `x-paystack-signature` against the untouched request body, calls Paystack's transaction verification endpoint, and compares the reference, status, amount, currency, and customer email before committing inventory. Repeated webhooks are idempotent. Invalid or mismatched payments are held for manual attention rather than fulfilled.
+
+### Local Paystack test setup
+
+1. In the Paystack dashboard, switch to **Test mode**, open API keys, and copy the actual secret key beginning with `sk_test_`. A documentation placeholder will not work.
+2. Copy `.env.example` to `.env`. Set `PAYSTACK_SECRET_KEY` to that actual test secret, keep `PAYSTACK_BASE_URL=https://api.paystack.co`, and set `PAYSTACK_CALLBACK_URL=http://localhost:4200/checkout/result`.
+3. Run this API at `http://localhost:3000`; the Angular repository's local API base URL must be `http://localhost:3000/api/v1`.
+4. Run the Angular storefront at `http://localhost:4200` and configure a public HTTPS tunnel as the Paystack test webhook if testing webhooks against the local API.
+5. Restart the API after changing `.env`. Use Paystack test mode only; automated tests mock every Paystack request.
+
+The developer must supply the real test secret and, when using a tunnel, its public HTTPS origin. No real key belongs in `.env.example` or source control.
+
+### Render Paystack setup
+
+In the Render dashboard for the deployed backend, set these service environment variables:
+
+- `PAYSTACK_SECRET_KEY`: the actual `sk_test_...` key while validating the integration; switch to the matching live secret only for an intentional production launch.
+- `PAYSTACK_BASE_URL`: `https://api.paystack.co`.
+- `PAYSTACK_CALLBACK_URL`: the deployed Angular storefront origin plus `/checkout/result` (the developer must enter the real deployed frontend URL).
+- `FRONTEND_ORIGINS`: the exact deployed Angular origin(s), comma-separated when more than one is required.
+
+Save the Render environment changes, then restart or manually redeploy the backend service so the running process reads them. Editing `.env` on a laptop does **not** configure Render. In the Paystack dashboard's matching test/live mode, configure the deployed webhook URL shown above and confirm the selected API keys and webhook belong to the same mode.
+
+Repository code cannot verify the values currently stored in Render or Paystack. Check the failed response's `error.code`/`requestId` and the matching Render log entry to distinguish `PAYSTACK_NOT_CONFIGURED`, `PAYSTACK_INVALID_CONFIGURATION`, `PAYSTACK_AUTHENTICATION_FAILED`, `PAYSTACK_TIMEOUT`, `PAYSTACK_CONNECTION_FAILED`, `PAYSTACK_PROVIDER_ERROR`, and `PAYSTACK_INVALID_RESPONSE` without exposing credentials or provider bodies.
 
 ## Admin commerce API
 
@@ -86,4 +115,4 @@ See `/openapi.json` or the Postman collection for the complete request and respo
 
 ## Deployment
 
-`render.yaml` defines the Render web service and readiness health check. Add every secret marked `sync: false` in Render, including `JWT_SECRET`; keep MongoDB Atlas near the Render region, allow Render to connect to Atlas, and set `FRONTEND_ORIGINS` to the comma-separated production/preview storefront origins. Run `npm run seed:admin` from a trusted environment whenever the production owner password must be created or rotated; do not store `ADMIN_PASSWORD` in Render after bootstrap.
+`render.yaml` defines the Render web service and readiness health check. Add every secret marked `sync: false` in Render, including `JWT_SECRET` and `PAYSTACK_SECRET_KEY`; keep MongoDB Atlas near the Render region, allow Render to connect to Atlas, and set `FRONTEND_ORIGINS` to the comma-separated production/preview storefront origins. Run `npm run seed:admin` from a trusted environment whenever the production owner password must be created or rotated; do not store `ADMIN_PASSWORD` in Render after bootstrap.
