@@ -202,6 +202,11 @@ describe('Kawama API', () => {
     const response = await request(app).get('/health/ready');
     expect(response.status).toBe(200);
     expect(response.body.data).toEqual({ status: 'ready', database: true });
+
+    const version = await request(app).get('/health/version');
+    expect(version.status).toBe(200);
+    expect(version.body.data.version).toBe('1.0.0');
+    expect(version.body.data.commit === null || /^[a-f\d]{7,64}$/i.test(version.body.data.commit)).toBe(true);
   });
 
   it('lists active products using the storefront DTO and inventory derivation', async () => {
@@ -506,6 +511,7 @@ describe('Kawama API', () => {
       });
 
     expect(response.status).toBe(503);
+
     expect(response.body.error.code).toBe('PAYSTACK_NOT_CONFIGURED');
     expect(paystackInitializationCalls).toBe(0);
     expect(await OrderModel.countDocuments()).toBe(0);

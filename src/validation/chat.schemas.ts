@@ -34,6 +34,11 @@ export const getProductDetailsToolSchema = z.object({
 
 export const getStorePoliciesToolSchema = z.object({}).strict();
 
+export const continueProductSearchToolSchema = z.object({
+  mode: z.enum(['more', 'count', 'cheaper']).default('more'),
+  limit: z.number().int().min(1).max(6).default(4),
+}).strict();
+
 const productContextSchema = z.object({
   productId: objectIdSchema.optional(),
   productSlug: slugSchema.optional(),
@@ -115,6 +120,13 @@ const policyClaimsSchema = z.array(policyClaimSchema).min(1).max(5).superRefine(
   });
 });
 
+const groundedProductIdsSchema = z.array(objectIdSchema).max(4).refine(
+  (identifiers) => new Set(identifiers).size === identifiers.length,
+  { message: 'Grounded product IDs must be unique.' },
+);
+
+const suggestedFollowUpsSchema = z.array(z.string().trim().min(1).max(100)).max(2).optional();
+
 export const assistantResponseSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('greeting') }).strict(),
   z.object({
@@ -122,6 +134,13 @@ export const assistantResponseSchema = z.discriminatedUnion('type', [
     purpose: z.enum(['budget', 'intended_use', 'product', 'category', 'preferences', 'delivery_location']),
   }).strict(),
   z.object({ type: z.literal('product_answer'), productClaims: productClaimsSchema }).strict(),
+  z.object({
+    type: z.literal('grounded_answer'),
+    intent: z.enum(['search', 'details', 'alternatives', 'count', 'comparison', 'recommendation']),
+    answerTemplate: z.string().trim().min(1).max(1_500),
+    productIds: groundedProductIdsSchema,
+    suggestedFollowUps: suggestedFollowUpsSchema,
+  }).strict(),
   z.object({ type: z.literal('policy_answer'), policyClaims: policyClaimsSchema }).strict(),
   z.object({
     type: z.literal('mixed_answer'),

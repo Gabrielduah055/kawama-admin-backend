@@ -10,12 +10,14 @@ import {
   isValidStoredChatMessage,
 } from '../lib/chat.js';
 import { ChatConversationModel } from '../models/ChatConversationSchema.js';
+import { logger } from '../utils/logger.js';
+import { getPublicProductsByIdentifiers } from './catalog.service.js';
 import {
-  getActivePublicCategoryNames,
-  getPublicProductsByIdentifiers,
-  searchPublicProducts,
-} from './catalog.service.js';
-import { executeShoppingTool, shoppingToolDefinitions } from './chat-tools.service.js';
+  executeShoppingTool,
+  shoppingToolDefinitions,
+  type ShoppingToolResult,
+  type ShoppingSearchContext,
+} from './chat-tools.service.js';
 import { openRouterProvider, type ChatProvider, type ProviderMessage } from './openrouter.service.js';
 import type { StorePolicies } from './store-policy.service.js';
 import { assistantResponseSchema, chatRequestSchema } from '../validation/chat.schemas.js';
@@ -28,6 +30,7 @@ const MAX_OUTPUT_TOKENS = 550;
 
 type ChatInput = z.infer<typeof chatRequestSchema>;
 type AssistantPlan = z.infer<typeof assistantResponseSchema>;
+type GroundedAnswerPlan = Extract<AssistantPlan, { type: 'grounded_answer' }>;
 type ProductPlan = Extract<AssistantPlan, { type: 'product_answer' | 'mixed_answer' }>;
 type ProductClaim = ProductPlan['productClaims'][number];
 type PolicyPlan = Extract<AssistantPlan, { type: 'policy_answer' | 'mixed_answer' }>;
@@ -46,6 +49,9 @@ interface EvidenceState {
   productSearchPerformed: boolean;
   products: Map<string, Record<string, unknown>>;
   searchTotalMatches?: number | undefined;
+  remainingMatches?: number | undefined;
+  searchContext?: ShoppingSearchContext | undefined;
+  storeCategories?: string[] | undefined;
   policies?: StorePolicies | undefined;
 }
 
@@ -64,6 +70,7 @@ interface RenderedAssistantResponse {
   assistantMessage: string;
   productIds: string[];
   suggestedFollowUps: string[];
+  groundedFallback?: boolean | undefined;
 }
 
 export interface ProductCard {
@@ -109,24 +116,54 @@ function referencedPosition(message: string): number | undefined {
   return references.find(([expression]) => expression.test(normalized))?.[1];
 }
 
-function normalizedCustomerMessage(message: string): string {
-  return message.trim().toLowerCase().replace(/\s+/g, ' ');
+function conversationalTokens(message: string): string[] {
+  return message
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function withoutGreeting(tokens: string[]): string[] {
+  const remaining = [...tokens];
+  const greetingPhrases = [
+    ['good', 'morning'],
+    ['good', 'afternoon'],
+    ['good', 'evening'],
+    ['hello'],
+    ['hi'],
+    ['hey'],
+    ['howdy'],
+  ];
+  let removed = true;
+  while (removed && remaining.length > 0) {
+    removed = false;
+    for (const phrase of greetingPhrases) {
+      if (phrase.every((word, index) => remaining[index] === word)) {
+        remaining.splice(0, phrase.length);
+        if (remaining[0] === 'there') remaining.shift();
+        removed = true;
+        break;
+      }
+    }
+  }
+  return remaining;
 }
 
 function isGreetingOnly(message: string): boolean {
-  return /^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|howdy)(?:\s+there)?[!.?]*$/i
-    .test(message.trim());
+  const remaining = withoutGreeting(conversationalTokens(message));
+  return remaining.length === 0
+    || remaining.join(' ') === 'how are you'
+    || remaining.join(' ') === 'how are you doing';
 }
 
-function asksForStoreOverview(message: string): boolean {
-  const normalized = normalizedCustomerMessage(message);
-  return /\b(?:what|which)\b.{0,35}\b(?:sell|stock|offer|carry|have)\b/.test(normalized)
-    || /\bwhat\s+can\s+i\s+(?:buy|shop)\b/.test(normalized)
-    || /\btell\s+me\s+about\s+(?:kawama|the\s+(?:shop|store|business))\b/.test(normalized);
-}
-
-function asksForOtherProducts(message: string): boolean {
-  return /\b(?:another|other|others|more|different|anything\s+else|what\s+else)\b/i.test(message);
+function isThanksOnly(message: string): boolean {
+  const remaining = withoutGreeting(conversationalTokens(message));
+  const normalized = remaining.join(' ');
+  return ['thanks', 'thank you', 'thank u', 'many thanks', 'okay thanks', 'ok thanks'].includes(normalized);
 }
 
 function asksForProductCount(message: string): boolean {
@@ -152,6 +189,7 @@ function buildSystemPrompt(
   previousProducts: PreviousProductReference[],
   context: ChatInput['context'],
   preferences: ShoppingPreferences,
+  activeSearch: ShoppingSearchContext | undefined,
 ): string {
   const previous = previousProducts.length > 0
     ? previousProducts.map((product, index) => {
@@ -165,6 +203,18 @@ function buildSystemPrompt(
   const preferenceContext = preferences.budgetPesewas === undefined
     ? 'No active customer budget is stored.'
     : `The active customer budget is ${preferences.budgetPesewas} pesewas.`;
+  const activeSearchContext = activeSearch
+    ? `Active product search: ${JSON.stringify({
+      ...(activeSearch.query ? { query: activeSearch.query } : {}),
+      ...(activeSearch.category ? { category: activeSearch.category } : {}),
+      ...(activeSearch.minPricePesewas !== undefined ? { minPricePesewas: activeSearch.minPricePesewas } : {}),
+      ...(activeSearch.maxPricePesewas !== undefined ? { maxPricePesewas: activeSearch.maxPricePesewas } : {}),
+      availability: activeSearch.availability,
+      sort: activeSearch.sort,
+      totalMatches: activeSearch.totalMatches,
+      seenProductIds: activeSearch.seenProductIds,
+    })}`
+    : 'No active product search is stored.';
   return `You are Kawama's friendly shopping assistant. Be concise, practical, and focused on shopping.
 
 Grounding and safety rules:
@@ -177,7 +227,9 @@ Grounding and safety rules:
 - Use the customer's existing requirements. Ask at most one focused clarification only when genuinely needed.
 - Recommend at most four relevant products and explain the reason from recorded facts. Respect budget and availability requirements.
 - For a simple product or category request, search the catalogue instead of asking for unnecessary clarification.
-- For "another", "other", "more", or "anything else", search again; the backend will exclude products already shown.
+- Use getStoreOverview only for a general question about the business or everything it sells. A named product or category such as "What blenders do you have?" requires searchProducts.
+- Use continueProductSearch for contextual follow-ups such as "only this?", "is that all?", "other options", counts, and additional or cheaper choices. Use its cheaper mode for a lower-priced alternative. Do not replace the active subject unless the customer names a new one.
+- Repeated requests for more options must use continueProductSearch so previously seen products are not shown again.
 - For comparisons, recheck the named or previously shown products and select only facts that help distinguish them.
 - Select warranty or material only when the customer asks about it. Select no more than two descriptive facts per product unless the customer explicitly asks for all details.
 - If no product matches, say so and ask whether one requirement may be adjusted.
@@ -187,13 +239,25 @@ Previously shown products, in their original order:
 ${previous}
 ${pageContext}
 ${preferenceContext}
+${activeSearchContext}
 
 Resolve references such as "the second one" from that ordered list without renumbering it. Never substitute another product for a position marked unavailable. Explain that an unavailable referenced item is no longer in the public catalogue. If a reference is genuinely ambiguous, ask one clarification. Use getProductDetails with the listed id before answering current facts about an active referenced product.
 
-Your final response is a typed plan. Do not write customer-facing prose. Return exactly one of:
+Your final response must be one JSON object. For product answers, prefer a grounded_answer so the explanation can sound natural without copying catalogue values:
+- {"type":"grounded_answer","intent":"search|details|alternatives|count|comparison|recommendation","answerTemplate":"natural text with verified placeholders","productIds":["PRODUCT_ID"],"suggestedFollowUps":["optional concise question"]}
+
+Every product name, price, availability statement, summary, specification, detail, description fact, warranty/material statement, result count, remaining count, or price difference inside answerTemplate must use one of these placeholders:
+- {{product:PRODUCT_ID:name}}, {{product:PRODUCT_ID:price}}, {{product:PRODUCT_ID:availability}}, {{product:PRODUCT_ID:summary}}
+- {{product:PRODUCT_ID:spec:INDEX}}, {{product:PRODUCT_ID:detail:INDEX}}, {{product:PRODUCT_ID:description:INDEX}}
+- {{product:PRODUCT_ID:missing:specifications}} only when that product has no recorded specifications
+- {{product:PRODUCT_ID:warranty}}, {{product:PRODUCT_ID:material}}
+- {{difference:PRODUCT_ID:PRODUCT_ID}}, {{count}}, {{remaining}}, {{categories}}
+
+The backend expands placeholders from freshly revalidated records. Use natural connective language around them, answer the question first, and stay concise. Never type a product name, monetary amount, stock claim, or other product fact directly into answerTemplate. For suitability, cite the recorded summary/detail/specification that supports it; do not infer performance from the product name. Include only product IDs retrieved during this request.
+
+Other allowed final plans are:
 - {"type":"greeting"}
 - {"type":"clarification","purpose":"budget|intended_use|product|category|preferences|delivery_location"}
-- {"type":"product_answer","productClaims":[PRODUCT_CLAIM]}
 - {"type":"policy_answer","policyClaims":[POLICY_CLAIM]}
 - {"type":"mixed_answer","productClaims":[PRODUCT_CLAIM],"policyClaims":[POLICY_CLAIM]}
 - {"type":"no_match"} only after a product lookup returns no product
@@ -206,7 +270,7 @@ A POLICY_CLAIM copies the exact relevant getStorePolicies value, including null 
 - {"topic":"contact","email":"exact value or null","phone":"exact value or null","whatsappUrl":"exact value or null"}
 - {"topic":"checkout","productPaymentProvider":"Paystack","productPaymentScope":"products_only","deliveryPaymentMethod":"pay_on_delivery"}
 
-The backend validates this plan and renders all customer-facing facts. Extra keys and prose fields are invalid. Use only product IDs returned by tools in this request. Do not include markdown fences.`;
+Legacy product_answer plans remain accepted for compatibility, but grounded_answer is preferred. Extra keys are invalid. Do not include markdown fences.`;
 }
 
 function parseAssistantResponse(content: string) {
@@ -432,6 +496,113 @@ function nullableClaimMatches(asserted: string | null, recorded: string[]): bool
   return recorded.some((value) => normalizeEvidenceText(value) === normalized);
 }
 
+function groundedTemplateValue(
+  token: string,
+  selectedIds: Set<string>,
+  products: Map<string, Record<string, unknown>>,
+  evidence: EvidenceState,
+): { value: string; productId?: string } | undefined {
+  if (token === 'count') {
+    return evidence.searchTotalMatches === undefined ? undefined : { value: String(evidence.searchTotalMatches) };
+  }
+  if (token === 'remaining') {
+    return evidence.remainingMatches === undefined ? undefined : { value: String(evidence.remainingMatches) };
+  }
+  if (token === 'categories') {
+    return evidence.storeCategories?.length ? { value: joinNaturalList(evidence.storeCategories) } : undefined;
+  }
+  const parts = token.split(':');
+  if (parts[0] === 'difference' && parts.length === 3) {
+    const left = products.get(parts[1]!);
+    const right = products.get(parts[2]!);
+    if (!left || !right || !selectedIds.has(parts[1]!) || !selectedIds.has(parts[2]!)) return undefined;
+    const differencePesewas = Math.abs(toPesewas(Number(left.price)) - toPesewas(Number(right.price)));
+    return { value: formatGhs(differencePesewas) };
+  }
+  if (parts[0] !== 'product' || parts.length < 3) return undefined;
+  const productId = parts[1]!;
+  const field = parts[2]!;
+  const product = products.get(productId);
+  if (!product || !selectedIds.has(productId)) return undefined;
+  if (field === 'name' && parts.length === 3) return { value: String(product.name), productId };
+  if (field === 'price' && parts.length === 3) {
+    return { value: formatGhs(toPesewas(Number(product.price))), productId };
+  }
+  if (field === 'availability' && parts.length === 3) {
+    const value = product.stockLevel === 'out_of_stock'
+      ? 'out of stock'
+      : product.stockLevel === 'low_stock' ? 'in stock with low stock remaining' : 'in stock';
+    return { value, productId };
+  }
+  if (field === 'summary' && parts.length === 3 && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
+    return { value: product.shortDescription.trim(), productId };
+  }
+  if (field === 'warranty' && parts.length === 3) {
+    const values = recordedFactValues(product, 'warranty');
+    return { value: values[0] ?? 'warranty information is not recorded', productId };
+  }
+  if (field === 'material' && parts.length === 3) {
+    const values = recordedFactValues(product, 'material');
+    return { value: values[0] ?? 'material information is not recorded', productId };
+  }
+  if (field === 'missing' && parts.length === 4 && parts[3] === 'specifications') {
+    const specifications = Array.isArray(product.specifications) ? product.specifications : [];
+    return specifications.length === 0
+      ? { value: `No specifications are recorded for ${String(product.name)}`, productId }
+      : undefined;
+  }
+  const index = Number(parts[3]);
+  if (!Number.isInteger(index) || index < 0 || parts.length !== 4) return undefined;
+  if (field === 'spec') {
+    const specification = specificationAt(product, index);
+    return specification ? { value: `${specification.label}: ${specification.value}`, productId } : undefined;
+  }
+  if (field === 'detail') {
+    const detail = detailAt(product, index);
+    return detail ? { value: detail, productId } : undefined;
+  }
+  if (field === 'description') {
+    const section = productDescriptionSections(product)[index];
+    return section ? { value: section, productId } : undefined;
+  }
+  return undefined;
+}
+
+function renderGroundedAnswer(
+  plan: GroundedAnswerPlan,
+  products: Map<string, Record<string, unknown>>,
+  evidence: EvidenceState,
+): string | undefined {
+  if (plan.productIds.some((productId) => !products.has(productId))) return undefined;
+  const selectedIds = new Set(plan.productIds);
+  const rawText = plan.answerTemplate.replace(/\{\{[^{}]+\}\}/g, ' ');
+  if (/\b(?:GHS|GH₵|GH¢)\b|\b\d+(?:\.\d{1,2})?\s*cedis?\b|\b(?:in stock|out of stock|low stock)\b/i.test(rawText)) {
+    return undefined;
+  }
+  if (plan.productIds.some((productId) => {
+    const name = String(products.get(productId)?.name ?? '').trim().toLowerCase();
+    return name.length > 0 && rawText.toLowerCase().includes(name);
+  })) return undefined;
+
+  const referencedProducts = new Set<string>();
+  let usedGroundedToken = false;
+  let invalidToken = false;
+  const rendered = plan.answerTemplate.replace(/\{\{([^{}]{1,200})\}\}/g, (_match, token: string) => {
+    const resolved = groundedTemplateValue(token.trim(), selectedIds, products, evidence);
+    if (!resolved) {
+      invalidToken = true;
+      return '';
+    }
+    usedGroundedToken = true;
+    if (resolved.productId) referencedProducts.add(resolved.productId);
+    return resolved.value;
+  });
+  if (invalidToken || !usedGroundedToken || /\{\{|\}\}/.test(rendered)) return undefined;
+  if (plan.productIds.some((productId) => !referencedProducts.has(productId))) return undefined;
+  const normalized = rendered.trim().replace(/[ \t]+/g, ' ');
+  return isValidStoredChatMessage(normalized) ? normalized : undefined;
+}
+
 function productClaimsAreSupported(
   input: ChatInput,
   claims: ProductClaim[],
@@ -507,6 +678,11 @@ function responseHasRequiredEvidence(
   const referenced = position === undefined ? undefined : previousProducts[position];
   if (response.type === 'unavailable_reference') return Boolean(referenced && !referenced.available);
   if (response.type === 'no_match') return evidence.productRetrieved && evidence.products.size === 0;
+  if (response.type === 'grounded_answer') {
+    return evidence.productRetrieved
+      && (!referenced || (referenced.available && response.productIds.includes(referenced.id)))
+      && renderGroundedAnswer(response, evidence.products, evidence) !== undefined;
+  }
   if (response.type === 'product_answer') {
     return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts, preferences);
   }
@@ -518,15 +694,18 @@ function responseHasRequiredEvidence(
 function groundingCorrection(response: AssistantPlan | undefined, input: ChatInput, previousProducts: PreviousProductReference[]): string {
   const position = referencedPosition(input.message);
   const referenced = position === undefined ? undefined : previousProducts[position];
-  const needsProducts = response?.type === 'product_answer' || response?.type === 'mixed_answer' || response?.type === 'no_match';
+  const needsProducts = response?.type === 'product_answer'
+    || response?.type === 'grounded_answer'
+    || response?.type === 'mixed_answer'
+    || response?.type === 'no_match';
   const needsPolicies = response?.type === 'policy_answer' || response?.type === 'mixed_answer';
   return [
     response ? 'Your typed plan is not supported by current approved evidence.' : 'Your response did not match the required typed plan.',
-    needsProducts ? 'Use a product tool and copy each selected product assertion exactly into its own product claim.' : '',
+    needsProducts ? 'Use a product tool. Prefer grounded_answer with verified placeholders and only product IDs retrieved in this request.' : '',
     needsPolicies ? 'Use getStorePolicies and copy each selected policy claim exactly, including null values.' : '',
     referenced?.available ? `The positional reference resolves only to product id ${referenced.id}; do not substitute another product.` : '',
     referenced && !referenced.available ? `The product at position ${position! + 1} is unavailable; return unavailable_reference.` : '',
-    'Do not include customer-facing prose. A clarification may contain only an allowed purpose.',
+    'A clarification may contain only an allowed purpose. Do not type catalogue values directly into a grounded answer template.',
   ].filter(Boolean).join(' ');
 }
 
@@ -567,7 +746,7 @@ function groundedEvidenceFallback(
   if (response?.type === 'policy_answer' || response?.type === 'mixed_answer') {
     return safeGroundingFallback(response, input, previousProducts);
   }
-  if (evidence.productSearchPerformed && evidence.products.size === 0) {
+  if (evidence.productRetrieved && evidence.products.size === 0) {
     return {
       assistantMessage: 'I could not find a matching product in Kawama’s current public catalogue. Would you like to try a different category, budget, or feature?',
       productIds: [],
@@ -588,29 +767,7 @@ function groundedEvidenceFallback(
     assistantMessage,
     productIds,
     suggestedFollowUps: productIds.length > 1 ? ['Compare these products'] : [],
-  };
-}
-
-async function buildStoreOverview(evidence: EvidenceState): Promise<RenderedAssistantResponse> {
-  const [categoryNames, catalogue] = await Promise.all([
-    getActivePublicCategoryNames(),
-    searchPublicProducts({ availability: 'in_stock', sort: 'featured', page: 1, limit: 4 }),
-  ]);
-  const products = catalogue.products;
-  evidence.productRetrieved = true;
-  evidence.productSearchPerformed = true;
-  evidence.searchTotalMatches = catalogue.total;
-  products.forEach((product) => evidence.products.set(String(product.id), product));
-  const categoryText = categoryNames.length > 0
-    ? ` Current catalogue categories include ${joinNaturalList(categoryNames)}.`
-    : '';
-  const availabilityText = products.length > 0
-    ? ' I’ve added a few available products below, or tell me the item, budget, or feature you need.'
-    : ' There are no active in-stock products I can show right now.';
-  return {
-    assistantMessage: `Kawama sells home and kitchen products.${categoryText}${availabilityText}`,
-    productIds: products.map((product) => String(product.id)),
-    suggestedFollowUps: products.length > 1 ? ['Compare these products'] : [],
+    groundedFallback: true,
   };
 }
 
@@ -721,20 +878,132 @@ function compactProductLine(product: Record<string, unknown>, includeSummary: bo
   return `• ${availabilitySentence(product)} Price: ${formatGhs(pricePesewas)}${summary}`;
 }
 
+function comparisonFacts(product: Record<string, unknown>, claim: ProductClaim | undefined): string[] {
+  if (!claim) return [];
+  const facts: string[] = [];
+  if (claim.includeSummary && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
+    facts.push(product.shortDescription.trim());
+  }
+  for (const index of claim.specificationIndexes ?? []) {
+    const specification = specificationAt(product, index);
+    if (specification) facts.push(`${specification.label}: ${specification.value}`);
+  }
+  for (const index of claim.detailIndexes ?? []) {
+    const detail = detailAt(product, index);
+    if (detail) facts.push(detail);
+  }
+  for (const index of claim.descriptionSectionIndexes ?? []) {
+    const section = productDescriptionSections(product)[index];
+    if (section) facts.push(section);
+  }
+  if (hasOwn(claim, 'material')) {
+    facts.push(recordedFactValues(product, 'material')[0] ?? 'Material is not recorded');
+  }
+  if (hasOwn(claim, 'warranty')) {
+    facts.push(recordedFactValues(product, 'warranty')[0] ?? 'Warranty information is not recorded');
+  }
+  return [...new Set(facts)].slice(0, 3);
+}
+
 function renderProductCollection(
   products: Array<Record<string, unknown>>,
   input: ChatInput,
   searchTotalMatches: number | undefined,
+  claims: ProductClaim[] = [],
 ): string {
   const total = searchTotalMatches ?? products.length;
   if (asksForComparison(input.message)) {
-    const lines = products.map((product) => compactProductLine(product, true));
-    return [`Here’s a current catalogue comparison:`, ...lines].join('\n');
+    const claimById = new Map(claims.map((claim) => [claim.productId, claim]));
+    const lines = products.map((product) => {
+      const facts = comparisonFacts(product, claimById.get(String(product.id)));
+      const detail = facts.length > 0 ? ` ${facts.map(completeSentence).join(' ')}` : '';
+      return `${compactProductLine(product, false)}${detail}`;
+    });
+    const prices = products.map((product) => ({
+      name: String(product.name),
+      pricePesewas: toPesewas(Number(product.price)),
+    }));
+    const priceDifference = prices.length === 2 && prices[0]!.pricePesewas !== prices[1]!.pricePesewas
+      ? `${prices[0]!.pricePesewas < prices[1]!.pricePesewas ? prices[0]!.name : prices[1]!.name} is ${formatGhs(Math.abs(prices[0]!.pricePesewas - prices[1]!.pricePesewas))} less expensive.`
+      : '';
+    return [`Here’s how the current records differ:`, ...lines, priceDifference].filter(Boolean).join('\n');
   }
   const introduction = asksForProductCount(input.message)
     ? `I found ${total} matching ${total === 1 ? 'product' : 'products'} in the current catalogue.`
     : `I found ${total} current ${total === 1 ? 'option' : 'options'} that match.`;
   return [introduction, ...products.map((product) => compactProductLine(product, false))].join('\n');
+}
+
+function relevantRecordedFacts(message: string, product: Record<string, unknown>): string[] {
+  const ignored = new Set(['about', 'does', 'have', 'with', 'this', 'that', 'what', 'which', 'would', 'could', 'should', 'product']);
+  const queryWords = conversationalTokens(message).filter((word) => word.length > 2 && !ignored.has(word));
+  const candidates: string[] = [];
+  if (typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
+    candidates.push(product.shortDescription.trim());
+  }
+  if (Array.isArray(product.specifications)) {
+    for (const specification of product.specifications as Array<{ label?: unknown; value?: unknown }>) {
+      if (typeof specification.label === 'string' && typeof specification.value === 'string') {
+        candidates.push(`${specification.label}: ${specification.value}`);
+      }
+    }
+  }
+  if (Array.isArray(product.details)) {
+    candidates.push(...product.details.filter((detail): detail is string => typeof detail === 'string'));
+  }
+  candidates.push(...productDescriptionSections(product));
+  return [...new Set(candidates)]
+    .map((fact, index) => ({
+      fact,
+      index,
+      score: queryWords.reduce((score, word) => score + (fact.toLowerCase().includes(word) ? 1 : 0), 0),
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .filter((candidate, index) => candidate.score > 0 || index === 0)
+    .slice(0, 2)
+    .map((candidate) => completeSentence(candidate.fact));
+}
+
+function renderCanonicalFallback(
+  input: ChatInput,
+  products: Array<Record<string, unknown>>,
+  evidence: EvidenceState,
+): RenderedAssistantResponse {
+  if (products.length === 0) {
+    if (evidence.remainingMatches === 0 && evidence.searchContext) {
+      const total = evidence.searchTotalMatches ?? evidence.searchContext.totalMatches;
+      return {
+        assistantMessage: `You’ve now seen all ${total} current ${total === 1 ? 'match' : 'matches'} for that search. Would you like to change the budget, product type, or another preference?`,
+        productIds: [],
+        suggestedFollowUps: ['Try another category'],
+      };
+    }
+    return {
+      assistantMessage: 'I could not find a matching product in Kawama’s current public catalogue. Would you like to try a different product type, budget, or feature?',
+      productIds: [],
+      suggestedFollowUps: ['Try another category', 'Change my budget'],
+    };
+  }
+  const productIds = products.map((product) => String(product.id));
+  if (products.length > 1 || asksForComparison(input.message) || asksForProductCount(input.message)) {
+    return {
+      assistantMessage: renderProductCollection(products, input, evidence.searchTotalMatches),
+      productIds,
+      suggestedFollowUps: asksForComparison(input.message) ? [] : ['Compare these products'],
+    };
+  }
+  const product = products[0]!;
+  const name = String(product.name);
+  const facts = relevantRecordedFacts(input.message, product);
+  return {
+    assistantMessage: [
+      `I found one current match: ${name}.`,
+      `${availabilitySentence(product)} Its current price is ${formatGhs(toPesewas(Number(product.price)))}.`,
+      ...facts,
+    ].join(' '),
+    productIds,
+    suggestedFollowUps: [],
+  };
 }
 
 function renderPolicyClaim(claim: PolicyClaim, policies: StorePolicies): string {
@@ -771,6 +1040,7 @@ function renderPolicyClaim(claim: PolicyClaim, policies: StorePolicies): string 
 }
 
 function selectedProductIds(response: AssistantPlan): string[] {
+  if (response.type === 'grounded_answer') return response.productIds;
   if (response.type !== 'product_answer' && response.type !== 'mixed_answer') return [];
   return response.productClaims.map((claim) => claim.productId);
 }
@@ -782,6 +1052,8 @@ function renderAssistantPlan(
   input: ChatInput,
   previousProducts: PreviousProductReference[],
   searchTotalMatches?: number,
+  remainingMatches?: number,
+  storeCategories?: string[],
 ): RenderedAssistantResponse {
   if (response.type === 'greeting') {
     return {
@@ -811,12 +1083,28 @@ function renderAssistantPlan(
   }
 
   const productById = new Map(products.map((product) => [String(product.id), product]));
+  if (response.type === 'grounded_answer') {
+    const assistantMessage = renderGroundedAnswer(response, productById, {
+      productRetrieved: true,
+      productSearchPerformed: false,
+      products: productById,
+      ...(searchTotalMatches !== undefined ? { searchTotalMatches } : {}),
+      ...(remainingMatches !== undefined ? { remainingMatches } : {}),
+      ...(storeCategories ? { storeCategories } : {}),
+    });
+    if (!assistantMessage) return safeGroundingFallback(response, input, previousProducts);
+    return {
+      assistantMessage,
+      productIds: response.productIds,
+      suggestedFollowUps: response.suggestedFollowUps ?? [],
+    };
+  }
   const productClaims = response.type === 'product_answer' || response.type === 'mixed_answer'
     ? response.productClaims
     : [];
   const useCompactCollection = products.length > 1 && !asksForExhaustiveDetails(input.message);
   const productSections = useCompactCollection
-    ? [renderProductCollection(products, input, searchTotalMatches)]
+    ? [renderProductCollection(products, input, searchTotalMatches, productClaims)]
     : productClaims.flatMap((claim) => {
       const product = productById.get(claim.productId);
       return product ? renderProductClaim(claim, product, input.message) : [];
@@ -896,11 +1184,84 @@ async function loadPreviousProductReferences(conversation: Record<string, any> |
   });
 }
 
+function loadActiveSearchContext(conversation: Record<string, any> | null): ShoppingSearchContext | undefined {
+  const stored = conversation?.lastSearch as Record<string, unknown> | null | undefined;
+  if (!stored) return undefined;
+  const availability = stored.availability;
+  const sort = stored.sort;
+  const totalMatches = stored.totalMatches;
+  if (!['any', 'in_stock', 'out_of_stock'].includes(String(availability))) return undefined;
+  if (!['relevance', 'price_asc', 'price_desc', 'newest', 'name'].includes(String(sort))) return undefined;
+  if (typeof totalMatches !== 'number' || !Number.isInteger(totalMatches) || totalMatches < 0) return undefined;
+  const seenProductIds = Array.isArray(stored.seenProductIds)
+    ? stored.seenProductIds.map(String).filter((identifier) => /^[a-f\d]{24}$/i.test(identifier)).slice(0, 100)
+    : [];
+  return {
+    ...(typeof stored.query === 'string' && stored.query.trim() ? { query: stored.query.trim() } : {}),
+    ...(typeof stored.category === 'string' && stored.category.trim() ? { category: stored.category.trim() } : {}),
+    ...(typeof stored.minPricePesewas === 'number' ? { minPricePesewas: stored.minPricePesewas } : {}),
+    ...(typeof stored.maxPricePesewas === 'number' ? { maxPricePesewas: stored.maxPricePesewas } : {}),
+    availability: availability as ShoppingSearchContext['availability'],
+    sort: sort as ShoppingSearchContext['sort'],
+    totalMatches,
+    seenProductIds,
+  };
+}
+
+function logChatDiagnostics(input: {
+  requestId?: string | undefined;
+  status: 'completed' | 'failed';
+  modelCallCount: number;
+  providerElapsedMs: number;
+  toolElapsedMs: number;
+  toolNames: string[];
+  finishReasons: string[];
+  rejectionReasonCodes: string[];
+  startedAt: number;
+}): void {
+  logger.info('shopping_chat_diagnostics', {
+    requestId: input.requestId,
+    status: input.status,
+    modelCallCount: input.modelCallCount,
+    toolCount: input.toolNames.length,
+    toolNames: input.toolNames.join(','),
+    providerElapsedMs: input.providerElapsedMs,
+    toolElapsedMs: input.toolElapsedMs,
+    elapsedMs: Date.now() - input.startedAt,
+    finishReasons: input.finishReasons.join(','),
+    rejectionReasonCodes: input.rejectionReasonCodes.join(','),
+  });
+}
+
 export async function runShoppingChat(
   input: ChatInput,
   providedSessionToken: string | undefined,
   provider: ChatProvider = openRouterProvider,
+  requestId?: string,
 ): Promise<ShoppingChatResult> {
+  const startedAt = Date.now();
+  let modelCallCount = 0;
+  let providerElapsedMs = 0;
+  let toolElapsedMs = 0;
+  const toolNames: string[] = [];
+  const finishReasons: string[] = [];
+  const rejectionReasonCodes: string[] = [];
+  let diagnosticsWritten = false;
+  const emitDiagnostics = (status: 'completed' | 'failed'): void => {
+    if (diagnosticsWritten) return;
+    diagnosticsWritten = true;
+    logChatDiagnostics({
+      requestId,
+      status,
+      modelCallCount,
+      providerElapsedMs,
+      toolElapsedMs,
+      toolNames,
+      finishReasons,
+      rejectionReasonCodes,
+      startedAt,
+    });
+  };
   if (provider === openRouterProvider) {
     const environment = getEnvironment();
     if (!environment.AI_CHAT_ENABLED) {
@@ -921,6 +1282,7 @@ export async function runShoppingChat(
   }
 
   const previousProducts = await loadPreviousProductReferences(conversation as Record<string, any> | null);
+  const activeSearch = loadActiveSearchContext(conversation as Record<string, any> | null);
   const storedPreferences: ShoppingPreferences = typeof conversation?.shoppingPreferences?.budgetPesewas === 'number'
     ? { budgetPesewas: conversation.shoppingPreferences.budgetPesewas }
     : {};
@@ -937,7 +1299,7 @@ export async function runShoppingChat(
     (message: { role: 'user' | 'assistant'; content: string }) => ({ role: message.role, content: message.content }),
   );
   const messages: ProviderMessage[] = [
-    { role: 'system', content: buildSystemPrompt(previousProducts, input.context, shoppingPreferences) },
+    { role: 'system', content: buildSystemPrompt(previousProducts, input.context, shoppingPreferences, activeSearch) },
     ...history,
     { role: 'user', content: input.message },
   ];
@@ -946,6 +1308,7 @@ export async function runShoppingChat(
     productRetrieved: false,
     productSearchPerformed: false,
     products: new Map<string, Record<string, unknown>>(),
+    ...(activeSearch ? { searchContext: activeSearch, searchTotalMatches: activeSearch.totalMatches } : {}),
   };
   let toolExecutions = 0;
   let groundingCorrections = 0;
@@ -961,15 +1324,34 @@ export async function runShoppingChat(
       productIds: [],
       suggestedFollowUps: ['What do you sell?'],
     };
-  } else if (!finalPlan && asksForStoreOverview(input.message)) {
-    fallbackResponse = await buildStoreOverview(evidence);
+  } else if (!finalPlan && isThanksOnly(input.message)) {
+    fallbackResponse = {
+      assistantMessage: 'You’re welcome! If you’d like, I can help you compare another product or keep browsing the current catalogue.',
+      productIds: [],
+      suggestedFollowUps: [],
+    };
   }
 
   for (let modelCall = 0; !finalPlan && !fallbackResponse && modelCall < MAX_MODEL_CALLS; modelCall += 1) {
-    const assistant = await provider.complete({ messages, tools: shoppingToolDefinitions, maxTokens: MAX_OUTPUT_TOKENS });
+    const providerStartedAt = Date.now();
+    let assistant: ProviderMessage;
+    try {
+      assistant = await provider.complete({ messages, tools: shoppingToolDefinitions, maxTokens: MAX_OUTPUT_TOKENS });
+      modelCallCount += 1;
+      providerElapsedMs += Date.now() - providerStartedAt;
+      if (assistant.finish_reason) finishReasons.push(assistant.finish_reason);
+    } catch (error) {
+      modelCallCount += 1;
+      providerElapsedMs += Date.now() - providerStartedAt;
+      rejectionReasonCodes.push(error instanceof AppError ? error.code : 'AI_PROVIDER_UNEXPECTED_ERROR');
+      emitDiagnostics('failed');
+      throw error;
+    }
     const toolCalls = assistant.tool_calls ?? [];
     if (toolCalls.length === 0) {
       if (!assistant.content) {
+        rejectionReasonCodes.push('AI_PROVIDER_EMPTY_RESPONSE');
+        emitDiagnostics('failed');
         throw new AppError(502, 'AI_PROVIDER_EMPTY_RESPONSE', 'The shopping assistant returned an empty response.');
       }
       let candidate: AssistantPlan;
@@ -977,7 +1359,8 @@ export async function runShoppingChat(
         candidate = parseAssistantResponse(assistant.content);
       } catch (error) {
         if (!(error instanceof AppError) || error.code !== 'AI_PROVIDER_INVALID_RESPONSE') throw error;
-        if (evidence.productSearchPerformed) {
+        rejectionReasonCodes.push('MALFORMED_FINAL_PLAN');
+        if (evidence.productRetrieved) {
           fallbackResponse = groundedEvidenceFallback(undefined, input, previousProducts, evidence);
           break;
         }
@@ -998,7 +1381,8 @@ export async function runShoppingChat(
         break;
       }
       rejectedPlan = candidate;
-      if (evidence.productSearchPerformed && (candidate.type === 'product_answer' || candidate.type === 'no_match' || candidate.type === 'greeting')) {
+      rejectionReasonCodes.push('UNSUPPORTED_FINAL_PLAN');
+      if (evidence.productRetrieved && candidate.type !== 'policy_answer' && candidate.type !== 'mixed_answer') {
         fallbackResponse = groundedEvidenceFallback(candidate, input, previousProducts, evidence);
         break;
       }
@@ -1014,19 +1398,35 @@ export async function runShoppingChat(
       break;
     }
     if (toolExecutions + toolCalls.length > MAX_TOOL_EXECUTIONS) {
+      rejectionReasonCodes.push('AI_TOOL_EXECUTION_LIMIT');
+      emitDiagnostics('failed');
       throw new AppError(502, 'AI_TOOL_EXECUTION_LIMIT', 'The shopping assistant requested too many catalogue operations.');
     }
     messages.push(assistant);
     for (const toolCall of toolCalls) {
       toolExecutions += 1;
-      const result = await executeShoppingTool(toolCall.function.name, toolCall.function.arguments, {
-        excludeProductIds: asksForOtherProducts(input.message)
-          ? previousProducts.filter((product) => product.available).map((product) => product.id)
-          : [],
-      });
+      toolNames.push(toolCall.function.name);
+      const toolStartedAt = Date.now();
+      let result: ShoppingToolResult;
+      try {
+        result = await executeShoppingTool(toolCall.function.name, toolCall.function.arguments, {
+          activeSearch: evidence.searchContext ?? activeSearch,
+        });
+        toolElapsedMs += Date.now() - toolStartedAt;
+      } catch (error) {
+        toolElapsedMs += Date.now() - toolStartedAt;
+        rejectionReasonCodes.push(error instanceof AppError ? error.code : 'AI_TOOL_UNEXPECTED_ERROR');
+        emitDiagnostics('failed');
+        throw error;
+      }
       if (result.evidenceKind === 'product') evidence.productRetrieved = true;
-      if (result.evidenceSource === 'search') evidence.productSearchPerformed = true;
+      if (result.evidenceSource === 'search' || result.evidenceSource === 'overview') {
+        evidence.productSearchPerformed = true;
+      }
       if (result.totalMatches !== undefined) evidence.searchTotalMatches = result.totalMatches;
+      if (result.remainingMatches !== undefined) evidence.remainingMatches = result.remainingMatches;
+      if (result.searchContext) evidence.searchContext = result.searchContext;
+      if (result.categories) evidence.storeCategories = result.categories;
       if (result.policies) evidence.policies = result.policies;
       result.products.forEach((product) => evidence.products.set(String(product.id), product));
       messages.push({
@@ -1039,9 +1439,13 @@ export async function runShoppingChat(
   }
 
   if (!finalPlan && !fallbackResponse && groundingCorrections > 0) {
-    fallbackResponse = safeGroundingFallback(rejectedPlan, input, previousProducts);
+    fallbackResponse = evidence.productRetrieved
+      ? groundedEvidenceFallback(rejectedPlan, input, previousProducts, evidence)
+      : safeGroundingFallback(rejectedPlan, input, previousProducts);
   }
   if (!finalPlan && !fallbackResponse) {
+    rejectionReasonCodes.push('MODEL_CALL_LIMIT');
+    emitDiagnostics('failed');
     throw new AppError(502, 'AI_MODEL_CALL_LIMIT', 'The shopping assistant could not finish within the allowed steps.');
   }
 
@@ -1056,6 +1460,8 @@ export async function runShoppingChat(
       productSearchPerformed: evidence.productSearchPerformed,
       products: new Map(canonicalProducts.map((product) => [String(product.id), product])),
       ...(evidence.searchTotalMatches !== undefined ? { searchTotalMatches: evidence.searchTotalMatches } : {}),
+      ...(evidence.remainingMatches !== undefined ? { remainingMatches: evidence.remainingMatches } : {}),
+      ...(evidence.searchContext ? { searchContext: evidence.searchContext } : {}),
       ...(evidence.policies ? { policies: evidence.policies } : {}),
     };
     const stillSupported = productClaimsAreSupported(
@@ -1075,14 +1481,29 @@ export async function runShoppingChat(
       canonicalProducts = [];
     }
   }
-  const finalResponse = fallbackResponse
-    ?? renderAssistantPlan(
+  if (finalPlan?.type === 'grounded_answer') {
+    const canonicalById = new Map(canonicalProducts.map((product) => [String(product.id), product]));
+    if (canonicalProducts.length !== selectedIds.length
+      || renderGroundedAnswer(finalPlan, canonicalById, evidence) === undefined) {
+      fallbackResponse = {
+        assistantMessage: 'The product information changed while I was checking it, so I could not confirm that answer. Please ask me to check the latest options again.',
+        productIds: [],
+        suggestedFollowUps: ['Check the latest options'],
+      };
+      canonicalProducts = [];
+    }
+  }
+  const finalResponse = fallbackResponse?.groundedFallback
+    ? renderCanonicalFallback(input, canonicalProducts, evidence)
+    : fallbackResponse ?? renderAssistantPlan(
       finalPlan!,
       canonicalProducts,
       evidence.policies,
       input,
       previousProducts,
       evidence.searchTotalMatches,
+      evidence.remainingMatches,
+      evidence.storeCategories,
     );
   const pendingClarificationPurpose = finalPlan?.type === 'clarification' && !fallbackResponse
     ? finalPlan.purpose
@@ -1096,6 +1517,7 @@ export async function runShoppingChat(
     ? cards.map((card) => ({ productId: card.id, name: card.name, slug: card.slug }))
     : previousProducts.map((product) => ({ productId: product.id, name: product.name, slug: product.slug ?? 'unavailable-product' }));
   const retainedIds = retainedProducts.map((product) => product.productId);
+  const retainedSearchContext = evidence.searchContext ?? activeSearch ?? null;
   const nextMessages = [
     ...(conversation?.messages ?? []),
     { role: 'user', content: input.message, createdAt: now },
@@ -1113,6 +1535,7 @@ export async function runShoppingChat(
         messages: nextMessages,
         lastShownProducts: retainedProducts,
         lastShownProductIds: retainedIds,
+        lastSearch: retainedSearchContext,
         shoppingPreferences,
         pendingClarificationPurpose,
         expiresAt: conversationExpiry(),
@@ -1126,6 +1549,7 @@ export async function runShoppingChat(
       messages: nextMessages,
       lastShownProducts: retainedProducts,
       lastShownProductIds: retainedIds,
+      lastSearch: retainedSearchContext,
       shoppingPreferences,
       pendingClarificationPurpose,
       expiresAt: conversationExpiry(),
@@ -1133,6 +1557,7 @@ export async function runShoppingChat(
     conversationId = String(created._id);
   }
 
+  emitDiagnostics('completed');
   return {
     conversationId,
     sessionToken,

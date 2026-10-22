@@ -218,7 +218,11 @@ describe('shopping chat API', () => {
     const second = await seedProduct({ slug: 'other-second', name: 'Other Second', pricePesewas: 30_000 });
     const third = await seedProduct({ slug: 'other-third', name: 'Other Third', pricePesewas: 40_000 });
     const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
       const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      if (!lastTool && userMessage.includes('other options')) {
+        return toolCall('other-continuation', 'continueProductSearch', { mode: 'more', limit: 2 });
+      }
       if (!lastTool) return toolCall('other-search', 'searchProducts', { query: 'other', sort: 'price_asc', limit: 2 });
       const products = productsFromLastTool(input);
       return finalPlan({
@@ -241,6 +245,46 @@ describe('shopping chat API', () => {
 
     expect(followUp.status).toBe(200);
     expect(followUp.body.data.products.map((product: { id: string }) => product.id)).toEqual([String(third._id)]);
+  });
+
+  it('retains the active product subject when finding a cheaper unseen alternative', async () => {
+    const premium = await seedProduct({ slug: 'premium-subject-blender', name: 'Premium Subject Blender', pricePesewas: 50_000 });
+    const value = await seedProduct({ slug: 'value-subject-blender', name: 'Value Subject Blender', pricePesewas: 30_000 });
+    const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      if (!lastTool) {
+        return userMessage.toLowerCase().includes('cheaper')
+          ? toolCall('cheaper-continuation', 'continueProductSearch', { mode: 'cheaper', limit: 2 })
+          : toolCall('premium-search', 'searchProducts', { query: 'blender', sort: 'price_desc', limit: 1 });
+      }
+      const products = productsFromLastTool(input);
+      const productId = String(products[0]!.id);
+      return finalPlan({
+        type: 'grounded_answer',
+        intent: userMessage.toLowerCase().includes('cheaper') ? 'alternatives' : 'search',
+        answerTemplate: `{{product:${productId}:name}} is {{product:${productId}:availability}} at {{product:${productId}:price}}.`,
+        productIds: [productId],
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me a blender.' });
+    expect(initial.body.data.products[0].id).toBe(String(premium._id));
+
+    const cheaper = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Any cheaper ones?' });
+
+    expect(cheaper.status).toBe(200);
+    expect(cheaper.body.data.assistantMessage).toContain('Value Subject Blender');
+    expect(cheaper.body.data.assistantMessage).toContain('GHS 300.00');
+    expect(cheaper.body.data.products.map((product: { id: string }) => product.id)).toEqual([String(value._id)]);
+    const stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.lastSearch?.query).toBe('blender');
+    expect(stored?.lastSearch?.maxPricePesewas).toBe(49_999);
+    expect(stored?.lastSearch?.seenProductIds.map(String)).toEqual(expect.arrayContaining([String(premium._id), String(value._id)]));
   });
 
   it('keeps original positions when an earlier displayed product is archived', async () => {
@@ -368,9 +412,18 @@ describe('shopping chat API', () => {
     expect(clarification.calls).toHaveLength(1);
   });
 
-  it('answers store-overview questions from the active catalogue without calling the provider', async () => {
+  it('answers store-overview questions from the active catalogue without confusing them with named searches', async () => {
     const product = await seedProduct();
-    const provider = new ScriptedProvider(() => finalPlan({ type: 'greeting' }));
+    const provider = new ScriptedProvider((input, call) => {
+      if (call === 1) return toolCall('store-overview', 'getStoreOverview', {});
+      const products = productsFromLastTool(input);
+      return finalPlan({
+        type: 'grounded_answer',
+        intent: 'search',
+        answerTemplate: `Kawama carries home and kitchen products across {{categories}}. One current option is {{product:${String(products[0]!.id)}:name}}.`,
+        productIds: [String(products[0]!.id)],
+      });
+    });
 
     const response = await request(createApp({ chatProvider: provider }))
       .post('/api/ai/chat')
@@ -380,7 +433,282 @@ describe('shopping chat API', () => {
     expect(response.body.data.assistantMessage).toContain('home and kitchen products');
     expect(response.body.data.assistantMessage).toContain('Appliances');
     expect(response.body.data.products[0].id).toBe(String(product._id));
+    expect(provider.calls).toHaveLength(2);
+  });
+
+  it('keeps a natural shopping conversation grounded across greetings, searches, counts, comparisons, and recommendations', async () => {
+    const appliances = await CategoryModel.create({ name: 'Appliances', slug: 'appliances', status: 'active' });
+    const cookware = await CategoryModel.create({ name: 'Cookware', slug: 'cookware', status: 'active' });
+    const blender = await seedProduct({ category: appliances._id });
+    const stockPot = await seedProduct({
+      category: cookware._id,
+      slug: 'granite-stock-pot',
+      name: 'Granite Everyday Stock Pot',
+      shortDescription: 'A roomy lidded pot for soups, stews, rice, and family meals.',
+      description: 'A single stock pot designed for generous everyday cooking.',
+      pricePesewas: 32_000,
+      details: ['Fitted lid', 'Twin side handles'],
+      specifications: [
+        { label: 'Product format', value: 'Single stock pot' },
+        { label: 'Best recorded use', value: 'Soups, stews, rice, and family meals' },
+      ],
+    });
+    const cookwareSet = await seedProduct({
+      category: cookware._id,
+      slug: 'ceramic-cookware-set',
+      name: 'Ceramic Cookware Set',
+      shortDescription: 'A coordinated nonstick cookware set for everyday family meals.',
+      description: 'A coordinated collection of pots and pans with fitted glass lids.',
+      pricePesewas: 28_900,
+      details: ['Fitted glass lids', 'Comfortable wood-look handles'],
+      specifications: [
+        { label: 'Product contents', value: 'Coordinated pot and pan set' },
+        { label: 'Material', value: 'Ceramic-coated cookware' },
+      ],
+    });
+
+    const blenderId = String(blender._id);
+    const stockPotId = String(stockPot._id);
+    const cookwareSetId = String(cookwareSet._id);
+    const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const normalized = userMessage.toLowerCase();
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+
+      if (!lastTool) {
+        if (normalized.includes('wat do u have')) return toolCall('overview', 'getStoreOverview', {});
+        if (normalized.includes('blender')) return toolCall('blender-search', 'searchProducts', { query: 'blender', limit: 4 });
+        if (normalized.includes('poot')) {
+          return toolCall('cookware-search', 'searchProducts', {
+            category: 'Cookware', availability: 'in_stock', sort: 'price_desc', limit: 1,
+          });
+        }
+        if (normalized.includes('how many')) return toolCall('cookware-count', 'continueProductSearch', { mode: 'count', limit: 4 });
+        if (normalized.includes('only ceramic')) {
+          return toolCall('cookware-clarification', 'getProductDetails', { identifiers: [stockPotId, cookwareSetId] });
+        }
+        if (normalized.includes('compare') || normalized.includes('different')) {
+          return toolCall('cookware-comparison', 'getProductDetails', { identifiers: [stockPotId, cookwareSetId] });
+        }
+        if (normalized.includes('soup')) {
+          return toolCall('soup-suitability', 'getProductDetails', { identifiers: [stockPotId, cookwareSetId] });
+        }
+        throw new Error(`Unexpected conversational test message: ${userMessage}`);
+      }
+
+      if (normalized.includes('wat do u have')) {
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'search',
+          answerTemplate: `Kawama sells home and kitchen products across {{categories}}. Current examples include {{product:${blenderId}:name}}, {{product:${stockPotId}:name}}, and {{product:${cookwareSetId}:name}}.`,
+          productIds: [blenderId, stockPotId, cookwareSetId],
+          suggestedFollowUps: ['Show me blenders'],
+        });
+      }
+      if (normalized.includes('blender')) {
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'search',
+          answerTemplate: `I found {{product:${blenderId}:name}}. It is {{product:${blenderId}:availability}} at {{product:${blenderId}:price}}. {{product:${blenderId}:summary}}`,
+          productIds: [blenderId],
+        });
+      }
+      if (normalized.includes('poot')) {
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'search',
+          answerTemplate: `A strong current match is {{product:${stockPotId}:name}} at {{product:${stockPotId}:price}}. {{product:${stockPotId}:summary}}`,
+          productIds: [stockPotId],
+          suggestedFollowUps: ['Show me the other cookware options'],
+        });
+      }
+      if (normalized.includes('how many')) {
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'count',
+          answerTemplate: `There are {{count}} current matching options: {{product:${stockPotId}:name}} and {{product:${cookwareSetId}:name}}.`,
+          productIds: [stockPotId, cookwareSetId],
+        });
+      }
+      if (normalized.includes('only ceramic')) {
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'alternatives',
+          answerTemplate: `No—the options are not all the same. {{product:${cookwareSetId}:name}} records {{product:${cookwareSetId}:spec:0}} and {{product:${cookwareSetId}:spec:1}}, while {{product:${stockPotId}:name}} records {{product:${stockPotId}:spec:0}}.`,
+          productIds: [cookwareSetId, stockPotId],
+        });
+      }
+      if (normalized.includes('compare') || normalized.includes('different')) {
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'comparison',
+          answerTemplate: `{{product:${stockPotId}:name}} costs {{product:${stockPotId}:price}}; {{product:${stockPotId}:spec:0}}. {{product:${cookwareSetId}:name}} costs {{product:${cookwareSetId}:price}}; {{product:${cookwareSetId}:spec:0}}. Their current price difference is {{difference:${stockPotId}:${cookwareSetId}}}.`,
+          productIds: [stockPotId, cookwareSetId],
+        });
+      }
+      return finalPlan({
+        type: 'grounded_answer',
+        intent: 'recommendation',
+        answerTemplate: `I would start with {{product:${stockPotId}:name}} because {{product:${stockPotId}:summary}} {{product:${stockPotId}:spec:1}}.`,
+        productIds: [stockPotId],
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+    let conversationId: string | undefined;
+    let sessionToken: string | undefined;
+    const send = async (message: string) => {
+      const pending = request(app).post('/api/ai/chat');
+      if (sessionToken) pending.set('x-chat-session', sessionToken);
+      const response = await pending.send({ ...(conversationId ? { conversationId } : {}), message });
+      expect(response.status).toBe(200);
+      conversationId = response.body.data.conversationId as string;
+      sessionToken = String(response.headers['x-chat-session']);
+      return response;
+    };
+
+    const compoundGreeting = await send('hello good afternoon');
+    expect(compoundGreeting.body.data.assistantMessage).toContain('home and kitchen catalogue');
     expect(provider.calls).toHaveLength(0);
+
+    const overview = await send('wat do u have or sells');
+    expect(overview.body.data.assistantMessage).toContain('Appliances and Cookware');
+    expect(overview.body.data.assistantMessage).toContain('Kawama sells home and kitchen products');
+
+    const blenderResult = await send('well.. I want blender');
+    expect(blenderResult.body.data.assistantMessage).toContain('Smoothie Blender');
+    expect(blenderResult.body.data.products.map((product: { id: string }) => product.id)).toEqual([blenderId]);
+
+    const providerCallsBeforeGreeting = provider.calls.length;
+    const laterGreeting = await send('good afternoon');
+    expect(laterGreeting.body.data.assistantMessage).toMatch(/^Hi!/);
+    expect(provider.calls).toHaveLength(providerCallsBeforeGreeting);
+
+    const firstCookware = await send('I want cooking poot');
+    expect(firstCookware.body.data.assistantMessage).toContain('Granite Everyday Stock Pot');
+    expect(firstCookware.body.data.products.map((product: { id: string }) => product.id)).toEqual([stockPotId]);
+
+    const count = await send('how many cooking pots you have? Only this?');
+    expect(count.body.data.assistantMessage).toContain('There are 2 current matching options');
+    expect(new Set(count.body.data.products.map((product: { id: string }) => product.id))).toEqual(new Set([stockPotId, cookwareSetId]));
+
+    const ceramicClarification = await send('only ceramic cookware?');
+    expect(ceramicClarification.body.data.assistantMessage).toContain('not all the same');
+    expect(ceramicClarification.body.data.assistantMessage).toContain('Coordinated pot and pan set');
+    expect(ceramicClarification.body.data.assistantMessage).toContain('Single stock pot');
+
+    const comparison = await send('Compare these products');
+    expect(comparison.body.data.assistantMessage).toContain('GHS 320.00');
+    expect(comparison.body.data.assistantMessage).toContain('GHS 289.00');
+    expect(comparison.body.data.assistantMessage).toContain('GHS 31.00');
+    expect(comparison.body.data.suggestedFollowUps ?? []).not.toContain('Compare these products');
+
+    const difference = await send('How are these different?');
+    expect(difference.body.data.assistantMessage).toContain('Single stock pot');
+    expect(difference.body.data.assistantMessage).toContain('Coordinated pot and pan set');
+
+    const suitability = await send('Which would suit making soup?');
+    expect(suitability.body.data.assistantMessage).toContain('soups, stews, rice, and family meals');
+    expect(suitability.body.data.products.map((product: { id: string }) => product.id)).toEqual([stockPotId]);
+
+    const providerCallsBeforeThanks = provider.calls.length;
+    const thanks = await send('thanks');
+    expect(thanks.body.data.assistantMessage).toMatch(/^You’re welcome!/);
+    expect(provider.calls).toHaveLength(providerCallsBeforeThanks);
+
+    const stored = await ChatConversationModel.findById(conversationId).lean();
+    expect(stored?.lastSearch?.category).toBe('Cookware');
+    expect(stored?.lastSearch?.totalMatches).toBe(2);
+    expect(stored?.lastSearch?.seenProductIds.map(String)).toEqual(expect.arrayContaining([stockPotId, cookwareSetId]));
+  });
+
+  it('uses a product search, not the store overview, for a named product request', async () => {
+    const blender = await seedProduct();
+    const blenderId = String(blender._id);
+    const requestedTools: string[] = [];
+    const provider = new ScriptedProvider((input) => {
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      if (!lastTool) {
+        requestedTools.push('searchProducts');
+        return toolCall('named-blender-search', 'searchProducts', { query: 'blender', limit: 4 });
+      }
+      return finalPlan({
+        type: 'grounded_answer',
+        intent: 'search',
+        answerTemplate: `I found {{product:${blenderId}:name}} at {{product:${blenderId}:price}}. {{product:${blenderId}:summary}}`,
+        productIds: [blenderId],
+      });
+    });
+
+    const response = await request(createApp({ chatProvider: provider }))
+      .post('/api/ai/chat')
+      .send({ message: 'What blenders do you have?' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.assistantMessage).toContain('Smoothie Blender');
+    expect(response.body.data.products[0].id).toBe(blenderId);
+    expect(requestedTools).toEqual(['searchProducts']);
+  });
+
+  it('keeps malformed detail output useful and distinguishes real no-match results', async () => {
+    const blender = await seedProduct();
+    const malformedDetails = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('malformed-details', 'getProductDetails', { identifiers: [String(blender._id)] })
+      : { role: 'assistant', content: 'This is not a typed plan.' });
+    const recovered = await request(createApp({ chatProvider: malformedDetails }))
+      .post('/api/ai/chat')
+      .send({ message: 'Tell me about this blender.', context: { productId: String(blender._id) } });
+
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.data.assistantMessage).toContain('Smoothie Blender');
+    expect(recovered.body.data.assistantMessage).toContain('GHS 350.00');
+    expect(recovered.body.data.products[0].id).toBe(String(blender._id));
+
+    const noMatch = new ScriptedProvider((input) => {
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      return lastTool
+        ? finalPlan({ type: 'no_match' })
+        : toolCall('real-no-match', 'searchProducts', { query: 'space toaster', limit: 4 });
+    });
+    const missing = await request(createApp({ chatProvider: noMatch }))
+      .post('/api/ai/chat')
+      .send({ message: 'Do you have a space toaster?' });
+
+    expect(missing.status).toBe(200);
+    expect(missing.body.data.assistantMessage).toContain('could not find a matching product');
+    expect(missing.body.data.products).toEqual([]);
+    expect(missing.body.data.suggestedFollowUps).toHaveLength(2);
+  });
+
+  it('states a comparison limitation when a requested specification is not recorded', async () => {
+    const specified = await seedProduct({
+      slug: 'specified-pot',
+      name: 'Specified Pot',
+      specifications: [{ label: 'Capacity', value: 'Five litres' }],
+    });
+    const unspecified = await seedProduct({
+      slug: 'unspecified-pot',
+      name: 'Unspecified Pot',
+      specifications: [],
+    });
+    const specifiedId = String(specified._id);
+    const unspecifiedId = String(unspecified._id);
+    const provider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('missing-spec-comparison', 'getProductDetails', { identifiers: [specifiedId, unspecifiedId] })
+      : finalPlan({
+        type: 'grounded_answer',
+        intent: 'comparison',
+        answerTemplate: `{{product:${specifiedId}:name}} records {{product:${specifiedId}:spec:0}}. {{product:${unspecifiedId}:missing:specifications}}, so I cannot compare their capacity from the catalogue.`,
+        productIds: [specifiedId, unspecifiedId],
+      }));
+
+    const response = await request(createApp({ chatProvider: provider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Compare their capacity.' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.assistantMessage).toContain('Capacity: Five litres');
+    expect(response.body.data.assistantMessage).toContain('No specifications are recorded for Unspecified Pot');
+    expect(response.body.data.products).toHaveLength(2);
   });
 
   it('recovers useful catalogue cards when a model plan is malformed after product search', async () => {
@@ -483,7 +811,9 @@ describe('shopping chat API', () => {
       .send({ message: 'I need a blender under GH₵400.' });
     expect(rejected.status).toBe(200);
     expect(rejected.body.data.assistantMessage).not.toContain('costs GHS 400');
-    expect(rejected.body.data.products).toEqual([]);
+    expect(rejected.body.data.assistantMessage).toContain('Smoothie Blender');
+    expect(rejected.body.data.assistantMessage).toContain('GHS 350.00');
+    expect(rejected.body.data.products[0].id).toBe(String(blender._id));
 
     const correct = new ScriptedProvider((_input, call) => call === 1
       ? toolCall('correct-price', 'getProductDetails', { identifiers: [String(blender._id)] })
@@ -726,7 +1056,8 @@ describe('shopping chat API', () => {
       .send({ message: 'My budget is GHS 1,25.00.', context: { productId: String(precise._id) } });
     expect(malformedResponse.status).toBe(200);
     expect(malformedResponse.body.data.assistantMessage).not.toContain('GHS 125.00');
-    expect(malformedResponse.body.data.products).toEqual([]);
+    expect(malformedResponse.body.data.assistantMessage).toContain('Precise Price Blender');
+    expect(malformedResponse.body.data.products[0].id).toBe(String(precise._id));
     const malformedStored = await ChatConversationModel.findById(malformedResponse.body.data.conversationId).lean();
     expect(malformedStored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
   });
@@ -829,8 +1160,9 @@ describe('shopping chat API', () => {
       .post('/api/ai/chat')
       .send({ message: 'Give me care detail 100.', context: { productId: String(careProduct._id) } });
     expect(invalidReference.status).toBe(200);
-    expect(invalidReference.body.data.assistantMessage).toContain('could not verify current catalogue information');
-    expect(invalidReference.body.data.products).toEqual([]);
+    expect(invalidReference.body.data.assistantMessage).toContain('Care Details Blender');
+    expect(invalidReference.body.data.assistantMessage).not.toContain('care detail 100');
+    expect(invalidReference.body.data.products[0].id).toBe(String(careProduct._id));
   });
 
   it('persists, replaces, removes, and isolates active customer budgets', async () => {
@@ -890,8 +1222,8 @@ describe('shopping chat API', () => {
       .set('x-chat-session', String(initial.headers['x-chat-session']))
       .send({ conversationId: initial.body.data.conversationId, message: 'Show me another blender.' });
     expect(staleBudgetResponse.status).toBe(200);
-    expect(staleBudgetResponse.body.data.assistantMessage).toContain('could not verify current catalogue information');
-    expect(staleBudgetResponse.body.data.products).toEqual([]);
+    expect(staleBudgetResponse.body.data.assistantMessage).toContain('Budget Updated');
+    expect(staleBudgetResponse.body.data.products[0].id).toBe(String(updated._id));
 
     const isolatedProvider = new ScriptedProvider((_input, call) => call === 1
       ? toolCall('isolated-budget', 'getProductDetails', { identifiers: [String(cheaper._id)] })
@@ -903,8 +1235,8 @@ describe('shopping chat API', () => {
       .post('/api/ai/chat')
       .send({ message: 'Show me a cheaper blender.' });
     expect(isolated.status).toBe(200);
-    expect(isolated.body.data.assistantMessage).toContain('could not verify current catalogue information');
-    expect(isolated.body.data.products).toEqual([]);
+    expect(isolated.body.data.assistantMessage).toContain('Budget Cheaper');
+    expect(isolated.body.data.products[0].id).toBe(String(cheaper._id));
   });
 
   it('associates a budget with its declaration instead of nearby product prices', async () => {
@@ -945,9 +1277,9 @@ describe('shopping chat API', () => {
         message: 'Does this GHS 450 blender fit my budget?',
       });
     expect(followUp.status).toBe(200);
-    expect(followUp.body.data.assistantMessage).toContain('could not verify current catalogue information');
+    expect(followUp.body.data.assistantMessage).toContain('Above Budget Blender');
     expect(followUp.body.data.assistantMessage).not.toContain('fits your GHS 450.00 budget');
-    expect(followUp.body.data.products).toEqual([]);
+    expect(followUp.body.data.products[0].id).toBe(String(product._id));
     stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
     expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
   });
@@ -1381,6 +1713,18 @@ describe('OpenRouter provider failures', () => {
     const configuredRequest = await requestedModel('example-provider/explicit-model');
     expect(configuredRequest.model).toBe('example-provider/explicit-model');
     expect(configuredRequest.models).toBeUndefined();
+  });
+
+  it('retains the provider finish reason for bounded chat diagnostics', async () => {
+    const provider = createOpenRouterProvider(async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    await expect(provider.complete(input)).resolves.toMatchObject({
+      role: 'assistant',
+      content: 'ok',
+      finish_reason: 'stop',
+    });
   });
 
   it('fails closed when the server key is missing', async () => {

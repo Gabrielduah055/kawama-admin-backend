@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import { getEnvironment } from './config/environment.js';
 import { databaseIsReady } from './config/mongodb.js';
 import { AppError } from './errors/AppError.js';
+import { getBuildMetadata } from './lib/build.js';
 import { createAdministratorAuthentication } from './middlewares/auth.js';
 import { errorHandler, notFoundHandler } from './middlewares/errors.js';
 import { requestContext } from './middlewares/requestContext.js';
@@ -102,6 +103,7 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
 
   app.get('/', (_request, response) => response.status(200).json({ status: 'ok', message: 'Kawama API is running' }));
   app.get('/health/live', (_request, response) => response.json({ data: { status: 'ok' } }));
+  app.get('/health/version', (_request, response) => response.json({ data: getBuildMetadata() }));
   app.get('/health/ready', (_request, response) => {
     const ready = databaseIsReady();
     response.status(ready ? 200 : 503).json({ data: { status: ready ? 'ready' : 'not_ready', database: ready } });
