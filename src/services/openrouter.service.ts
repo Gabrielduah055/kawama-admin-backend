@@ -77,6 +77,7 @@ export function createOpenRouterProvider(fetchImpl: typeof fetch = fetch): ChatP
         tools: input.tools,
         tool_choice: 'auto',
         parallel_tool_calls: false,
+        reasoning: { effort: 'low' },
         temperature: 0.2,
         max_tokens: input.maxTokens,
       });

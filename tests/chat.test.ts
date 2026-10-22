@@ -213,6 +213,36 @@ describe('shopping chat API', () => {
     expect(followUpSystem).toContain(`2. Second Blender (id: ${second._id}`);
   });
 
+  it('excludes previously shown products when the customer asks for other options', async () => {
+    const first = await seedProduct({ slug: 'other-first', name: 'Other First', pricePesewas: 20_000 });
+    const second = await seedProduct({ slug: 'other-second', name: 'Other Second', pricePesewas: 30_000 });
+    const third = await seedProduct({ slug: 'other-third', name: 'Other Third', pricePesewas: 40_000 });
+    const provider = new ScriptedProvider((input) => {
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      if (!lastTool) return toolCall('other-search', 'searchProducts', { query: 'other', sort: 'price_asc', limit: 2 });
+      const products = productsFromLastTool(input);
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: products.map((product) => ({ productId: String(product.id), includeSummary: true })),
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me two other products.' });
+    expect(initial.body.data.products.map((product: { id: string }) => product.id)).toEqual([
+      String(first._id),
+      String(second._id),
+    ]);
+
+    const followUp = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Show me other options.' });
+
+    expect(followUp.status).toBe(200);
+    expect(followUp.body.data.products.map((product: { id: string }) => product.id)).toEqual([String(third._id)]);
+  });
+
   it('keeps original positions when an earlier displayed product is archived', async () => {
     const first = await seedProduct({ slug: 'position-a', name: 'Position A Blender', pricePesewas: 30_000 });
     const second = await seedProduct({ slug: 'position-b', name: 'Position B Blender', pricePesewas: 38_000 });
@@ -320,13 +350,14 @@ describe('shopping chat API', () => {
     expect(response.body.data.assistantMessage).not.toContain('90 days');
   });
 
-  it('allows greetings and necessary fact-free clarification without retrieval', async () => {
+  it('answers greetings without provider latency and allows necessary fact-free clarification', async () => {
     const greeting = new ScriptedProvider(() => finalPlan({ type: 'greeting' }));
     const greeted = await request(createApp({ chatProvider: greeting }))
       .post('/api/ai/chat')
       .send({ message: 'Hello' });
     expect(greeted.status).toBe(200);
-    expect(greeting.calls).toHaveLength(1);
+    expect(greeted.body.data.assistantMessage).toContain('home and kitchen catalogue');
+    expect(greeting.calls).toHaveLength(0);
 
     const clarification = new ScriptedProvider(() => finalPlan({ type: 'clarification', purpose: 'budget' }));
     const clarified = await request(createApp({ chatProvider: clarification }))
@@ -335,6 +366,37 @@ describe('shopping chat API', () => {
     expect(clarified.status).toBe(200);
     expect(clarified.body.data.assistantMessage).toContain('What budget');
     expect(clarification.calls).toHaveLength(1);
+  });
+
+  it('answers store-overview questions from the active catalogue without calling the provider', async () => {
+    const product = await seedProduct();
+    const provider = new ScriptedProvider(() => finalPlan({ type: 'greeting' }));
+
+    const response = await request(createApp({ chatProvider: provider }))
+      .post('/api/ai/chat')
+      .send({ message: 'What do you sell?' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.assistantMessage).toContain('home and kitchen products');
+    expect(response.body.data.assistantMessage).toContain('Appliances');
+    expect(response.body.data.products[0].id).toBe(String(product._id));
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  it('recovers useful catalogue cards when a model plan is malformed after product search', async () => {
+    const product = await seedProduct();
+    const provider = new ScriptedProvider((input, call) => call === 1
+      ? toolCall('fallback-search', 'searchProducts', { query: 'blender', limit: 4 })
+      : { role: 'assistant', content: 'The blender is definitely available.' });
+
+    const response = await request(createApp({ chatProvider: provider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Show me a blender.' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.assistantMessage).toContain('one current match');
+    expect(response.body.data.products[0].id).toBe(String(product._id));
+    expect(provider.calls).toHaveLength(2);
   });
 
   it('accepts a policy answer only after approved policy retrieval', async () => {
@@ -1213,7 +1275,7 @@ describe('shopping chat API', () => {
 
     expect(stolen.status).toBe(404);
     expect(stolen.body.error.code).toBe('CONVERSATION_NOT_FOUND');
-    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls).toHaveLength(0);
   });
 
   it('keeps catalogue and checkout routes available when chat is disabled', async () => {

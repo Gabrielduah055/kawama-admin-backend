@@ -80,7 +80,7 @@ export const openApiDocument = {
     '/api/ai/chat': {
       post: {
         tags: ['Shopping assistant'],
-        description: 'Starts or continues a server-managed guest shopping conversation. Factual product and policy answers require approved current-request retrieval; greetings and fact-free clarification questions may omit tools. Store the X-Chat-Session response header and send it on follow-ups; a conversation ID alone does not grant access.',
+        description: 'Starts or continues a server-managed guest shopping conversation. Factual product and policy answers require approved current-request retrieval. Simple greetings are rendered immediately, store-overview answers come from active catalogue records, and requests for other options exclude previously shown products. Store the X-Chat-Session response header and send it on follow-ups; a conversation ID alone does not grant access.',
         parameters: [{
           name: 'X-Chat-Session',
           in: 'header',

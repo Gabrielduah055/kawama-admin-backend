@@ -18,6 +18,7 @@ export interface PublicProductSearchInput {
   sort?: PublicProductSort | undefined;
   page?: number | undefined;
   limit?: number | undefined;
+  excludeProductIds?: string[] | undefined;
 }
 
 export interface PublicProductSearchResult {
@@ -97,6 +98,10 @@ async function resolveCategoryId(value: string | undefined): Promise<unknown | u
 
 function buildBaseFilter(input: PublicProductSearchInput, categoryId: unknown | undefined): Record<string, unknown> {
   const filter: Record<string, any> = { status: 'active' };
+  const excludedIds = (input.excludeProductIds ?? [])
+    .filter((identifier) => Types.ObjectId.isValid(identifier))
+    .map((identifier) => new Types.ObjectId(identifier));
+  if (excludedIds.length > 0) filter._id = { $nin: excludedIds };
   if (categoryId !== undefined) filter.category = categoryId;
   if (input.featured !== undefined) filter.featured = input.featured;
   if (input.minPrice !== undefined || input.maxPrice !== undefined) {
@@ -111,6 +116,22 @@ function buildBaseFilter(input: PublicProductSearchInput, categoryId: unknown | 
     filter.$expr = { $lte: [{ $subtract: ['$stockQuantity', { $ifNull: ['$reservedQuantity', 0] }] }, 0] };
   }
   return filter;
+}
+
+export async function getActivePublicCategoryNames(limit = 8): Promise<string[]> {
+  const categoryIds = await ProductModel.distinct('category', { status: 'active' });
+  if (categoryIds.length === 0) return [];
+  const categories = await CategoryModel.find({
+    _id: { $in: categoryIds },
+    status: 'active',
+  })
+    .select('name')
+    .sort({ name: 1 })
+    .limit(limit)
+    .lean();
+  return categories
+    .map((category) => category.name)
+    .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
 }
 
 const mongoSorts: Record<Exclude<PublicProductSort, 'relevance'>, Record<string, 1 | -1>> = {
