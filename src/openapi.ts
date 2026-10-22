@@ -3,7 +3,7 @@ export const openApiDocument = {
   info: {
     title: 'Kawama API',
     version: '1.0.0',
-    description: 'Public catalog/review API and JWT-protected owner administration API.',
+    description: 'Public catalog, shopping assistant, review, and checkout API plus JWT-protected owner administration.',
   },
   servers: [{ url: '/' }],
   tags: [
@@ -11,6 +11,7 @@ export const openApiDocument = {
     { name: 'Public catalog' },
     { name: 'Public reviews' },
     { name: 'Public checkout' },
+    { name: 'Shopping assistant' },
     { name: 'Paystack webhooks' },
     { name: 'Admin dashboard' },
     { name: 'Admin orders' },
@@ -75,6 +76,33 @@ export const openApiDocument = {
     '/api/v1/products/{productId}/reviews': {
       get: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], responses: { '200': { description: 'Approved reviews.' }, '404': { $ref: '#/components/responses/NotFound' } } },
       post: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ReviewInput' } } } }, responses: { '202': { description: 'Review accepted for moderation.' }, '400': { $ref: '#/components/responses/BadRequest' }, '429': { description: 'Review rate limit exceeded.' } } },
+    },
+    '/api/ai/chat': {
+      post: {
+        tags: ['Shopping assistant'],
+        description: 'Starts or continues a server-managed guest shopping conversation. Factual product and policy answers require approved current-request retrieval; greetings and fact-free clarification questions may omit tools. Store the X-Chat-Session response header and send it on follow-ups; a conversation ID alone does not grant access.',
+        parameters: [{
+          name: 'X-Chat-Session',
+          in: 'header',
+          required: false,
+          schema: { type: 'string', pattern: '^[A-Za-z0-9_-]{43}$' },
+          description: 'Server-issued guest-session secret required when continuing an existing conversation.',
+        }],
+        requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ChatInput' } } } },
+        responses: {
+          '200': {
+            description: 'Customer-facing answer and canonical product cards. The X-Chat-Session header is returned on every success.',
+            headers: { 'X-Chat-Session': { schema: { type: 'string' } } },
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/ChatResponse' } } },
+          },
+          '404': { description: 'Conversation not found for this guest session.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+          '422': { $ref: '#/components/responses/BadRequest' },
+          '429': { description: 'Chat rate limit exceeded.' },
+          '502': { description: 'The model returned an invalid response or exceeded its bounded tool cycle.' },
+          '503': { description: 'Chat is disabled, unconfigured, rate-limited upstream, or temporarily unavailable.' },
+          '504': { description: 'The model provider timed out.' },
+        },
+      },
     },
     '/api/v1/checkout/sessions': {
       post: {
@@ -253,6 +281,54 @@ export const openApiDocument = {
       AdminLogin: { type: 'object', required: ['email', 'password'], properties: { email: { type: 'string', minLength: 3, maxLength: 254 }, password: { type: 'string', minLength: 8, maxLength: 200 } } },
       AuthResponse: { type: 'object', required: ['data'], properties: { data: { type: 'object', required: ['token', 'tokenType', 'expiresIn', 'admin'], properties: { token: { type: 'string' }, tokenType: { const: 'Bearer' }, expiresIn: { type: 'integer' }, admin: { type: 'object', required: ['id', 'email', 'role'], properties: { id: { type: 'string' }, email: { type: 'string' }, role: { const: 'owner' } } } } } } },
       Meta: { type: 'object', required: ['page', 'limit', 'total'], properties: { page: { type: 'integer' }, limit: { type: 'integer' }, total: { type: 'integer' } } },
+      ChatInput: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message'],
+        properties: {
+          conversationId: { type: 'string', format: 'uuid' },
+          message: { type: 'string', minLength: 1, maxLength: 1500 },
+          context: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              productId: { type: 'string', pattern: '^[a-fA-F0-9]{24}$' },
+              productSlug: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
+            },
+          },
+        },
+      },
+      ProductCard: {
+        type: 'object',
+        required: ['id', 'slug', 'name', 'price', 'currency', 'availability'],
+        properties: {
+          id: { type: 'string' },
+          slug: { type: 'string' },
+          name: { type: 'string' },
+          price: { type: 'number', description: 'Current public price in Ghana cedis.' },
+          currency: { const: 'GHS' },
+          availability: { enum: ['in_stock', 'low_stock', 'out_of_stock'] },
+          image: { $ref: '#/components/schemas/Image' },
+          url: { type: 'string', format: 'uri', description: 'Present only when STOREFRONT_PRODUCT_URL_TEMPLATE is configured.' },
+        },
+      },
+      ChatResponse: {
+        type: 'object',
+        required: ['message', 'data'],
+        properties: {
+          message: { type: 'string' },
+          data: {
+            type: 'object',
+            required: ['conversationId', 'assistantMessage', 'products'],
+            properties: {
+              conversationId: { type: 'string', format: 'uuid' },
+              assistantMessage: { type: 'string', maxLength: 2_000 },
+              products: { type: 'array', maxItems: 4, items: { $ref: '#/components/schemas/ProductCard' } },
+              suggestedFollowUps: { type: 'array', maxItems: 3, items: { type: 'string' } },
+            },
+          },
+        },
+      },
       Image: { type: 'object', required: ['src', 'alt'], properties: { src: { type: 'string', format: 'uri' }, alt: { type: 'string' }, publicId: { type: 'string' }, position: { type: 'integer', minimum: 0 } } },
       Category: { type: 'object', required: ['id', 'name', 'slug', 'displayOrder'], properties: { id: { type: 'string' }, name: { type: 'string' }, slug: { type: 'string' }, description: { type: 'string' }, image: { $ref: '#/components/schemas/Image' }, displayOrder: { type: 'integer' } } },
       CategoryList: { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Category' } } } },

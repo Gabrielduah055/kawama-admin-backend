@@ -20,7 +20,9 @@
     { "key": "checkoutProductId", "value": "" },
     { "key": "checkoutToken", "value": "" },
     { "key": "orderId", "value": "" },
-    { "key": "customerId", "value": "" }
+    { "key": "customerId", "value": "" },
+    { "key": "chatConversationId", "value": "" },
+    { "key": "chatSessionToken", "value": "" }
   ],
   "item": [
     {
@@ -74,6 +76,41 @@
         {
           "name": "List active products",
           "request": { "method": "GET", "url": "{{baseUrl}}/api/product?page=1&limit=24" }
+        },
+        {
+          "name": "Start shopping chat",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Shopping assistant responds', () => pm.response.to.have.status(200));",
+                  "const payload = pm.response.json();",
+                  "if (payload.data?.conversationId) pm.collectionVariables.set('chatConversationId', payload.data.conversationId);",
+                  "const session = pm.response.headers.get('X-Chat-Session');",
+                  "if (session) pm.collectionVariables.set('chatSessionToken', session);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"message\": \"I need a blender under 400 cedis\"\n}" },
+            "url": "{{baseUrl}}/api/ai/chat"
+          }
+        },
+        {
+          "name": "Continue shopping chat",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Chat-Session", "value": "{{chatSessionToken}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"conversationId\": \"{{chatConversationId}}\",\n  \"message\": \"Show me a cheaper one.\"\n}" },
+            "url": "{{baseUrl}}/api/ai/chat"
+          }
         }
       ]
     },

@@ -41,6 +41,82 @@ The simpler Slipper-style storefront routes are `GET /api/product`, `GET /api/pr
 
 Alternatively, import `postman/Kawama API.postman_collection.json`, set its `adminPassword` collection variable, and run **Admin Login** first. The collection stores the returned token automatically and includes public checks plus category/product CRUD requests. The included create requests use fixed test slugs, so archive or rename old test records before rerunning them.
 
+## AI shopping assistant
+
+`POST /api/ai/chat` starts or continues a customer shopping conversation. It searches active MongoDB catalogue records through bounded server-side tools and returns only a final customer-facing reply plus canonical product cards. Product prices are returned in GHS. Current availability is calculated from stock minus active reservations. The assistant cannot mutate products, inventory, orders, payments, or customer records.
+
+Configure the server with:
+
+```text
+AI_CHAT_ENABLED=true
+OPENROUTER_API_KEY=your-server-only-key
+OPENROUTER_MODEL=google/gemma-4-31b-it:free
+```
+
+`google/gemma-4-31b-it:free` is the default model. `OPENROUTER_MODEL` may explicitly select another OpenRouter model without a source change; the provider sends exactly that one model ID and never adds automatic fallback or upgrade models. A missing key or `AI_CHAT_ENABLED=false` affects only the chat route. `OPENROUTER_TIMEOUT_MS` and `AI_CHAT_CONVERSATION_TTL_HOURS` optionally control the provider timeout and guest-history expiry.
+
+Store policy answers come from `STORE_DELIVERY_POLICY`, `STORE_PAYMENT_POLICY`, `STORE_RETURN_POLICY`, `STORE_CONTACT_EMAIL`, `STORE_CONTACT_PHONE`, and `STORE_CONTACT_WHATSAPP_URL`. Blank or whitespace-only optional settings are treated as unset; invalid nonblank emails and URLs are rejected. Unset policy values remain unknown. `STOREFRONT_PRODUCT_URL_TEMPLATE` may contain a literal `{slug}` for canonical product-card links.
+
+Grounding is enforced through a typed internal response plan rather than regular expressions over model-written customer prose. The model selects a response intent, product-specific claims, or policy-specific claims; it cannot provide the final factual wording. Clarifications select one allowed purpose and are rendered by the backend, so a factual prefix cannot be smuggled through as a question. Product IDs, integer-pesewa prices, availability, warranty, material, and customer-budget claims are validated per product against a successful current-request catalogue lookup. Usage, care, feature, and description answers select validated zero-based references to recorded details, specifications, or server-defined description sections; the backend resolves and renders the stored content. Policy, checkout, and contact claims must exactly match the actual `getStorePolicies` result, including `null` for missing information.
+
+Customer budgets remain separate from selling prices and product measurements, including when currency is formatted with valid thousands separators. A budget supplied by the customer is stored only inside that owner-bound conversation, remains active on later turns, and can be replaced or removed by later customer input. Budget amounts are associated with currency, explicit spending-limit statements, or monetary context instead of unrelated prices, dimensions, quantities, or time limits in the same message. When the backend-rendered response asks for a budget, that constrained clarification purpose is stored on the conversation so a direct GHS amount (or an unambiguous bare number) can answer it on the next turn. Numbered product questions continue through the normal grounded-answer flow; only a reply shaped like competing budget amounts triggers another focused budget question. The purpose is cleared or replaced with the next validated state; assistant output, product prices, and other conversations never create preference state. Product claims are validated once against tool evidence and again against the final active catalogue snapshot used for rendering; a price, stock, content, or archive change produces a safe retry suggestion rather than a stale recommendation.
+
+The backend renders the public `assistantMessage`, canonical product cards, policy values, missing-information explanations, and critical price/stock wording. Stored chat messages share a 2,000-character limit with the renderer and Mongoose schema. The renderer composes complete fact sections within that limit, keeps selected product cards, and adds a notice when more recorded information is available instead of cutting a sentence or monetary value. Conversation updates run schema validators and retain at most twelve messages.
+
+Greetings and constrained fact-free clarifications may skip tools. Product, policy, and mixed response intents require their corresponding evidence; product-page context alone does not turn an unrelated policy question into a product request. If a plan is invalid or unsupported, the application permits one corrective model step within the existing four-call/six-tool limits, then returns a deterministic safe response. There is no unrestricted natural-language factual answer path, automatic verification loop, or extra provider call beyond those bounds.
+
+Previously shown positions are stored as safe ID/name/slug snapshots. If an item is later archived, it keeps its original position but is marked unavailable; active items are re-retrieved before current facts are answered.
+
+For a first Postman request, omit `X-Chat-Session`:
+
+```http
+POST http://localhost:3000/api/ai/chat
+Content-Type: application/json
+
+{
+  "message": "I need a blender under 400 cedis",
+  "context": { "productSlug": "smoothie-blender" }
+}
+```
+
+The response has this shape:
+
+```json
+{
+  "message": "Assistant response generated successfully",
+  "data": {
+    "conversationId": "00000000-0000-4000-8000-000000000000",
+    "assistantMessage": "...",
+    "products": [
+      {
+        "id": "000000000000000000000000",
+        "slug": "example-product",
+        "name": "Example product",
+        "price": 350,
+        "currency": "GHS",
+        "availability": "in_stock"
+      }
+    ],
+    "suggestedFollowUps": ["Would you like a comparison?"]
+  }
+}
+```
+
+Save the `X-Chat-Session` response header. To continue, send that header together with `data.conversationId`; the conversation ID alone cannot read another visitor's history:
+
+```http
+POST http://localhost:3000/api/ai/chat
+Content-Type: application/json
+X-Chat-Session: <43-character value returned by the server>
+
+{
+  "conversationId": "00000000-0000-4000-8000-000000000000",
+  "message": "Compare the first and second."
+}
+```
+
+Guest history retains at most twelve user/assistant messages and expires through a MongoDB TTL index. Do not log or place the session header in URLs. The OpenAPI document and included Postman collection contain the same contract.
+
 ## Uploads
 
 For product media, call `POST /api/v1/admin/uploads/signature`, upload directly to Cloudinary with the returned values, then store the returned `secure_url` and `public_id` in the product payload. Asset deletion is rejected while a category or product references it.

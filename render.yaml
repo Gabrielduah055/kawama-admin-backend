@@ -33,3 +33,9 @@ services:
         sync: false
       - key: PAYSTACK_BASE_URL
         value: https://api.paystack.co
+      - key: AI_CHAT_ENABLED
+        value: true
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: google/gemma-4-31b-it:free

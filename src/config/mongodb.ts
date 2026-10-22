@@ -4,6 +4,7 @@ import { getEnvironment, requireEnvironment } from './environment.js';
 import { CustomerModel } from '../models/CustomerSchema.js';
 import { OrderModel } from '../models/OrderSchema.js';
 import { PaymentAttemptModel } from '../models/PaymentAttemptSchema.js';
+import { ChatConversationModel } from '../models/ChatConversationSchema.js';
 import { logger } from '../utils/logger.js';
 
 export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): Promise<void> => {
@@ -22,6 +23,7 @@ export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): 
       CustomerModel.createIndexes(),
       OrderModel.createIndexes(),
       PaymentAttemptModel.createIndexes(),
+      ChatConversationModel.createIndexes(),
     ]);
   }
   logger.info('mongodb_connected');
