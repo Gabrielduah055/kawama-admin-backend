@@ -28,6 +28,7 @@ type ProductPlan = Extract<AssistantPlan, { type: 'product_answer' | 'mixed_answ
 type ProductClaim = ProductPlan['productClaims'][number];
 type PolicyPlan = Extract<AssistantPlan, { type: 'policy_answer' | 'mixed_answer' }>;
 type PolicyClaim = PolicyPlan['policyClaims'][number];
+type ClarificationPurpose = Extract<AssistantPlan, { type: 'clarification' }>['purpose'];
 
 interface PreviousProductReference {
   id: string;
@@ -45,6 +46,13 @@ interface EvidenceState {
 
 interface ShoppingPreferences {
   budgetPesewas?: number | undefined;
+}
+
+interface ShoppingPreferenceResolution {
+  preferences: ShoppingPreferences;
+  pendingClarificationPurpose: ClarificationPurpose | null;
+  forceClarificationPurpose?: 'budget' | undefined;
+  budgetWasProvided: boolean;
 }
 
 interface RenderedAssistantResponse {
@@ -181,10 +189,9 @@ function hasOwn(value: object, key: string): boolean {
 
 function extractCustomerAmountsPesewas(message: string): Set<number> {
   const amounts = new Set<number>();
-  const numberPattern = '(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]{1,2})?';
   const expressions = [
-    new RegExp(`(?:GHS|GH₵|GH¢)\\s*(${numberPattern})(?![0-9,]|\\.[0-9])`, 'gi'),
-    new RegExp(`(?<![0-9,.])(${numberPattern})(?![0-9,]|\\.[0-9])\\s*(?:cedis?|GHS)\\b`, 'gi'),
+    new RegExp(`(?:GHS|GH₵|GH¢)\\s*(${GHS_NUMBER_PATTERN})(?![0-9,]|\\.[0-9])`, 'gi'),
+    new RegExp(`(?<![0-9,.])(${GHS_NUMBER_PATTERN})(?![0-9,]|\\.[0-9])\\s*(?:cedis?|GHS)\\b`, 'gi'),
   ];
   for (const expression of expressions) {
     for (const match of message.matchAll(expression)) {
@@ -199,17 +206,99 @@ function extractCustomerAmountsPesewas(message: string): Set<number> {
   return amounts;
 }
 
+const GHS_NUMBER_PATTERN = '(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]{1,2})?';
+const BUDGET_AMOUNT_PATTERN = `(?:(?:GHS|GH₵|GH¢)\\s*)?${GHS_NUMBER_PATTERN}(?![0-9,]|\\.[0-9])(?:\\s*(?:cedis?|GHS))?`;
+
+function parseGhsAmountText(value: string): number | undefined {
+  const normalized = value
+    .replace(/(?:GHS|GH₵|GH¢)/gi, '')
+    .replace(/cedis?/gi, '')
+    .replaceAll(',', '')
+    .trim();
+  if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return undefined;
+  try {
+    return toPesewas(Number(normalized));
+  } catch {
+    return undefined;
+  }
+}
+
+function declaredBudgetPesewas(message: string): number | undefined {
+  const expressions = [
+    new RegExp(`\\b(?:my\\s+|the\\s+)?budget\\s*(?:is|of|=|:)?\\s*(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:set|change|update|make|raise|lower|reduce|increase)\\s+(?:my\\s+|the\\s+)?budget\\s+(?:to|at)\\s+(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:i\\s+can|i\\s+could|i(?:'d|\\s+would)\\s+like\\s+to|i\\s+want\\s+to)\\s+spend\\s+(?:up\\s+to\\s+|at\\s+most\\s+)?(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:under|below|up\\s+to|no\\s+more\\s+than|at\\s+most|maximum|max)\\s+(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`(${BUDGET_AMOUNT_PATTERN})\\s+budget\\b`, 'gi'),
+  ];
+  const declarations: Array<{ index: number; budgetPesewas: number }> = [];
+  for (const expression of expressions) {
+    for (const match of message.matchAll(expression)) {
+      const budgetPesewas = parseGhsAmountText(match[1]!);
+      if (budgetPesewas !== undefined) declarations.push({ index: match.index, budgetPesewas });
+    }
+  }
+  declarations.sort((left, right) => left.index - right.index);
+  return declarations.at(-1)?.budgetPesewas;
+}
+
+function directBudgetReply(message: string): { budgetPesewas?: number; ambiguous: boolean } {
+  const direct = new RegExp(
+    `^\\s*(?:about|around|roughly|approximately)?\\s*(${BUDGET_AMOUNT_PATTERN})\\s*(?:only)?\\s*[.!]?\\s*$`,
+    'i',
+  ).exec(message);
+  if (direct) {
+    const budgetPesewas = parseGhsAmountText(direct[1]!);
+    return budgetPesewas === undefined ? { ambiguous: true } : { budgetPesewas, ambiguous: false };
+  }
+  const looksLikeBudgetReply = /\d|\b(?:cedis?|GHS|GH₵|GH¢|budget|maybe|unsure)\b/i.test(message);
+  return { ambiguous: looksLikeBudgetReply };
+}
+
 function resolveShoppingPreferences(
   stored: ShoppingPreferences | undefined,
+  pendingClarificationPurpose: ClarificationPurpose | null,
   message: string,
-): ShoppingPreferences {
+): ShoppingPreferenceResolution {
+  const retained = stored?.budgetPesewas === undefined ? {} : { budgetPesewas: stored.budgetPesewas };
   const removesBudget = /(?:\b(?:remove|clear|drop|forget|ignore)\b.{0,30}\bbudget\b|\b(?:no|without)\s+(?:a\s+)?budget\b|\bany\s+price\b|\bprice\s+(?:does\s+not|doesn't)\s+matter\b)/i.test(message);
-  if (removesBudget) return {};
+  if (removesBudget) {
+    return { preferences: {}, pendingClarificationPurpose: null, budgetWasProvided: true };
+  }
 
-  const amounts = [...extractCustomerAmountsPesewas(message)];
-  const declaresBudget = /\b(?:budget|under|below|up\s+to|no\s+more\s+than|maximum|max|spend|afford)\b/i.test(message);
-  if (declaresBudget && amounts.length > 0) return { budgetPesewas: amounts.at(-1)! };
-  return stored?.budgetPesewas === undefined ? {} : { budgetPesewas: stored.budgetPesewas };
+  const declared = declaredBudgetPesewas(message);
+  if (declared !== undefined) {
+    return {
+      preferences: { budgetPesewas: declared },
+      pendingClarificationPurpose: null,
+      budgetWasProvided: true,
+    };
+  }
+
+  if (pendingClarificationPurpose === 'budget') {
+    const reply = directBudgetReply(message);
+    if (reply.budgetPesewas !== undefined) {
+      return {
+        preferences: { budgetPesewas: reply.budgetPesewas },
+        pendingClarificationPurpose: null,
+        budgetWasProvided: true,
+      };
+    }
+    if (reply.ambiguous) {
+      return {
+        preferences: retained,
+        pendingClarificationPurpose: 'budget',
+        forceClarificationPurpose: 'budget',
+        budgetWasProvided: false,
+      };
+    }
+  }
+
+  return {
+    preferences: retained,
+    pendingClarificationPurpose: null,
+    budgetWasProvided: false,
+  };
 }
 
 function productDescriptionSections(product: Record<string, unknown>): string[] {
@@ -660,7 +749,15 @@ export async function runShoppingChat(
   const storedPreferences: ShoppingPreferences = typeof conversation?.shoppingPreferences?.budgetPesewas === 'number'
     ? { budgetPesewas: conversation.shoppingPreferences.budgetPesewas }
     : {};
-  const shoppingPreferences = resolveShoppingPreferences(storedPreferences, input.message);
+  const storedPendingClarification = typeof conversation?.pendingClarificationPurpose === 'string'
+    ? conversation.pendingClarificationPurpose as ClarificationPurpose
+    : null;
+  const preferenceResolution = resolveShoppingPreferences(
+    storedPreferences,
+    storedPendingClarification,
+    input.message,
+  );
+  const shoppingPreferences = preferenceResolution.preferences;
   const history: ProviderMessage[] = (conversation?.messages ?? []).slice(-MAX_CONTEXT_MESSAGES).map(
     (message: { role: 'user' | 'assistant'; content: string }) => ({ role: message.role, content: message.content }),
   );
@@ -677,11 +774,13 @@ export async function runShoppingChat(
   };
   let toolExecutions = 0;
   let groundingCorrections = 0;
-  let finalPlan: AssistantPlan | undefined;
+  let finalPlan: AssistantPlan | undefined = preferenceResolution.forceClarificationPurpose
+    ? { type: 'clarification', purpose: preferenceResolution.forceClarificationPurpose }
+    : undefined;
   let rejectedPlan: AssistantPlan | undefined;
   let fallbackResponse: RenderedAssistantResponse | undefined;
 
-  for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
+  for (let modelCall = 0; !finalPlan && modelCall < MAX_MODEL_CALLS; modelCall += 1) {
     const assistant = await provider.complete({ messages, tools: shoppingToolDefinitions, maxTokens: MAX_OUTPUT_TOKENS });
     const toolCalls = assistant.tool_calls ?? [];
     if (toolCalls.length === 0) {
@@ -701,7 +800,11 @@ export async function runShoppingChat(
         fallbackResponse = safeGroundingFallback(undefined, input, previousProducts);
         break;
       }
-      if (responseHasRequiredEvidence(input, candidate, evidence, previousProducts, shoppingPreferences)) {
+      const repeatsResolvedBudgetQuestion = candidate.type === 'clarification'
+        && candidate.purpose === 'budget'
+        && preferenceResolution.budgetWasProvided;
+      if (!repeatsResolvedBudgetQuestion
+        && responseHasRequiredEvidence(input, candidate, evidence, previousProducts, shoppingPreferences)) {
         finalPlan = candidate;
         break;
       }
@@ -775,6 +878,9 @@ export async function runShoppingChat(
   }
   const finalResponse = fallbackResponse
     ?? renderAssistantPlan(finalPlan!, canonicalProducts, evidence.policies, input, previousProducts);
+  const pendingClarificationPurpose = finalPlan?.type === 'clarification' && !fallbackResponse
+    ? finalPlan.purpose
+    : preferenceResolution.pendingClarificationPurpose;
   if (!isValidStoredChatMessage(finalResponse.assistantMessage)) {
     throw new AppError(500, 'CHAT_RESPONSE_LENGTH_INVALID', 'The shopping assistant could not produce a storable response.');
   }
@@ -802,6 +908,7 @@ export async function runShoppingChat(
         lastShownProducts: retainedProducts,
         lastShownProductIds: retainedIds,
         shoppingPreferences,
+        pendingClarificationPurpose,
         expiresAt: conversationExpiry(),
       } },
       { runValidators: true },
@@ -814,6 +921,7 @@ export async function runShoppingChat(
       lastShownProducts: retainedProducts,
       lastShownProductIds: retainedIds,
       shoppingPreferences,
+      pendingClarificationPurpose,
       expiresAt: conversationExpiry(),
     });
     conversationId = String(created._id);

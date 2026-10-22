@@ -29,6 +29,15 @@ const shoppingPreferencesSchema = new Schema(
   { _id: false },
 );
 
+const clarificationPurposes = [
+  'budget',
+  'intended_use',
+  'product',
+  'category',
+  'preferences',
+  'delivery_location',
+] as const;
+
 const chatConversationSchema = new Schema(
   {
     _id: { type: String, default: randomUUID },
@@ -39,6 +48,7 @@ const chatConversationSchema = new Schema(
     // also retain this field while readers prefer the positional snapshots.
     lastShownProductIds: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
     shoppingPreferences: { type: shoppingPreferencesSchema, default: () => ({}) },
+    pendingClarificationPurpose: { type: String, enum: clarificationPurposes, default: null },
     expiresAt: { type: Date, required: true },
   },
   { timestamps: true, versionKey: false },

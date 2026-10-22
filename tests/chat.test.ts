@@ -665,6 +665,8 @@ describe('shopping chat API', () => {
     expect(malformedResponse.status).toBe(200);
     expect(malformedResponse.body.data.assistantMessage).not.toContain('GHS 125.00');
     expect(malformedResponse.body.data.products).toEqual([]);
+    const malformedStored = await ChatConversationModel.findById(malformedResponse.body.data.conversationId).lean();
+    expect(malformedStored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
   });
 
   it('bounds rendered specification answers before new and follow-up persistence', async () => {
@@ -841,6 +843,107 @@ describe('shopping chat API', () => {
     expect(isolated.status).toBe(200);
     expect(isolated.body.data.assistantMessage).toContain('could not verify current catalogue information');
     expect(isolated.body.data.products).toEqual([]);
+  });
+
+  it('associates a budget with its declaration instead of nearby product prices', async () => {
+    const product = await seedProduct({
+      slug: 'above-customer-budget',
+      name: 'Above Budget Blender',
+      pricePesewas: 45_000,
+    });
+    const provider = new ScriptedProvider((input) => {
+      const message = [...input.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+      if (message.includes('My budget is')) return finalPlan({ type: 'greeting' });
+      if (!input.messages.some((item) => item.role === 'tool')) {
+        return toolCall('above-budget', 'getProductDetails', { identifiers: [String(product._id)] });
+      }
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: [{
+          productId: String(product._id),
+          pricePesewas: 45_000,
+          customerBudgetPesewas: 45_000,
+        }],
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+
+    const initial = await request(app)
+      .post('/api/ai/chat')
+      .send({ message: 'My budget is GHS 400. The blender costs GHS 450.' });
+    expect(initial.status).toBe(200);
+    let stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
+
+    const followUp = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({
+        conversationId: initial.body.data.conversationId,
+        message: 'Does this GHS 450 blender fit my budget?',
+      });
+    expect(followUp.status).toBe(200);
+    expect(followUp.body.data.assistantMessage).toContain('could not verify current catalogue information');
+    expect(followUp.body.data.assistantMessage).not.toContain('fits your GHS 450.00 budget');
+    expect(followUp.body.data.products).toEqual([]);
+    stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
+  });
+
+  it('accepts direct GHS budget replies only for the owner conversation awaiting that clarification', async () => {
+    for (const reply of ['400 cedis', 'GHS 400', '400']) {
+      const provider = new ScriptedProvider((input) => {
+        const message = [...input.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+        return message === 'Please help me choose.'
+          ? finalPlan({ type: 'clarification', purpose: 'budget' })
+          : finalPlan({ type: 'greeting' });
+      });
+      const app = createApp({ chatProvider: provider });
+      const initial = await request(app).post('/api/ai/chat').send({ message: 'Please help me choose.' });
+      expect(initial.status).toBe(200);
+      let stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+      expect(stored?.pendingClarificationPurpose).toBe('budget');
+
+      const answered = await request(app)
+        .post('/api/ai/chat')
+        .set('x-chat-session', String(initial.headers['x-chat-session']))
+        .send({ conversationId: initial.body.data.conversationId, message: reply });
+      expect(answered.status).toBe(200);
+      stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+      expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
+      expect(stored?.pendingClarificationPurpose).toBeNull();
+      expect(provider.calls.at(-1)?.messages[0]?.content).toContain('active customer budget is 40000 pesewas');
+    }
+
+    const ambiguousProvider = new ScriptedProvider(() => finalPlan({ type: 'clarification', purpose: 'budget' }));
+    const ambiguousApp = createApp({ chatProvider: ambiguousProvider });
+    const prompted = await request(ambiguousApp).post('/api/ai/chat').send({ message: 'Ask me for my budget.' });
+    const ambiguous = await request(ambiguousApp)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(prompted.headers['x-chat-session']))
+      .send({ conversationId: prompted.body.data.conversationId, message: '400 or 500' });
+    expect(ambiguous.status).toBe(200);
+    expect(ambiguous.body.data.assistantMessage).toBe('What budget would you like to stay within?');
+    expect(ambiguousProvider.calls).toHaveLength(1);
+    const ambiguousStored = await ChatConversationModel.findById(prompted.body.data.conversationId).lean();
+    expect(ambiguousStored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
+    expect(ambiguousStored?.pendingClarificationPurpose).toBe('budget');
+
+    const isolationProvider = new ScriptedProvider((input) => {
+      const message = [...input.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+      return message === 'Please ask for a limit.'
+        ? finalPlan({ type: 'clarification', purpose: 'budget' })
+        : finalPlan({ type: 'greeting' });
+    });
+    const isolationApp = createApp({ chatProvider: isolationProvider });
+    const owner = await request(isolationApp).post('/api/ai/chat').send({ message: 'Please ask for a limit.' });
+    const otherVisitor = await request(isolationApp).post('/api/ai/chat').send({ message: '400' });
+    expect(otherVisitor.status).toBe(200);
+    const ownerStored = await ChatConversationModel.findById(owner.body.data.conversationId).lean();
+    const otherStored = await ChatConversationModel.findById(otherVisitor.body.data.conversationId).lean();
+    expect(ownerStored?.pendingClarificationPurpose).toBe('budget');
+    expect(otherStored?.pendingClarificationPurpose).toBeNull();
+    expect(otherStored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
   });
 
   it('revalidates price, archive status, and availability against the final canonical snapshot', async () => {
