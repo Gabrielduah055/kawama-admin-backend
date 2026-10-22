@@ -208,6 +208,7 @@ function extractCustomerAmountsPesewas(message: string): Set<number> {
 
 const GHS_NUMBER_PATTERN = '(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]{1,2})?';
 const BUDGET_AMOUNT_PATTERN = `(?:(?:GHS|GH₵|GH¢)\\s*)?${GHS_NUMBER_PATTERN}(?![0-9,]|\\.[0-9])(?:\\s*(?:cedis?|GHS))?`;
+const MONETARY_AMOUNT_PATTERN = `(?:(?:GHS|GH₵|GH¢)\\s*${GHS_NUMBER_PATTERN}(?![0-9,]|\\.[0-9])|${GHS_NUMBER_PATTERN}(?![0-9,]|\\.[0-9])\\s*(?:cedis?|GHS)\\b)`;
 
 function parseGhsAmountText(value: string): number | undefined {
   const normalized = value
@@ -225,10 +226,13 @@ function parseGhsAmountText(value: string): number | undefined {
 
 function declaredBudgetPesewas(message: string): number | undefined {
   const expressions = [
-    new RegExp(`\\b(?:my\\s+|the\\s+)?budget\\s*(?:is|of|=|:)?\\s*(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:my\\s+|the\\s+)?(?:budget|spending\\s+(?:limit|cap))\\s*(?:is|of|=|:|at)?\\s*(?:only\\s+)?(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
     new RegExp(`\\b(?:set|change|update|make|raise|lower|reduce|increase)\\s+(?:my\\s+|the\\s+)?budget\\s+(?:to|at)\\s+(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
-    new RegExp(`\\b(?:i\\s+can|i\\s+could|i(?:'d|\\s+would)\\s+like\\s+to|i\\s+want\\s+to)\\s+spend\\s+(?:up\\s+to\\s+|at\\s+most\\s+)?(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
-    new RegExp(`\\b(?:under|below|up\\s+to|no\\s+more\\s+than|at\\s+most|maximum|max)\\s+(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:i\\s+can|i\\s+could|i(?:'d|\\s+would)\\s+like\\s+to|i\\s+want\\s+to)\\s+(?:spend|pay)\\s+(?:up\\s+to\\s+|at\\s+most\\s+|no\\s+more\\s+than\\s+)?(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\bi\\s+can\\s+afford\\s+(?:up\\s+to\\s+|at\\s+most\\s+)?(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:under|below|up\\s+to|no\\s+more\\s+than|at\\s+most|maximum|max)\\s+(${MONETARY_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:under|below|up\\s+to|no\\s+more\\s+than|at\\s+most|maximum|max)\\s+(?:purchase\\s+)?(?:price|cost|budget|spending\\s+(?:limit|cap))\\s*(?:is|of|at|:)?\\s*(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
+    new RegExp(`\\b(?:price|cost|budget|spending\\s+(?:limit|cap))\\s*(?:is|must\\s+be|should\\s+be)?\\s*(?:under|below|up\\s+to|no\\s+more\\s+than|at\\s+most|maximum|max)\\s+(${BUDGET_AMOUNT_PATTERN})`, 'gi'),
     new RegExp(`(${BUDGET_AMOUNT_PATTERN})\\s+budget\\b`, 'gi'),
   ];
   const declarations: Array<{ index: number; budgetPesewas: number }> = [];
@@ -251,8 +255,15 @@ function directBudgetReply(message: string): { budgetPesewas?: number; ambiguous
     const budgetPesewas = parseGhsAmountText(direct[1]!);
     return budgetPesewas === undefined ? { ambiguous: true } : { budgetPesewas, ambiguous: false };
   }
-  const looksLikeBudgetReply = /\d|\b(?:cedis?|GHS|GH₵|GH¢|budget|maybe|unsure)\b/i.test(message);
-  return { ambiguous: looksLikeBudgetReply };
+  const alternativeAmounts = new RegExp(
+    `^\\s*(?:(?:maybe|perhaps|either|not\\s+sure(?:,?\\s+maybe)?)\\s+)?${BUDGET_AMOUNT_PATTERN}\\s*(?:or|/|to|-)\\s*${BUDGET_AMOUNT_PATTERN}\\s*[.?!]?\\s*$`,
+    'i',
+  );
+  const uncertainAmount = new RegExp(
+    `^\\s*(?:maybe|perhaps|not\\s+sure(?:,?\\s+maybe)?)\\s+${BUDGET_AMOUNT_PATTERN}\\s*[.?!]?\\s*$`,
+    'i',
+  );
+  return { ambiguous: alternativeAmounts.test(message) || uncertainAmount.test(message) };
 }
 
 function resolveShoppingPreferences(

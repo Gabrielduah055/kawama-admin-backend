@@ -890,6 +890,50 @@ describe('shopping chat API', () => {
     expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
   });
 
+  it('keeps measurements, quantities, and time limits separate from monetary budgets', async () => {
+    const provider = new ScriptedProvider(() => finalPlan({ type: 'greeting' }));
+    const app = createApp({ chatProvider: provider });
+
+    const mixed = await request(app)
+      .post('/api/ai/chat')
+      .send({ message: 'My budget is GHS 400 and I need a blender under 2 litres.' });
+    expect(mixed.status).toBe(200);
+    let stored = await ChatConversationModel.findById(mixed.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
+
+    const measurementUpdate = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(mixed.headers['x-chat-session']))
+      .send({ conversationId: mixed.body.data.conversationId, message: 'Maximum 500 watts.' });
+    expect(measurementUpdate.status).toBe(200);
+    stored = await ChatConversationModel.findById(mixed.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
+
+    for (const message of [
+      'I need a blender under 2 litres.',
+      'Maximum 500 watts.',
+      'The shelf must be below 60 centimetres.',
+      'I need no more than 3 jars.',
+      'Maximum 90 minutes.',
+    ]) {
+      const response = await request(app).post('/api/ai/chat').send({ message });
+      expect(response.status).toBe(200);
+      const measurementStored = await ChatConversationModel.findById(response.body.data.conversationId).lean();
+      expect(measurementStored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
+    }
+
+    for (const [message, expectedBudget] of [
+      ['I need a blender under GHS 350.', 35_000],
+      ['I can spend 300.', 30_000],
+      ['Maximum price 500.', 50_000],
+    ] as const) {
+      const response = await request(app).post('/api/ai/chat').send({ message });
+      expect(response.status).toBe(200);
+      const monetaryStored = await ChatConversationModel.findById(response.body.data.conversationId).lean();
+      expect(monetaryStored?.shoppingPreferences?.budgetPesewas).toBe(expectedBudget);
+    }
+  });
+
   it('accepts direct GHS budget replies only for the owner conversation awaiting that clarification', async () => {
     for (const reply of ['400 cedis', 'GHS 400', '400']) {
       const provider = new ScriptedProvider((input) => {
@@ -944,6 +988,75 @@ describe('shopping chat API', () => {
     expect(ownerStored?.pendingClarificationPurpose).toBe('budget');
     expect(otherStored?.pendingClarificationPurpose).toBeNull();
     expect(otherStored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
+  });
+
+  it('lets numbered product questions use grounded tools while a budget clarification is pending', async () => {
+    const product = await seedProduct({
+      slug: 'numbered-specifications',
+      name: 'Numbered Specifications Blender',
+      specifications: [
+        { label: 'Speed settings', value: '2' },
+        { label: 'Jug capacity', value: '2 litres' },
+      ],
+    });
+    const cases = [
+      {
+        setup: ['My budget is GHS 400.', 'Please ask for my budget again.'],
+        question: 'Does it have 2 speed settings?',
+        specificationIndex: 0,
+        expectedText: 'Speed settings: 2.',
+        expectedBudget: 40_000,
+      },
+      {
+        setup: ['Please ask for my budget.'],
+        question: 'Does it have a 2-litre jug?',
+        specificationIndex: 1,
+        expectedText: 'Jug capacity: 2 litres.',
+        expectedBudget: undefined,
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const provider = new ScriptedProvider((input) => {
+        const message = [...input.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+        if (message === 'My budget is GHS 400.') return finalPlan({ type: 'greeting' });
+        if (message.startsWith('Please ask')) return finalPlan({ type: 'clarification', purpose: 'budget' });
+        if (!input.messages.some((item) => item.role === 'tool')) {
+          return toolCall(`numbered-${testCase.specificationIndex}`, 'getProductDetails', {
+            identifiers: [String(product._id)],
+          });
+        }
+        return finalPlan({
+          type: 'product_answer',
+          productClaims: [{ productId: String(product._id), specificationIndexes: [testCase.specificationIndex] }],
+        });
+      });
+      const app = createApp({ chatProvider: provider });
+      let conversationId: string | undefined;
+      let sessionToken: string | undefined;
+      for (const setupMessage of testCase.setup) {
+        let setupRequest = request(app).post('/api/ai/chat');
+        if (sessionToken) setupRequest = setupRequest.set('x-chat-session', sessionToken);
+        const setupResponse = await setupRequest.send({
+          ...(conversationId ? { conversationId } : {}),
+          message: setupMessage,
+        });
+        expect(setupResponse.status).toBe(200);
+        conversationId = String(setupResponse.body.data.conversationId);
+        sessionToken = String(setupResponse.headers['x-chat-session'] ?? sessionToken);
+      }
+      const beforeQuestionCalls = provider.calls.length;
+      const answered = await request(app)
+        .post('/api/ai/chat')
+        .set('x-chat-session', sessionToken!)
+        .send({ conversationId, message: testCase.question });
+      expect(answered.status).toBe(200);
+      expect(answered.body.data.assistantMessage).toContain(testCase.expectedText);
+      expect(provider.calls.length).toBe(beforeQuestionCalls + 2);
+      const stored = await ChatConversationModel.findById(conversationId).lean();
+      expect(stored?.shoppingPreferences?.budgetPesewas).toBe(testCase.expectedBudget);
+      expect(stored?.pendingClarificationPurpose).toBeNull();
+    }
   });
 
   it('revalidates price, archive status, and availability against the final canonical snapshot', async () => {
