@@ -67,6 +67,11 @@ export interface ShoppingToolResult {
   policies?: StorePolicies | undefined;
   evidenceKind?: 'product' | 'policy' | undefined;
   evidenceSource?: 'search' | 'details' | 'policy' | undefined;
+  totalMatches?: number | undefined;
+}
+
+export interface ShoppingToolOptions {
+  excludeProductIds?: string[] | undefined;
 }
 
 function invalidToolArguments(error: unknown): ShoppingToolResult {
@@ -95,7 +100,11 @@ function withEvidencePrices(products: Array<Record<string, unknown>>): Array<Rec
   }));
 }
 
-export async function executeShoppingTool(name: string, rawArguments: string): Promise<ShoppingToolResult> {
+export async function executeShoppingTool(
+  name: string,
+  rawArguments: string,
+  options: ShoppingToolOptions = {},
+): Promise<ShoppingToolResult> {
   let raw: unknown;
   try {
     raw = parseArguments(rawArguments);
@@ -122,6 +131,7 @@ export async function executeShoppingTool(name: string, rawArguments: string): P
         sort: sortMap[input.sort],
         page: 1,
         limit: input.limit,
+        ...(options.excludeProductIds?.length ? { excludeProductIds: options.excludeProductIds } : {}),
       });
       const products = withEvidencePrices(result.products);
       return {
@@ -129,6 +139,7 @@ export async function executeShoppingTool(name: string, rawArguments: string): P
         products,
         evidenceKind: 'product',
         evidenceSource: 'search',
+        totalMatches: result.total,
       };
     }
     if (name === 'getProductDetails') {
