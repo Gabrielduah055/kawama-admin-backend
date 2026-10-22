@@ -12,11 +12,23 @@ const chatMessageSchema = new Schema(
   { _id: false },
 );
 
+const shownProductReferenceSchema = new Schema(
+  {
+    productId: { type: Schema.Types.ObjectId, ref: 'Product', required: true },
+    name: { type: String, trim: true, required: true, maxlength: 120 },
+    slug: { type: String, trim: true, lowercase: true, required: true, maxlength: 100 },
+  },
+  { _id: false },
+);
+
 const chatConversationSchema = new Schema(
   {
     _id: { type: String, default: randomUUID },
     ownerHash: { type: String, required: true, minlength: 64, maxlength: 64, index: true },
     messages: { type: [chatMessageSchema], default: [] },
+    lastShownProducts: { type: [shownProductReferenceSchema], default: [] },
+    // Kept for conversations created by the first chatbot release. New writes
+    // also retain this field while readers prefer the positional snapshots.
     lastShownProductIds: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
     expiresAt: { type: Date, required: true },
   },

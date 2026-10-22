@@ -1,8 +1,8 @@
 import { z } from 'zod';
-import { getEnvironment } from '../config/environment.js';
+import { DEFAULT_OPENROUTER_MODEL, getEnvironment } from '../config/environment.js';
 import { AppError } from '../errors/AppError.js';
 
-export const REQUIRED_OPENROUTER_MODEL = 'google/gemma-4-31b-it:free';
+export { DEFAULT_OPENROUTER_MODEL };
 const OPENROUTER_CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 export interface ProviderToolCall {
@@ -71,12 +71,8 @@ export function createOpenRouterProvider(fetchImpl: typeof fetch = fetch): ChatP
       if (!environment.OPENROUTER_API_KEY) {
         throw unavailable('AI_CHAT_NOT_CONFIGURED', 'The shopping assistant is temporarily unavailable.');
       }
-      if (environment.OPENROUTER_MODEL !== REQUIRED_OPENROUTER_MODEL) {
-        throw unavailable('AI_CHAT_INVALID_CONFIGURATION', 'The shopping assistant is temporarily unavailable.');
-      }
-
       const body = JSON.stringify({
-        model: REQUIRED_OPENROUTER_MODEL,
+        model: environment.OPENROUTER_MODEL,
         messages: input.messages,
         tools: input.tools,
         tool_choice: 'auto',

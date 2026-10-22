@@ -62,6 +62,9 @@ export const shoppingToolDefinitions: ProviderToolDefinition[] = [
 export interface ShoppingToolResult {
   output: Record<string, unknown>;
   products: Array<Record<string, unknown>>;
+  evidenceKind?: 'product' | 'policy' | undefined;
+  evidenceSource?: 'search' | 'details' | 'policy' | undefined;
+  missingProductIdentifiers?: string[] | undefined;
 }
 
 function invalidToolArguments(error: unknown): ShoppingToolResult {
@@ -110,20 +113,31 @@ export async function executeShoppingTool(name: string, rawArguments: string): P
       return {
         output: { products: result.products, totalMatches: result.total },
         products: result.products,
+        evidenceKind: 'product',
+        evidenceSource: 'search',
       };
     }
     if (name === 'getProductDetails') {
       const input = getProductDetailsToolSchema.parse(raw);
       const products = await getPublicProductsByIdentifiers(input.identifiers);
+      const missingIdentifiers = input.identifiers.filter((identifier) =>
+        !products.some((product) => product.id === identifier || product.slug === identifier));
       return {
-        output: { products, missingIdentifiers: input.identifiers.filter((identifier) =>
-          !products.some((product) => product.id === identifier || product.slug === identifier)) },
+        output: { products, missingIdentifiers },
         products,
+        evidenceKind: 'product',
+        evidenceSource: 'details',
+        missingProductIdentifiers: missingIdentifiers,
       };
     }
     if (name === 'getStorePolicies') {
       getStorePoliciesToolSchema.parse(raw);
-      return { output: { policies: getApprovedStorePolicies() }, products: [] };
+      return {
+        output: { policies: getApprovedStorePolicies() },
+        products: [],
+        evidenceKind: 'policy',
+        evidenceSource: 'policy',
+      };
     }
     return {
       output: { error: { code: 'UNKNOWN_TOOL', message: 'That tool is not available.' } },

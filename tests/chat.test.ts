@@ -5,12 +5,13 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
-import { resetEnvironmentForTests } from '../src/config/environment.js';
+import { DEFAULT_OPENROUTER_MODEL, resetEnvironmentForTests } from '../src/config/environment.js';
 import { CategoryModel } from '../src/models/CategorySchema.js';
 import { ChatConversationModel } from '../src/models/ChatConversationSchema.js';
 import { ProductModel } from '../src/models/ProductSchema.js';
 import { executeShoppingTool } from '../src/services/chat-tools.service.js';
 import { createOpenRouterProvider, type ChatCompletionRequest, type ChatProvider, type ProviderMessage } from '../src/services/openrouter.service.js';
+import { searchProductsToolSchema } from '../src/validation/chat.schemas.js';
 
 let mongo: MongoMemoryServer | undefined;
 let mongoDataDirectory: string | undefined;
@@ -170,6 +171,53 @@ describe('shopping chat API', () => {
     expect(followUpSystem).toContain(`2. Second Blender (id: ${second._id}`);
   });
 
+  it('keeps original positions when an earlier displayed product is archived', async () => {
+    const first = await seedProduct({ slug: 'position-a', name: 'Position A Blender', pricePesewas: 30_000 });
+    const second = await seedProduct({ slug: 'position-b', name: 'Position B Blender', pricePesewas: 38_000 });
+    const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      const system = input.messages[0]!.content ?? '';
+      if (userMessage.includes('Show me') && !lastTool) {
+        return toolCall('position-search', 'searchProducts', { query: 'blender', sort: 'price_asc', limit: 2 });
+      }
+      if (userMessage.includes('Show me') && lastTool) {
+        const products = productsFromLastTool(input);
+        return finalMessage('Here are two options.', products.map((product) => String(product.id)));
+      }
+      if (userMessage.includes('second') && !lastTool) {
+        const secondId = /2\..*?id: ([a-f\d]{24})/i.exec(system)?.[1];
+        return toolCall('position-second', 'getProductDetails', { identifiers: [secondId] });
+      }
+      if (userMessage.includes('second') && lastTool) {
+        return finalMessage('The second product is still available.', [String(second._id)]);
+      }
+      return finalMessage('Position A Blender is no longer available in the public catalogue.');
+    });
+    const app = createApp({ chatProvider: provider });
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me two blenders.' });
+    expect(initial.body.data.products.map((product: { id: string }) => product.id)).toEqual([String(first._id), String(second._id)]);
+    await ProductModel.findByIdAndUpdate(first._id, { status: 'archived' });
+
+    const secondResponse = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Tell me about the second one.' });
+    expect(secondResponse.status).toBe(200);
+    expect(secondResponse.body.data.products[0].id).toBe(String(second._id));
+
+    const firstResponse = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'What about the first one?' });
+    expect(firstResponse.status).toBe(200);
+    expect(firstResponse.body.data.assistantMessage).toContain('no longer available');
+    expect(firstResponse.body.data.products).toEqual([]);
+    const finalSystem = provider.calls.at(-1)!.messages[0]!.content ?? '';
+    expect(finalSystem).toContain(`1. Position A Blender (id: ${first._id}, slug: position-a, currentStatus: unavailable)`);
+    expect(finalSystem).toContain(`2. Position B Blender (id: ${second._id}, slug: position-b, currentStatus: active)`);
+  });
+
   it('distinguishes missing specifications and current unavailability', async () => {
     const unavailable = await seedProduct({ stockQuantity: 0, details: [], specifications: [] });
     const provider = new ScriptedProvider((input, call) => call === 1
@@ -184,12 +232,152 @@ describe('shopping chat API', () => {
     expect(response.body.data.products[0].availability).toBe('out_of_stock');
   });
 
+  it('does not forward invented product facts when the model skips retrieval', async () => {
+    const invented = new ScriptedProvider(() => finalMessage(
+      'The SuperBlend Max costs GHS 299, is in stock, and has a five-year warranty.',
+      [],
+    ));
+    const response = await request(createApp({ chatProvider: invented }))
+      .post('/api/ai/chat')
+      .send({ message: 'Recommend a blender and tell me its price and warranty.' });
+
+    expect(response.status).toBe(200);
+    expect(invented.calls).toHaveLength(2);
+    expect(response.body.data.assistantMessage).toContain('could not verify current catalogue information');
+    expect(response.body.data.assistantMessage).not.toContain('SuperBlend');
+    expect(response.body.data.products).toEqual([]);
+  });
+
+  it('does not allow policy answers to bypass the approved policy tool', async () => {
+    const invented = new ScriptedProvider(() => finalMessage('All returns are accepted for 90 days.'));
+    const response = await request(createApp({ chatProvider: invented }))
+      .post('/api/ai/chat')
+      .send({ message: 'What is your return policy?' });
+
+    expect(response.status).toBe(200);
+    expect(invented.calls).toHaveLength(2);
+    expect(response.body.data.assistantMessage).toContain('could not verify the approved store information');
+    expect(response.body.data.assistantMessage).not.toContain('90 days');
+  });
+
+  it('allows greetings and necessary fact-free clarification without retrieval', async () => {
+    const greeting = new ScriptedProvider(() => finalMessage('Hello! What are you shopping for today?'));
+    const greeted = await request(createApp({ chatProvider: greeting }))
+      .post('/api/ai/chat')
+      .send({ message: 'Hello' });
+    expect(greeted.status).toBe(200);
+    expect(greeting.calls).toHaveLength(1);
+
+    const clarification = new ScriptedProvider(() => finalMessage('What budget would you like to stay within?'));
+    const clarified = await request(createApp({ chatProvider: clarification }))
+      .post('/api/ai/chat')
+      .send({ message: 'I need something for my kitchen.' });
+    expect(clarified.status).toBe(200);
+    expect(clarified.body.data.assistantMessage).toContain('What budget');
+    expect(clarification.calls).toHaveLength(1);
+  });
+
+  it('accepts a policy answer only after approved policy retrieval', async () => {
+    const provider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('policies', 'getStorePolicies', {})
+      : finalMessage('Kawama has not configured a public return-policy statement yet.'));
+    const response = await request(createApp({ chatProvider: provider }))
+      .post('/api/ai/chat')
+      .send({ message: 'What is your return policy?' });
+    expect(response.status).toBe(200);
+    expect(response.body.data.assistantMessage).toContain('not configured');
+    expect(provider.calls).toHaveLength(2);
+  });
+
   it('rejects unsafe tool arguments and exposes no private-data tool', async () => {
     const unsafe = await executeShoppingTool('searchProducts', JSON.stringify({ query: 'pan', $where: 'this.secret' }));
     expect(unsafe.output).toMatchObject({ error: { code: 'INVALID_TOOL_ARGUMENTS' } });
 
     const privateAttempt = await executeShoppingTool('getCustomers', JSON.stringify({ includePasswords: true }));
     expect(privateAttempt.output).toEqual({ error: { code: 'UNKNOWN_TOOL', message: 'That tool is not available.' } });
+  });
+
+  it('finds an older matching product beyond the former 100-product candidate window', async () => {
+    const target = await seedProduct({
+      slug: 'older-citrus-press',
+      name: 'Older Citrus Press',
+      shortDescription: 'Manual citrus preparation.',
+      description: 'A manual press for citrus fruit.',
+      featured: false,
+    });
+    const category = await CategoryModel.findOne({ slug: 'appliances' });
+    await ProductModel.insertMany(Array.from({ length: 105 }, (_, index) => ({
+      slug: `new-featured-item-${index}`,
+      name: `New Featured Item ${index}`,
+      category: category!._id,
+      shortDescription: 'An unrelated new kitchen item.',
+      description: 'An unrelated product without the target keyword.',
+      pricePesewas: 10_000 + index,
+      stockQuantity: 5,
+      lowStockThreshold: 2,
+      featured: true,
+      status: 'active',
+    })));
+
+    const result = await executeShoppingTool('searchProducts', JSON.stringify({ query: 'citrus', limit: 4 }));
+    expect(result.products.map((product) => product.id)).toEqual([String(target._id)]);
+    expect(result.output.totalMatches).toBe(1);
+  });
+
+  it('searches full descriptions, details, specifications, filters, and spelling variants', async () => {
+    const appliances = await CategoryModel.create({ name: 'Appliances', slug: 'appliances', status: 'active' });
+    const cookware = await CategoryModel.create({ name: 'Cookware', slug: 'cookware', status: 'active' });
+    const blender = await ProductModel.create({
+      slug: 'precision-blender',
+      name: 'Precision Blender',
+      category: appliances._id,
+      shortDescription: 'A countertop appliance.',
+      description: 'one two three four five six seven eight nine ten eleven twelve heatproof vessel',
+      pricePesewas: 19_99,
+      stockQuantity: 3,
+      lowStockThreshold: 1,
+      details: ['Dishwasher-safe removable lid'],
+      specifications: [{ label: 'Jug material', value: 'Borosilicate glass' }],
+      status: 'active',
+    });
+    await ProductModel.create({
+      slug: 'unrelated-pan',
+      name: 'Unrelated Pan',
+      category: cookware._id,
+      shortDescription: 'A cookware item.',
+      description: 'An unrelated pan.',
+      pricePesewas: 19_99,
+      stockQuantity: 3,
+      status: 'active',
+    });
+
+    const specification = await executeShoppingTool('searchProducts', JSON.stringify({ query: 'borosilicate', limit: 4 }));
+    expect(specification.products.map((product) => product.id)).toEqual([String(blender._id)]);
+    const lateDescription = await executeShoppingTool('searchProducts', JSON.stringify({ query: 'heatproof', limit: 4 }));
+    expect(lateDescription.products.map((product) => product.id)).toEqual([String(blender._id)]);
+    const misspelled = await executeShoppingTool('searchProducts', JSON.stringify({
+      query: 'blendr', category: 'Appliances', minPrice: 19.99, maxPrice: 19.99, availability: 'in_stock', limit: 4,
+    }));
+    expect(misspelled.products.map((product) => product.id)).toEqual([String(blender._id)]);
+    expect(misspelled.output.totalMatches).toBe(1);
+  });
+
+  it('validates decimal budgets with tolerant pesewa conversion and exact boundaries', async () => {
+    for (const value of [19.99, 0.29, 35.50, 35]) {
+      expect(searchProductsToolSchema.safeParse({ minPrice: value }).success).toBe(true);
+    }
+    for (const value of [19.999, -1, Number.NaN, Number.POSITIVE_INFINITY, 10_000_001]) {
+      expect(searchProductsToolSchema.safeParse({ minPrice: value }).success).toBe(false);
+    }
+    expect(searchProductsToolSchema.safeParse({ minPrice: 20, maxPrice: 19.99 }).success).toBe(false);
+    const invalidTool = await executeShoppingTool('searchProducts', JSON.stringify({ minPrice: 19.999 }));
+    expect(invalidTool.output).toMatchObject({ error: { code: 'INVALID_TOOL_ARGUMENTS' } });
+
+    const exact = await seedProduct({ slug: 'exact-boundary', name: 'Exact Boundary Blender', pricePesewas: 1_999 });
+    await seedProduct({ slug: 'below-boundary', name: 'Below Boundary Blender', pricePesewas: 1_998 });
+    await seedProduct({ slug: 'above-boundary', name: 'Above Boundary Blender', pricePesewas: 2_000 });
+    const result = await executeShoppingTool('searchProducts', JSON.stringify({ minPrice: 19.99, maxPrice: 19.99, limit: 6 }));
+    expect(result.products.map((product) => product.id)).toEqual([String(exact._id)]);
   });
 
   it('isolates conversation history by a server-issued guest session secret', async () => {
@@ -205,6 +393,31 @@ describe('shopping chat API', () => {
     expect(stolen.status).toBe(404);
     expect(stolen.body.error.code).toBe('CONVERSATION_NOT_FOUND');
     expect(provider.calls).toHaveLength(1);
+  });
+
+  it('keeps catalogue and checkout routes available when chat is disabled', async () => {
+    const originalEnabled = process.env.AI_CHAT_ENABLED;
+    process.env.AI_CHAT_ENABLED = 'false';
+    resetEnvironmentForTests();
+    try {
+      await seedProduct();
+      const app = createApp();
+      const catalogue = await request(app).get('/api/v1/products');
+      expect(catalogue.status).toBe(200);
+      expect(catalogue.body.data).toHaveLength(1);
+
+      const checkout = await request(app).post('/api/v1/checkout/sessions').send({});
+      expect(checkout.status).toBe(422);
+      expect(checkout.body.error.code).toBe('VALIDATION_ERROR');
+
+      const chat = await request(app).post('/api/ai/chat').send({ message: 'Hello' });
+      expect(chat.status).toBe(503);
+      expect(chat.body.error.code).toBe('AI_CHAT_DISABLED');
+    } finally {
+      if (originalEnabled === undefined) delete process.env.AI_CHAT_ENABLED;
+      else process.env.AI_CHAT_ENABLED = originalEnabled;
+      resetEnvironmentForTests();
+    }
   });
 
   it('enforces tool-execution and model-call limits', async () => {
@@ -237,10 +450,12 @@ describe('shopping chat API', () => {
 describe('OpenRouter provider failures', () => {
   const originalKey = process.env.OPENROUTER_API_KEY;
   const originalModel = process.env.OPENROUTER_MODEL;
+  const originalEnabled = process.env.AI_CHAT_ENABLED;
 
   beforeEach(() => {
     process.env.OPENROUTER_API_KEY = 'synthetic-openrouter-key-for-tests';
     process.env.OPENROUTER_MODEL = 'google/gemma-4-31b-it:free';
+    process.env.AI_CHAT_ENABLED = 'true';
     resetEnvironmentForTests();
   });
 
@@ -249,6 +464,8 @@ describe('OpenRouter provider failures', () => {
     else process.env.OPENROUTER_API_KEY = originalKey;
     if (originalModel === undefined) delete process.env.OPENROUTER_MODEL;
     else process.env.OPENROUTER_MODEL = originalModel;
+    if (originalEnabled === undefined) delete process.env.AI_CHAT_ENABLED;
+    else process.env.AI_CHAT_ENABLED = originalEnabled;
     resetEnvironmentForTests();
   });
 
@@ -257,6 +474,31 @@ describe('OpenRouter provider failures', () => {
     tools: [],
     maxTokens: 50,
   };
+
+  async function requestedModel(configuredModel?: string): Promise<Record<string, unknown>> {
+    if (configuredModel === undefined) delete process.env.OPENROUTER_MODEL;
+    else process.env.OPENROUTER_MODEL = configuredModel;
+    resetEnvironmentForTests();
+    let requestBody: Record<string, unknown> = {};
+    const provider = createOpenRouterProvider(async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'ok' } }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+    await provider.complete(input);
+    return requestBody;
+  }
+
+  it('uses Gemma by default and sends an explicitly configured model without substitution', async () => {
+    const defaultRequest = await requestedModel();
+    expect(defaultRequest.model).toBe(DEFAULT_OPENROUTER_MODEL);
+    expect(defaultRequest.models).toBeUndefined();
+
+    const configuredRequest = await requestedModel('example-provider/explicit-model');
+    expect(configuredRequest.model).toBe('example-provider/explicit-model');
+    expect(configuredRequest.models).toBeUndefined();
+  });
 
   it('fails closed when the server key is missing', async () => {
     delete process.env.OPENROUTER_API_KEY;
@@ -267,6 +509,18 @@ describe('OpenRouter provider failures', () => {
       return new Response('{}', { status: 200 });
     });
     await expect(provider.complete(input)).rejects.toMatchObject({ status: 503, code: 'AI_CHAT_NOT_CONFIGURED' });
+    expect(called).toBe(false);
+  });
+
+  it('does not contact OpenRouter when chat is disabled', async () => {
+    process.env.AI_CHAT_ENABLED = 'false';
+    resetEnvironmentForTests();
+    let called = false;
+    const provider = createOpenRouterProvider(async () => {
+      called = true;
+      return new Response('{}', { status: 200 });
+    });
+    await expect(provider.complete(input)).rejects.toMatchObject({ status: 503, code: 'AI_CHAT_DISABLED' });
     expect(called).toBe(false);
   });
 

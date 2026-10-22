@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { escapeRegex, slugify, toPublicProduct } from '../lib/catalog.js';
+import { escapeRegex, slugify, toPesewas, toPublicProduct } from '../lib/catalog.js';
 import { CategoryModel } from '../models/CategorySchema.js';
 import { ProductModel } from '../models/ProductSchema.js';
 
@@ -25,7 +25,7 @@ export interface PublicProductSearchResult {
   total: number;
 }
 
-function normalizeWords(value: string): string[] {
+function normalizeQueryWords(value: string): string[] {
   return value
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -37,47 +37,51 @@ function normalizeWords(value: string): string[] {
     .slice(0, 10);
 }
 
-function editDistance(first: string, second: string): number {
-  const previous = Array.from({ length: second.length + 1 }, (_, index) => index);
-  for (let row = 1; row <= first.length; row += 1) {
-    let diagonal = previous[0]!;
-    previous[0] = row;
-    for (let column = 1; column <= second.length; column += 1) {
-      const above = previous[column]!;
-      previous[column] = Math.min(
-        previous[column]! + 1,
-        previous[column - 1]! + 1,
-        diagonal + (first[row - 1] === second[column - 1] ? 0 : 1),
+const searchableProductFields = [
+  'name',
+  'shortDescription',
+  'description',
+  'details',
+  'specifications.label',
+  'specifications.value',
+] as const;
+
+function fieldsMatching(expression: RegExp): Record<string, unknown> {
+  return { $or: searchableProductFields.map((field) => ({ [field]: expression })) };
+}
+
+function exactKeywordFilter(words: string[]): Record<string, unknown> {
+  return {
+    $and: words.map((word) => fieldsMatching(new RegExp(escapeRegex(word), 'i'))),
+  };
+}
+
+function fuzzyWordExpression(word: string): RegExp | undefined {
+  if (word.length < 4) return undefined;
+  const alternatives = new Set<string>([escapeRegex(word)]);
+  for (let index = 0; index <= word.length; index += 1) {
+    const before = escapeRegex(word.slice(0, index));
+    const after = escapeRegex(word.slice(index));
+    // One extra character in the stored word (for example blendr -> blender).
+    alternatives.add(`${before}[a-z0-9]${after}`);
+    if (index < word.length) {
+      // One extra or wrong character in the query.
+      alternatives.add(`${before}${escapeRegex(word.slice(index + 1))}`);
+      alternatives.add(`${before}[a-z0-9]${escapeRegex(word.slice(index + 1))}`);
+    }
+    if (index < word.length - 1) {
+      alternatives.add(
+        `${before}${escapeRegex(word[index + 1]!)}${escapeRegex(word[index]!)}${escapeRegex(word.slice(index + 2))}`,
       );
-      diagonal = above;
     }
   }
-  return previous[second.length]!;
+  return new RegExp(`\\b(?:${[...alternatives].join('|')})\\b`, 'i');
 }
 
-function wordMatches(queryWord: string, candidateWord: string): boolean {
-  if (candidateWord.includes(queryWord) || queryWord.includes(candidateWord)) return true;
-  const allowedDistance = queryWord.length >= 7 ? 2 : queryWord.length >= 4 ? 1 : 0;
-  return allowedDistance > 0 && editDistance(queryWord, candidateWord) <= allowedDistance;
-}
-
-function productSearchText(product: Record<string, any>): string[] {
-  return normalizeWords([
-    product.name,
-    product.shortDescription,
-    product.description,
-    ...(product.details ?? []),
-    ...(product.specifications ?? []).flatMap((item: { label?: string; value?: string }) => [item.label, item.value]),
-  ].filter(Boolean).join(' '));
-}
-
-function relevanceScore(product: Record<string, any>, queryWords: string[]): number {
-  const candidateWords = productSearchText(product);
-  return queryWords.reduce((score, queryWord) => {
-    if (candidateWords.includes(queryWord)) return score + 4;
-    if (candidateWords.some((candidate) => candidate.startsWith(queryWord) || queryWord.startsWith(candidate))) return score + 2;
-    return candidateWords.some((candidate) => wordMatches(queryWord, candidate)) ? score + 1 : score;
-  }, 0);
+function fuzzyKeywordFilter(words: string[]): Record<string, unknown> | undefined {
+  const expressions = words.map(fuzzyWordExpression);
+  if (expressions.some((expression) => expression === undefined)) return undefined;
+  return { $and: expressions.map((expression) => fieldsMatching(expression!)) };
 }
 
 async function resolveCategoryId(value: string | undefined): Promise<unknown | undefined> {
@@ -97,8 +101,8 @@ function buildBaseFilter(input: PublicProductSearchInput, categoryId: unknown | 
   if (input.featured !== undefined) filter.featured = input.featured;
   if (input.minPrice !== undefined || input.maxPrice !== undefined) {
     filter.pricePesewas = {
-      ...(input.minPrice !== undefined ? { $gte: Math.round(input.minPrice * 100) } : {}),
-      ...(input.maxPrice !== undefined ? { $lte: Math.round(input.maxPrice * 100) } : {}),
+      ...(input.minPrice !== undefined ? { $gte: toPesewas(input.minPrice) } : {}),
+      ...(input.maxPrice !== undefined ? { $lte: toPesewas(input.maxPrice) } : {}),
     };
   }
   if (input.availability === 'in_stock') {
@@ -124,7 +128,8 @@ export async function searchPublicProducts(input: PublicProductSearchInput): Pro
   if (input.category?.trim() && categoryId === undefined) return { products: [], total: 0 };
 
   const baseFilter = buildBaseFilter(input, categoryId);
-  const queryWords = input.query ? normalizeWords(input.query) : [];
+  const queryWords = input.query ? normalizeQueryWords(input.query) : [];
+  if (input.query?.trim() && queryWords.length === 0) return { products: [], total: 0 };
   const selectedSort = input.sort ?? (queryWords.length > 0 ? 'relevance' : 'featured');
 
   if (queryWords.length === 0) {
@@ -145,28 +150,26 @@ export async function searchPublicProducts(input: PublicProductSearchInput): Pro
     };
   }
 
-  // The candidate set is bounded before application-level fuzzy matching. This
-  // supports ordinary misspellings without accepting model-provided regexes.
-  const candidates = await ProductModel.find(baseFilter)
+  const exactFilter = { ...baseFilter, ...exactKeywordFilter(queryWords) };
+  const exactTotal = await ProductModel.countDocuments(exactFilter);
+  const fuzzyFilter = exactTotal === 0 ? fuzzyKeywordFilter(queryWords) : undefined;
+  const selectedFilter = exactTotal > 0 || !fuzzyFilter
+    ? exactFilter
+    : { ...baseFilter, ...fuzzyFilter };
+  const total = exactTotal > 0 || !fuzzyFilter
+    ? exactTotal
+    : await ProductModel.countDocuments(selectedFilter);
+  const sort = selectedSort === 'relevance' ? mongoSorts.featured : mongoSorts[selectedSort];
+  const products = await ProductModel.find(selectedFilter)
     .populate('category', 'name slug')
     .populate('complementaryCategories', 'name slug')
-    .sort({ featured: -1, createdAt: -1 })
-    .limit(100)
+    .sort(sort)
+    .skip((page - 1) * limit)
+    .limit(limit)
     .lean();
-  const ranked = candidates
-    .map((product) => ({ product, score: relevanceScore(product as Record<string, any>, queryWords) }))
-    .filter(({ score }) => score >= Math.max(1, queryWords.length))
-    .sort((first, second) => {
-      if (selectedSort === 'priceAsc') return first.product.pricePesewas - second.product.pricePesewas;
-      if (selectedSort === 'priceDesc') return second.product.pricePesewas - first.product.pricePesewas;
-      if (selectedSort === 'name') return first.product.name.localeCompare(second.product.name);
-      if (selectedSort === 'newest') return Number(second.product.createdAt) - Number(first.product.createdAt);
-      return second.score - first.score || Number(second.product.featured) - Number(first.product.featured);
-    });
   return {
-    products: ranked.slice((page - 1) * limit, page * limit).map(({ product }) =>
-      toPublicProduct(product as Record<string, any>)),
-    total: ranked.length,
+    products: products.map((product) => toPublicProduct(product as Record<string, any>)),
+    total,
   };
 }
 

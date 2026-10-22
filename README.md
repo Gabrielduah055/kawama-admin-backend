@@ -53,9 +53,13 @@ OPENROUTER_API_KEY=your-server-only-key
 OPENROUTER_MODEL=google/gemma-4-31b-it:free
 ```
 
-The required model is fixed in code as well as configuration, so a changed model value fails closed rather than silently selecting a paid model. A missing key or `AI_CHAT_ENABLED=false` affects only the chat route. `OPENROUTER_TIMEOUT_MS` and `AI_CHAT_CONVERSATION_TTL_HOURS` optionally control the provider timeout and guest-history expiry.
+`google/gemma-4-31b-it:free` is the default model. `OPENROUTER_MODEL` may explicitly select another OpenRouter model without a source change; the provider sends exactly that one model ID and never adds automatic fallback or upgrade models. A missing key or `AI_CHAT_ENABLED=false` affects only the chat route. `OPENROUTER_TIMEOUT_MS` and `AI_CHAT_CONVERSATION_TTL_HOURS` optionally control the provider timeout and guest-history expiry.
 
-Store policy answers come from `STORE_DELIVERY_POLICY`, `STORE_PAYMENT_POLICY`, `STORE_RETURN_POLICY`, `STORE_CONTACT_EMAIL`, `STORE_CONTACT_PHONE`, and `STORE_CONTACT_WHATSAPP_URL`. Unset policy values remain unknown; the assistant is instructed not to infer them. `STOREFRONT_PRODUCT_URL_TEMPLATE` may contain a literal `{slug}` for canonical product-card links.
+Store policy answers come from `STORE_DELIVERY_POLICY`, `STORE_PAYMENT_POLICY`, `STORE_RETURN_POLICY`, `STORE_CONTACT_EMAIL`, `STORE_CONTACT_PHONE`, and `STORE_CONTACT_WHATSAPP_URL`. Blank or whitespace-only optional settings are treated as unset; invalid nonblank emails and URLs are rejected. Unset policy values remain unknown. `STOREFRONT_PRODUCT_URL_TEMPLATE` may contain a literal `{slug}` for canonical product-card links.
+
+Grounding is enforced in the application as well as the system prompt. Product questions, recommendations, comparisons, prices, availability, specifications, and warranties require a successful current-request catalogue search or detail lookup. Policy and contact answers require `getStorePolicies`. Greetings and fact-free clarification questions may skip tools. If a draft lacks the required evidence, the application allows one corrective model step within the existing four-call/six-tool limits, then returns a deterministic safe clarification instead of the unsupported draft. It also rejects unreturned product IDs, unsupported explicit GHS amounts, unrecorded warranty claims that are not described as unknown, obvious stock contradictions, and model-generated product links. Canonical product cards remain the authority for IDs, prices, availability, images, and links; the validator does not attempt to mathematically prove every descriptive phrase in natural-language prose.
+
+Previously shown positions are stored as safe ID/name/slug snapshots. If an item is later archived, it keeps its original position but is marked unavailable; active items are re-retrieved before current facts are answered.
 
 For a first Postman request, omit `X-Chat-Session`:
 

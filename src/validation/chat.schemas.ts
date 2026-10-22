@@ -1,8 +1,16 @@
 import { z } from 'zod';
+import { toPesewas } from '../lib/catalog.js';
 import { objectIdSchema, slugSchema } from './schemas.js';
 
 const priceSchema = z.number().finite().nonnegative().max(10_000_000).refine(
-  (value) => Number.isInteger(value * 100),
+  (value) => {
+    try {
+      toPesewas(value);
+      return true;
+    } catch {
+      return false;
+    }
+  },
   { message: 'Must contain at most two decimal places.' },
 );
 
