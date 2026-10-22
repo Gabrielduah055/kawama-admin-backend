@@ -41,6 +41,72 @@ The simpler Slipper-style storefront routes are `GET /api/product`, `GET /api/pr
 
 Alternatively, import `postman/Kawama API.postman_collection.json`, set its `adminPassword` collection variable, and run **Admin Login** first. The collection stores the returned token automatically and includes public checks plus category/product CRUD requests. The included create requests use fixed test slugs, so archive or rename old test records before rerunning them.
 
+## AI shopping assistant
+
+`POST /api/ai/chat` starts or continues a customer shopping conversation. It searches active MongoDB catalogue records through bounded server-side tools and returns only a final customer-facing reply plus canonical product cards. Product prices are returned in GHS. Current availability is calculated from stock minus active reservations. The assistant cannot mutate products, inventory, orders, payments, or customer records.
+
+Configure the server with:
+
+```text
+AI_CHAT_ENABLED=true
+OPENROUTER_API_KEY=your-server-only-key
+OPENROUTER_MODEL=google/gemma-4-31b-it:free
+```
+
+The required model is fixed in code as well as configuration, so a changed model value fails closed rather than silently selecting a paid model. A missing key or `AI_CHAT_ENABLED=false` affects only the chat route. `OPENROUTER_TIMEOUT_MS` and `AI_CHAT_CONVERSATION_TTL_HOURS` optionally control the provider timeout and guest-history expiry.
+
+Store policy answers come from `STORE_DELIVERY_POLICY`, `STORE_PAYMENT_POLICY`, `STORE_RETURN_POLICY`, `STORE_CONTACT_EMAIL`, `STORE_CONTACT_PHONE`, and `STORE_CONTACT_WHATSAPP_URL`. Unset policy values remain unknown; the assistant is instructed not to infer them. `STOREFRONT_PRODUCT_URL_TEMPLATE` may contain a literal `{slug}` for canonical product-card links.
+
+For a first Postman request, omit `X-Chat-Session`:
+
+```http
+POST http://localhost:3000/api/ai/chat
+Content-Type: application/json
+
+{
+  "message": "I need a blender under 400 cedis",
+  "context": { "productSlug": "smoothie-blender" }
+}
+```
+
+The response has this shape:
+
+```json
+{
+  "message": "Assistant response generated successfully",
+  "data": {
+    "conversationId": "00000000-0000-4000-8000-000000000000",
+    "assistantMessage": "...",
+    "products": [
+      {
+        "id": "000000000000000000000000",
+        "slug": "example-product",
+        "name": "Example product",
+        "price": 350,
+        "currency": "GHS",
+        "availability": "in_stock"
+      }
+    ],
+    "suggestedFollowUps": ["Would you like a comparison?"]
+  }
+}
+```
+
+Save the `X-Chat-Session` response header. To continue, send that header together with `data.conversationId`; the conversation ID alone cannot read another visitor's history:
+
+```http
+POST http://localhost:3000/api/ai/chat
+Content-Type: application/json
+X-Chat-Session: <43-character value returned by the server>
+
+{
+  "conversationId": "00000000-0000-4000-8000-000000000000",
+  "message": "Compare the first and second."
+}
+```
+
+Guest history retains at most twelve user/assistant messages and expires through a MongoDB TTL index. Do not log or place the session header in URLs. The OpenAPI document and included Postman collection contain the same contract.
+
 ## Uploads
 
 For product media, call `POST /api/v1/admin/uploads/signature`, upload directly to Cloudinary with the returned values, then store the returned `secure_url` and `public_id` in the product payload. Asset deletion is rejected while a category or product references it.

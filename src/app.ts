@@ -12,21 +12,25 @@ import { openApiDocument } from './openapi.js';
 import { createAdminRouter } from './route/adminRouter.js';
 import { authRouter } from './route/authRouter.js';
 import { createCheckoutRouter, createPaystackWebhookRouter } from './route/checkoutRouter.js';
+import { createChatRouter } from './route/chatRouter.js';
 import { createProductRouter } from './route/productRouter.js';
 import { publicRouter } from './route/publicRouter.js';
 import { verifyDatabaseAdminToken, type AdminTokenVerifier } from './services/auth.service.js';
 import { cloudinaryMediaService, type MediaService } from './services/cloudinary.service.js';
 import { paystackGateway, type PaystackGateway } from './services/paystack.service.js';
+import { openRouterProvider, type ChatProvider } from './services/openrouter.service.js';
 
 export interface ApplicationDependencies {
   verifyAdminToken?: AdminTokenVerifier;
   mediaService?: MediaService;
   paystackGateway?: PaystackGateway;
+  chatProvider?: ChatProvider;
 }
 
 const corsOptions: Omit<CorsOptions, 'origin'> = {
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'X-Paystack-Signature', 'X-Request-Id'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'X-Paystack-Signature', 'X-Request-Id', 'X-Chat-Session'],
+  exposedHeaders: ['X-Request-Id', 'X-Chat-Session'],
   maxAge: 86_400,
 };
 
@@ -40,6 +44,7 @@ function isPublicStorefrontRequest(request: Request): boolean {
   if (method === 'GET' && (path === '/api/v1/categories' || path === '/api/v1/products' || path.startsWith('/api/v1/products/'))) return true;
   if (method === 'GET' && path.startsWith('/api/v1/checkout/sessions/')) return true;
   if (method === 'POST' && path === '/api/v1/checkout/sessions') return true;
+  if (method === 'POST' && path === '/api/ai/chat') return true;
   return method === 'POST' && /^\/api\/v1\/products\/[^/]+\/reviews$/.test(path);
 }
 
@@ -111,6 +116,7 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
   const selectedPaystackGateway = dependencies.paystackGateway ?? paystackGateway;
   app.use('/api/v1/checkout', createCheckoutRouter(selectedPaystackGateway));
   app.use('/api/v1/webhooks', createPaystackWebhookRouter(selectedPaystackGateway));
+  app.use('/api/ai', createChatRouter(dependencies.chatProvider ?? openRouterProvider));
   app.use('/api/v1', publicRouter);
   app.use(
     '/api/v1/admin',
