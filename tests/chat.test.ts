@@ -15,6 +15,15 @@ import { searchProductsToolSchema } from '../src/validation/chat.schemas.js';
 
 let mongo: MongoMemoryServer | undefined;
 let mongoDataDirectory: string | undefined;
+const controlledStoreKeys = [
+  'STORE_CONTACT_EMAIL',
+  'STORE_CONTACT_PHONE',
+  'STORE_CONTACT_WHATSAPP_URL',
+  'STORE_DELIVERY_POLICY',
+  'STORE_PAYMENT_POLICY',
+  'STORE_RETURN_POLICY',
+] as const;
+const originalStoreValues = new Map(controlledStoreKeys.map((key) => [key, process.env[key]]));
 
 class ScriptedProvider implements ChatProvider {
   public calls: ChatCompletionRequest[] = [];
@@ -58,15 +67,22 @@ function toolCall(id: string, name: string, argumentsValue: Record<string, unkno
   };
 }
 
-function finalMessage(assistantMessage: string, productIds: string[] = [], suggestedFollowUps: string[] = []): ProviderMessage {
+function finalPlan(plan: Record<string, unknown>): ProviderMessage {
   return {
     role: 'assistant',
-    content: JSON.stringify({ assistantMessage, productIds, suggestedFollowUps }),
+    content: JSON.stringify(plan),
   };
 }
 
 function productsFromLastTool(input: ChatCompletionRequest): Array<Record<string, unknown>> {
   const toolMessage = [...input.messages].reverse().find((message) => message.role === 'tool');
+  if (!toolMessage?.content) return [];
+  const parsed = JSON.parse(toolMessage.content) as { products?: Array<Record<string, unknown>> };
+  return parsed.products ?? [];
+}
+
+function productsFromTool(input: ChatCompletionRequest, name: string): Array<Record<string, unknown>> {
+  const toolMessage = [...input.messages].reverse().find((message) => message.role === 'tool' && message.name === name);
   if (!toolMessage?.content) return [];
   const parsed = JSON.parse(toolMessage.content) as { products?: Array<Record<string, unknown>> };
   return parsed.products ?? [];
@@ -86,6 +102,8 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  for (const key of controlledStoreKeys) process.env[key] = '';
+  resetEnvironmentForTests();
   await Promise.all([
     CategoryModel.deleteMany({}),
     ProductModel.deleteMany({}),
@@ -94,6 +112,12 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
+  for (const key of controlledStoreKeys) {
+    const original = originalStoreValues.get(key);
+    if (original === undefined) delete process.env[key];
+    else process.env[key] = original;
+  }
+  resetEnvironmentForTests();
   await mongoose.disconnect();
   await mongo?.stop();
   if (mongoDataDirectory) await rm(mongoDataDirectory, { recursive: true, force: true });
@@ -110,7 +134,15 @@ describe('shopping chat API', () => {
         });
       }
       const products = productsFromLastTool(input);
-      return finalMessage('The Smoothie Blender fits your GHS 400 budget and is currently available.', products.map((product) => String(product.id)), ['Would you like its specifications?']);
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: products.map((product) => ({
+          productId: String(product.id),
+          pricePesewas: Number(product.pricePesewas),
+          availability: product.stockLevel,
+          customerBudgetPesewas: 40_000,
+        })),
+      });
     });
     const app = createApp({ chatProvider: provider });
 
@@ -144,7 +176,10 @@ describe('shopping chat API', () => {
       }
       if (lastTool && userMessage?.includes('Show me')) {
         const products = productsFromLastTool(input);
-        return finalMessage('Here are two options.', products.map((product) => String(product.id)));
+        return finalPlan({
+          type: 'product_answer',
+          productClaims: products.map((product) => ({ productId: String(product.id), includeSummary: true })),
+        });
       }
       if (!lastTool && userMessage?.includes('Compare')) {
         const system = input.messages[0]!.content ?? '';
@@ -152,7 +187,13 @@ describe('shopping chat API', () => {
         return toolCall('compare', 'getProductDetails', { identifiers: ids });
       }
       const products = productsFromLastTool(input);
-      return finalMessage('The first costs less; the second has its own recorded details.', products.map((product) => String(product.id)));
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: products.map((product) => ({
+          productId: String(product.id),
+          pricePesewas: Number(product.pricePesewas),
+        })),
+      });
     });
     const app = createApp({ chatProvider: provider });
 
@@ -183,16 +224,22 @@ describe('shopping chat API', () => {
       }
       if (userMessage.includes('Show me') && lastTool) {
         const products = productsFromLastTool(input);
-        return finalMessage('Here are two options.', products.map((product) => String(product.id)));
+        return finalPlan({
+          type: 'product_answer',
+          productClaims: products.map((product) => ({ productId: String(product.id), includeSummary: true })),
+        });
       }
       if (userMessage.includes('second') && !lastTool) {
         const secondId = /2\..*?id: ([a-f\d]{24})/i.exec(system)?.[1];
         return toolCall('position-second', 'getProductDetails', { identifiers: [secondId] });
       }
       if (userMessage.includes('second') && lastTool) {
-        return finalMessage('The second product is still available.', [String(second._id)]);
+        return finalPlan({
+          type: 'product_answer',
+          productClaims: [{ productId: String(second._id), availability: 'in_stock' }],
+        });
       }
-      return finalMessage('Position A Blender is no longer available in the public catalogue.');
+      return finalPlan({ type: 'unavailable_reference' });
     });
     const app = createApp({ chatProvider: provider });
     const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me two blenders.' });
@@ -222,7 +269,10 @@ describe('shopping chat API', () => {
     const unavailable = await seedProduct({ stockQuantity: 0, details: [], specifications: [] });
     const provider = new ScriptedProvider((input, call) => call === 1
       ? toolCall('details', 'getProductDetails', { identifiers: [String(unavailable._id)] })
-      : finalMessage('This item is out of stock. Its warranty is not recorded, so I cannot confirm one.', [String(unavailable._id)]));
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(unavailable._id), availability: 'out_of_stock', warranty: null }],
+      }));
     const response = await request(createApp({ chatProvider: provider }))
       .post('/api/ai/chat')
       .send({ message: 'Is this available and does it have a warranty?', context: { productId: String(unavailable._id) } });
@@ -233,10 +283,16 @@ describe('shopping chat API', () => {
   });
 
   it('does not forward invented product facts when the model skips retrieval', async () => {
-    const invented = new ScriptedProvider(() => finalMessage(
-      'The SuperBlend Max costs GHS 299, is in stock, and has a five-year warranty.',
-      [],
-    ));
+    const inventedId = String(new mongoose.Types.ObjectId());
+    const invented = new ScriptedProvider(() => finalPlan({
+      type: 'product_answer',
+      productClaims: [{
+        productId: inventedId,
+        pricePesewas: 29_900,
+        availability: 'in_stock',
+        warranty: 'Five-year warranty',
+      }],
+    }));
     const response = await request(createApp({ chatProvider: invented }))
       .post('/api/ai/chat')
       .send({ message: 'Recommend a blender and tell me its price and warranty.' });
@@ -249,7 +305,10 @@ describe('shopping chat API', () => {
   });
 
   it('does not allow policy answers to bypass the approved policy tool', async () => {
-    const invented = new ScriptedProvider(() => finalMessage('All returns are accepted for 90 days.'));
+    const invented = new ScriptedProvider(() => finalPlan({
+      type: 'policy_answer',
+      policyClaims: [{ topic: 'return', value: 'All returns are accepted for 90 days.' }],
+    }));
     const response = await request(createApp({ chatProvider: invented }))
       .post('/api/ai/chat')
       .send({ message: 'What is your return policy?' });
@@ -261,14 +320,14 @@ describe('shopping chat API', () => {
   });
 
   it('allows greetings and necessary fact-free clarification without retrieval', async () => {
-    const greeting = new ScriptedProvider(() => finalMessage('Hello! What are you shopping for today?'));
+    const greeting = new ScriptedProvider(() => finalPlan({ type: 'greeting' }));
     const greeted = await request(createApp({ chatProvider: greeting }))
       .post('/api/ai/chat')
       .send({ message: 'Hello' });
     expect(greeted.status).toBe(200);
     expect(greeting.calls).toHaveLength(1);
 
-    const clarification = new ScriptedProvider(() => finalMessage('What budget would you like to stay within?'));
+    const clarification = new ScriptedProvider(() => finalPlan({ type: 'clarification', purpose: 'budget' }));
     const clarified = await request(createApp({ chatProvider: clarification }))
       .post('/api/ai/chat')
       .send({ message: 'I need something for my kitchen.' });
@@ -280,13 +339,331 @@ describe('shopping chat API', () => {
   it('accepts a policy answer only after approved policy retrieval', async () => {
     const provider = new ScriptedProvider((_input, call) => call === 1
       ? toolCall('policies', 'getStorePolicies', {})
-      : finalMessage('Kawama has not configured a public return-policy statement yet.'));
+      : finalPlan({ type: 'policy_answer', policyClaims: [{ topic: 'return', value: null }] }));
     const response = await request(createApp({ chatProvider: provider }))
       .post('/api/ai/chat')
       .send({ message: 'What is your return policy?' });
     expect(response.status).toBe(200);
-    expect(response.body.data.assistantMessage).toContain('not configured');
+    expect(response.body.data.assistantMessage).toContain('cannot confirm return terms');
     expect(provider.calls).toHaveLength(2);
+  });
+
+  it('renders constrained clarifications without forwarding factual prefixes', async () => {
+    for (const inventedPrefix of [
+      'This blender includes a lifetime warranty. What budget would you like?',
+      'This blender has a titanium jug. What budget would you like?',
+    ]) {
+      const provider = new ScriptedProvider((_input, call) => call === 1
+        ? finalPlan({ type: 'clarification', purpose: 'budget', assistantMessage: inventedPrefix })
+        : finalPlan({ type: 'clarification', purpose: 'budget' }));
+      const response = await request(createApp({ chatProvider: provider }))
+        .post('/api/ai/chat')
+        .send({ message: 'I need a blender.' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.assistantMessage).toBe('What budget would you like to stay within?');
+      expect(response.body.data.assistantMessage).not.toContain('lifetime warranty');
+      expect(response.body.data.assistantMessage).not.toContain('titanium');
+      expect(provider.calls).toHaveLength(2);
+    }
+  });
+
+  it('validates policy claims against null and configured policy values', async () => {
+    const nullPolicyProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('null-policy', 'getStorePolicies', {})
+      : finalPlan({ type: 'policy_answer', policyClaims: [{ topic: 'return', value: 'Free returns for 90 days.' }] }));
+    const nullPolicyResponse = await request(createApp({ chatProvider: nullPolicyProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'What are the return terms?' });
+    expect(nullPolicyResponse.status).toBe(200);
+    expect(nullPolicyResponse.body.data.assistantMessage).not.toContain('90 days');
+    expect(nullPolicyResponse.body.data.assistantMessage).toContain('could not verify');
+
+    process.env.STORE_RETURN_POLICY = 'Returns are accepted within 14 days with a receipt.';
+    resetEnvironmentForTests();
+    const contradictoryProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('configured-policy', 'getStorePolicies', {})
+      : finalPlan({ type: 'policy_answer', policyClaims: [{ topic: 'return', value: 'Returns are free for 30 days.' }] }));
+    const contradictoryResponse = await request(createApp({ chatProvider: contradictoryProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Can I return my order?' });
+    expect(contradictoryResponse.status).toBe(200);
+    expect(contradictoryResponse.body.data.assistantMessage).not.toContain('30 days');
+
+    const correctProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('correct-policy', 'getStorePolicies', {})
+      : finalPlan({
+        type: 'policy_answer',
+        policyClaims: [{ topic: 'return', value: 'Returns are accepted within 14 days with a receipt.' }],
+      }));
+    const correctResponse = await request(createApp({ chatProvider: correctProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Can I return my order?' });
+    expect(correctResponse.status).toBe(200);
+    expect(correctResponse.body.data.assistantMessage).toContain('Returns are accepted within 14 days with a receipt.');
+  });
+
+  it('keeps customer budgets separate from canonical per-product prices', async () => {
+    const blender = await seedProduct({ pricePesewas: 35_000 });
+    const incorrect = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('incorrect-price', 'getProductDetails', { identifiers: [String(blender._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{
+          productId: String(blender._id),
+          pricePesewas: 40_000,
+          customerBudgetPesewas: 40_000,
+        }],
+      }));
+    const rejected = await request(createApp({ chatProvider: incorrect }))
+      .post('/api/ai/chat')
+      .send({ message: 'I need a blender under GH₵400.' });
+    expect(rejected.status).toBe(200);
+    expect(rejected.body.data.assistantMessage).not.toContain('costs GHS 400');
+    expect(rejected.body.data.products).toEqual([]);
+
+    const correct = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('correct-price', 'getProductDetails', { identifiers: [String(blender._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{
+          productId: String(blender._id),
+          pricePesewas: 35_000,
+          customerBudgetPesewas: 40_000,
+        }],
+      }));
+    const accepted = await request(createApp({ chatProvider: correct }))
+      .post('/api/ai/chat')
+      .send({ message: 'I need a blender under GH₵400.' });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body.data.assistantMessage).toContain('costs GHS 350.00');
+    expect(accepted.body.data.assistantMessage).toContain('fits your GHS 400.00 budget');
+    expect(accepted.body.data.products[0].price).toBe(350);
+  });
+
+  it('supports contact, payment, return, contextual policy, and mixed intents without keyword classification', async () => {
+    process.env.STORE_CONTACT_EMAIL = 'help@kawama.test';
+    process.env.STORE_CONTACT_PHONE = '+233200000000';
+    process.env.STORE_CONTACT_WHATSAPP_URL = 'https://wa.me/233200000000';
+    process.env.STORE_DELIVERY_POLICY = 'Delivery in Accra takes two business days.';
+    resetEnvironmentForTests();
+
+    const contactProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('contact-policy', 'getStorePolicies', {})
+      : finalPlan({
+        type: 'policy_answer',
+        policyClaims: [{
+          topic: 'contact',
+          email: 'help@kawama.test',
+          phone: '+233200000000',
+          whatsappUrl: 'https://wa.me/233200000000',
+        }],
+      }));
+    const contact = await request(createApp({ chatProvider: contactProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'How can I reach you?' });
+    expect(contact.status).toBe(200);
+    expect(contact.body.data.assistantMessage).toContain('help@kawama.test');
+
+    const mobileMoneyProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('mobile-money-policy', 'getStorePolicies', {})
+      : finalPlan({ type: 'policy_answer', policyClaims: [{ topic: 'payment', value: null }] }));
+    const mobileMoney = await request(createApp({ chatProvider: mobileMoneyProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Can I pay with mobile money?' });
+    expect(mobileMoney.status).toBe(200);
+    expect(mobileMoney.body.data.assistantMessage).toContain('cannot confirm Mobile Money');
+
+    const returnProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('item-return-policy', 'getStorePolicies', {})
+      : finalPlan({ type: 'policy_answer', policyClaims: [{ topic: 'return', value: null }] }));
+    const itemReturn = await request(createApp({ chatProvider: returnProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Can I return an item?' });
+    expect(itemReturn.status).toBe(200);
+    expect(itemReturn.body.data.assistantMessage).toContain('cannot confirm return terms');
+
+    const product = await seedProduct();
+    const contextualPolicyProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('context-policy', 'getStorePolicies', {})
+      : finalPlan({
+        type: 'policy_answer',
+        policyClaims: [{ topic: 'delivery', value: 'Delivery in Accra takes two business days.' }],
+      }));
+    const contextualPolicy = await request(createApp({ chatProvider: contextualPolicyProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'When will you bring it?', context: { productId: String(product._id) } });
+    expect(contextualPolicy.status).toBe(200);
+    expect(contextualPolicy.body.data.assistantMessage).toContain('two business days');
+    expect(contextualPolicyProvider.calls).toHaveLength(2);
+
+    const mixedProvider = new ScriptedProvider((input, call) => {
+      if (call === 1) return toolCall('mixed-product', 'searchProducts', { query: 'blender', limit: 1 });
+      if (call === 2) return toolCall('mixed-policy', 'getStorePolicies', {});
+      const products = productsFromTool(input, 'searchProducts');
+      return finalPlan({
+        type: 'mixed_answer',
+        productClaims: [{ productId: String(products[0]!.id), availability: products[0]!.stockLevel }],
+        policyClaims: [{ topic: 'delivery', value: 'Delivery in Accra takes two business days.' }],
+      });
+    });
+    const mixed = await request(createApp({ chatProvider: mixedProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Is this blender available, and when can you bring it?' });
+    expect(mixed.status).toBe(200);
+    expect(mixed.body.data.assistantMessage).toContain('is in stock');
+    expect(mixed.body.data.assistantMessage).toContain('two business days');
+    expect(mixed.body.data.products[0].id).toBe(String(product._id));
+  });
+
+  it('binds positive and negative availability claims to each product', async () => {
+    const available = await seedProduct({ slug: 'available-blender', name: 'Available Blender', stockQuantity: 5, pricePesewas: 35_000 });
+    const unavailable = await seedProduct({ slug: 'unavailable-blender', name: 'Unavailable Blender', stockQuantity: 0, pricePesewas: 30_000 });
+
+    const unavailableProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('out-stock', 'getProductDetails', { identifiers: [String(unavailable._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(unavailable._id), availability: 'out_of_stock' }],
+      }));
+    const outOfStock = await request(createApp({ chatProvider: unavailableProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Is the unavailable blender available?' });
+    expect(outOfStock.status).toBe(200);
+    expect(outOfStock.body.data.assistantMessage).toContain('is not in stock');
+    expect(outOfStock.body.data.assistantMessage).toContain('out of stock');
+
+    const availableProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('in-stock', 'getProductDetails', { identifiers: [String(available._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(available._id), availability: 'in_stock' }],
+      }));
+    const inStock = await request(createApp({ chatProvider: availableProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Is the available blender available?' });
+    expect(inStock.body.data.assistantMessage).toContain('is in stock');
+
+    const contradictoryProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('wrong-stock', 'getProductDetails', { identifiers: [String(unavailable._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(unavailable._id), availability: 'in_stock' }],
+      }));
+    const contradictory = await request(createApp({ chatProvider: contradictoryProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Is the unavailable blender available?' });
+    expect(contradictory.status).toBe(200);
+    expect(contradictory.body.data.assistantMessage).not.toContain('is in stock');
+
+    const comparisonProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('stock-comparison', 'getProductDetails', { identifiers: [String(available._id), String(unavailable._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [
+          { productId: String(available._id), availability: 'in_stock' },
+          { productId: String(unavailable._id), availability: 'out_of_stock' },
+        ],
+      }));
+    const comparison = await request(createApp({ chatProvider: comparisonProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Compare availability for these two blenders.' });
+    expect(comparison.status).toBe(200);
+    expect(comparison.body.data.assistantMessage).toContain('Available Blender is in stock');
+    expect(comparison.body.data.assistantMessage).toContain('Unavailable Blender is not in stock');
+    expect(comparison.body.data.products).toHaveLength(2);
+  });
+
+  it('binds warranty and material assertions to the specific retrieved product', async () => {
+    const glass = await seedProduct({
+      slug: 'glass-blender',
+      name: 'Glass Blender',
+      specifications: [
+        { label: 'Jug material', value: 'Borosilicate glass' },
+        { label: 'Warranty', value: 'One year' },
+      ],
+    });
+    const steel = await seedProduct({
+      slug: 'steel-blender',
+      name: 'Steel Blender',
+      specifications: [
+        { label: 'Jug material', value: 'Stainless steel' },
+        { label: 'Warranty', value: 'Two years' },
+      ],
+    });
+    const wrongProductFact = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('cross-product-fact', 'getProductDetails', { identifiers: [String(glass._id), String(steel._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(glass._id), warranty: 'Two years', material: 'Stainless steel' }],
+      }));
+    const rejected = await request(createApp({ chatProvider: wrongProductFact }))
+      .post('/api/ai/chat')
+      .send({ message: 'What are the warranty and material for the glass blender?' });
+    expect(rejected.status).toBe(200);
+    expect(rejected.body.data.assistantMessage).not.toContain('Two years');
+    expect(rejected.body.data.assistantMessage).not.toContain('Stainless steel');
+
+    const correctProductFact = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('correct-product-fact', 'getProductDetails', { identifiers: [String(glass._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(glass._id), warranty: 'One year', material: 'Borosilicate glass' }],
+      }));
+    const accepted = await request(createApp({ chatProvider: correctProductFact }))
+      .post('/api/ai/chat')
+      .send({ message: 'What are the warranty and material for the glass blender?' });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body.data.assistantMessage).toContain('One year');
+    expect(accepted.body.data.assistantMessage).toContain('Borosilicate glass');
+    expect(accepted.body.data.products[0].id).toBe(String(glass._id));
+  });
+
+  it('handles formatted currency amounts without truncating malformed grouping', async () => {
+    const expensive = await seedProduct({ slug: 'formatted-price', name: 'Formatted Price Blender', pricePesewas: 125_000 });
+    for (const formattedBudget of ['GHS 1,250.00', 'GH₵1,250', '1250 cedis']) {
+      const provider = new ScriptedProvider((_input, call) => call === 1
+        ? toolCall(`formatted-${call}`, 'getProductDetails', { identifiers: [String(expensive._id)] })
+        : finalPlan({
+          type: 'product_answer',
+          productClaims: [{
+            productId: String(expensive._id),
+            pricePesewas: 125_000,
+            customerBudgetPesewas: 125_000,
+          }],
+        }));
+      const response = await request(createApp({ chatProvider: provider }))
+        .post('/api/ai/chat')
+        .send({ message: `My budget is ${formattedBudget}.`, context: { productId: String(expensive._id) } });
+      expect(response.status).toBe(200);
+      expect(response.body.data.assistantMessage).toContain('GHS 1,250.00');
+      expect(response.body.data.products[0].price).toBe(1250);
+    }
+
+    const precise = await seedProduct({ slug: 'precise-price', name: 'Precise Price Blender', pricePesewas: 1_999 });
+    const preciseProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('precise-price', 'getProductDetails', { identifiers: [String(precise._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(precise._id), pricePesewas: 1_999, customerBudgetPesewas: 1_999 }],
+      }));
+    const preciseResponse = await request(createApp({ chatProvider: preciseProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'My exact budget is GHS 19.99.', context: { productId: String(precise._id) } });
+    expect(preciseResponse.body.data.assistantMessage).toContain('GHS 19.99');
+
+    const malformedProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('malformed-price', 'getProductDetails', { identifiers: [String(precise._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(precise._id), customerBudgetPesewas: 12_500 }],
+      }));
+    const malformedResponse = await request(createApp({ chatProvider: malformedProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'My budget is GHS 1,25.00.', context: { productId: String(precise._id) } });
+    expect(malformedResponse.status).toBe(200);
+    expect(malformedResponse.body.data.assistantMessage).not.toContain('GHS 125.00');
+    expect(malformedResponse.body.data.products).toEqual([]);
   });
 
   it('rejects unsafe tool arguments and exposes no private-data tool', async () => {
@@ -381,7 +758,7 @@ describe('shopping chat API', () => {
   });
 
   it('isolates conversation history by a server-issued guest session secret', async () => {
-    const provider = new ScriptedProvider(() => finalMessage('Hello! How can I help you shop?'));
+    const provider = new ScriptedProvider(() => finalPlan({ type: 'greeting' }));
     const app = createApp({ chatProvider: provider });
     const initial = await request(app).post('/api/ai/chat').send({ message: 'Hello' });
 

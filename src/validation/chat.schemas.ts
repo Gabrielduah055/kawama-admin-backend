@@ -49,8 +49,79 @@ export const chatRequestSchema = z.object({
 
 export const chatSessionTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/, 'Invalid chat session token.');
 
-export const assistantResponseSchema = z.object({
-  assistantMessage: z.string().trim().min(1).max(2_000),
-  productIds: z.array(objectIdSchema).max(4).default([]),
-  suggestedFollowUps: z.array(z.string().trim().min(1).max(120)).max(3).default([]),
+const productAvailabilitySchema = z.enum(['in_stock', 'low_stock', 'out_of_stock']);
+
+const productClaimSchema = z.object({
+  productId: objectIdSchema,
+  pricePesewas: z.number().int().nonnegative().max(1_000_000_000).optional(),
+  availability: productAvailabilitySchema.optional(),
+  warranty: z.string().trim().min(1).max(500).nullable().optional(),
+  material: z.string().trim().min(1).max(500).nullable().optional(),
+  customerBudgetPesewas: z.number().int().nonnegative().max(1_000_000_000).optional(),
+  includeSummary: z.boolean().optional(),
+  includeSpecifications: z.boolean().optional(),
+}).strict().refine((claim) => Object.keys(claim).some((key) => key !== 'productId'), {
+  message: 'Select at least one fact to include.',
+});
+
+const textPolicyClaimSchema = z.object({
+  topic: z.enum(['delivery', 'payment', 'return']),
+  value: z.string().trim().min(1).max(2_000).nullable(),
 }).strict();
+
+const contactPolicyClaimSchema = z.object({
+  topic: z.literal('contact'),
+  email: z.string().trim().email().nullable(),
+  phone: z.string().trim().max(40).nullable(),
+  whatsappUrl: z.string().trim().url().nullable(),
+}).strict();
+
+const checkoutPolicyClaimSchema = z.object({
+  topic: z.literal('checkout'),
+  productPaymentProvider: z.literal('Paystack'),
+  productPaymentScope: z.literal('products_only'),
+  deliveryPaymentMethod: z.literal('pay_on_delivery'),
+}).strict();
+
+const policyClaimSchema = z.discriminatedUnion('topic', [
+  textPolicyClaimSchema,
+  contactPolicyClaimSchema,
+  checkoutPolicyClaimSchema,
+]);
+
+const productClaimsSchema = z.array(productClaimSchema).min(1).max(4).superRefine((claims, context) => {
+  const seen = new Set<string>();
+  claims.forEach((claim, index) => {
+    if (seen.has(claim.productId)) {
+      context.addIssue({ code: 'custom', path: [index, 'productId'], message: 'Product claims must be unique.' });
+    }
+    seen.add(claim.productId);
+  });
+});
+
+const policyClaimsSchema = z.array(policyClaimSchema).min(1).max(5).superRefine((claims, context) => {
+  const seen = new Set<string>();
+  claims.forEach((claim, index) => {
+    if (seen.has(claim.topic)) {
+      context.addIssue({ code: 'custom', path: [index, 'topic'], message: 'Policy topics must be unique.' });
+    }
+    seen.add(claim.topic);
+  });
+});
+
+export const assistantResponseSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('greeting') }).strict(),
+  z.object({
+    type: z.literal('clarification'),
+    purpose: z.enum(['budget', 'intended_use', 'product', 'category', 'preferences', 'delivery_location']),
+  }).strict(),
+  z.object({ type: z.literal('product_answer'), productClaims: productClaimsSchema }).strict(),
+  z.object({ type: z.literal('policy_answer'), policyClaims: policyClaimsSchema }).strict(),
+  z.object({
+    type: z.literal('mixed_answer'),
+    productClaims: productClaimsSchema,
+    policyClaims: policyClaimsSchema,
+  }).strict(),
+  z.object({ type: z.literal('no_match') }).strict(),
+  z.object({ type: z.literal('unavailable_reference') }).strict(),
+]);

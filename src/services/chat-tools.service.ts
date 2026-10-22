@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import { toPesewas } from '../lib/catalog.js';
 import { getPublicProductsByIdentifiers, searchPublicProducts, type PublicProductSort } from './catalog.service.js';
-import { getApprovedStorePolicies } from './store-policy.service.js';
+import { getApprovedStorePolicies, type StorePolicies } from './store-policy.service.js';
 import {
   getProductDetailsToolSchema,
   getStorePoliciesToolSchema,
@@ -62,9 +63,9 @@ export const shoppingToolDefinitions: ProviderToolDefinition[] = [
 export interface ShoppingToolResult {
   output: Record<string, unknown>;
   products: Array<Record<string, unknown>>;
+  policies?: StorePolicies | undefined;
   evidenceKind?: 'product' | 'policy' | undefined;
   evidenceSource?: 'search' | 'details' | 'policy' | undefined;
-  missingProductIdentifiers?: string[] | undefined;
 }
 
 function invalidToolArguments(error: unknown): ShoppingToolResult {
@@ -80,6 +81,16 @@ function invalidToolArguments(error: unknown): ShoppingToolResult {
 function parseArguments(rawArguments: string): unknown {
   if (rawArguments.length > 10_000) throw new SyntaxError('Tool arguments are too large.');
   return JSON.parse(rawArguments) as unknown;
+}
+
+function withEvidencePrices(products: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return products.map((product) => ({
+    ...product,
+    pricePesewas: toPesewas(Number(product.price)),
+    ...(typeof product.compareAtPrice === 'number'
+      ? { compareAtPricePesewas: toPesewas(product.compareAtPrice) }
+      : {}),
+  }));
 }
 
 export async function executeShoppingTool(name: string, rawArguments: string): Promise<ShoppingToolResult> {
@@ -110,16 +121,17 @@ export async function executeShoppingTool(name: string, rawArguments: string): P
         page: 1,
         limit: input.limit,
       });
+      const products = withEvidencePrices(result.products);
       return {
-        output: { products: result.products, totalMatches: result.total },
-        products: result.products,
+        output: { products, totalMatches: result.total },
+        products,
         evidenceKind: 'product',
         evidenceSource: 'search',
       };
     }
     if (name === 'getProductDetails') {
       const input = getProductDetailsToolSchema.parse(raw);
-      const products = await getPublicProductsByIdentifiers(input.identifiers);
+      const products = withEvidencePrices(await getPublicProductsByIdentifiers(input.identifiers));
       const missingIdentifiers = input.identifiers.filter((identifier) =>
         !products.some((product) => product.id === identifier || product.slug === identifier));
       return {
@@ -127,14 +139,15 @@ export async function executeShoppingTool(name: string, rawArguments: string): P
         products,
         evidenceKind: 'product',
         evidenceSource: 'details',
-        missingProductIdentifiers: missingIdentifiers,
       };
     }
     if (name === 'getStorePolicies') {
       getStorePoliciesToolSchema.parse(raw);
+      const policies = getApprovedStorePolicies();
       return {
-        output: { policies: getApprovedStorePolicies() },
+        output: { policies },
         products: [],
+        policies,
         evidenceKind: 'policy',
         evidenceSource: 'policy',
       };

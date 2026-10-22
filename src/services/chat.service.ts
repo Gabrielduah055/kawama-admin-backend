@@ -1,10 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { getEnvironment } from '../config/environment.js';
 import { AppError } from '../errors/AppError.js';
+import { toPesewas } from '../lib/catalog.js';
 import { ChatConversationModel } from '../models/ChatConversationSchema.js';
 import { getPublicProductsByIdentifiers } from './catalog.service.js';
 import { executeShoppingTool, shoppingToolDefinitions } from './chat-tools.service.js';
 import { openRouterProvider, type ChatProvider, type ProviderMessage } from './openrouter.service.js';
+import type { StorePolicies } from './store-policy.service.js';
 import { assistantResponseSchema, chatRequestSchema } from '../validation/chat.schemas.js';
 import type { z } from 'zod';
 
@@ -15,7 +17,11 @@ const MAX_CONTEXT_MESSAGES = 10;
 const MAX_OUTPUT_TOKENS = 550;
 
 type ChatInput = z.infer<typeof chatRequestSchema>;
-type AssistantResponse = z.infer<typeof assistantResponseSchema>;
+type AssistantPlan = z.infer<typeof assistantResponseSchema>;
+type ProductPlan = Extract<AssistantPlan, { type: 'product_answer' | 'mixed_answer' }>;
+type ProductClaim = ProductPlan['productClaims'][number];
+type PolicyPlan = Extract<AssistantPlan, { type: 'policy_answer' | 'mixed_answer' }>;
+type PolicyClaim = PolicyPlan['policyClaims'][number];
 
 interface PreviousProductReference {
   id: string;
@@ -24,18 +30,17 @@ interface PreviousProductReference {
   available: boolean;
 }
 
-interface EvidenceRequirements {
-  product: boolean;
-  policy: boolean;
-  socialOnly: boolean;
-}
-
 interface EvidenceState {
   productRetrieved: boolean;
   productSearchPerformed: boolean;
-  policyRetrieved: boolean;
   products: Map<string, Record<string, unknown>>;
-  missingProductIdentifiers: Set<string>;
+  policies?: StorePolicies | undefined;
+}
+
+interface RenderedAssistantResponse {
+  assistantMessage: string;
+  productIds: string[];
+  suggestedFollowUps: string[];
 }
 
 export interface ProductCard {
@@ -68,16 +73,6 @@ function newSessionToken(): string {
 function conversationExpiry(): Date {
   const hours = getEnvironment().AI_CHAT_CONVERSATION_TTL_HOURS;
   return new Date(Date.now() + hours * 60 * 60 * 1_000);
-}
-
-function classifyEvidenceRequirements(input: ChatInput): EvidenceRequirements {
-  const normalized = input.message.toLowerCase().trim();
-  const socialOnly = /^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|thanks?|thank\s+you|bye)[!.\s]*$/i.test(normalized);
-  if (socialOnly) return { product: false, policy: false, socialOnly: true };
-
-  const policy = /\b(?:deliver(?:y|ies|ed)?|shipping|payment|paystack|checkout|returns?|refunds?|contact|phone|whatsapp|e-?mail|store\s+location)\b/i.test(normalized);
-  const explicitProduct = Boolean(input.context) || /\b(?:product|item|price|cost|budget|stock|available|availability|warranty|material|size|specification|feature|compare|recommend|cheaper|first|second|third|fourth|one|colour|color|black|white)\b/i.test(normalized);
-  return { product: !policy || explicitProduct, policy, socialOnly: false };
 }
 
 function referencedPosition(message: string): number | undefined {
@@ -121,9 +116,23 @@ ${pageContext}
 
 Resolve references such as "the second one" from that ordered list without renumbering it. Never substitute another product for a position marked unavailable. Explain that an unavailable referenced item is no longer in the public catalogue. If a reference is genuinely ambiguous, ask one clarification. Use getProductDetails with the listed id before answering current facts about an active referenced product.
 
-Your final response must be only one JSON object with exactly these keys:
-{"assistantMessage":"customer-facing reply","productIds":["MongoDB product ids returned by tools"],"suggestedFollowUps":["up to three short questions"]}
-Use only product IDs returned by tools in this request. Do not include markdown fences.`;
+Your final response is a typed plan. Do not write customer-facing prose. Return exactly one of:
+- {"type":"greeting"}
+- {"type":"clarification","purpose":"budget|intended_use|product|category|preferences|delivery_location"}
+- {"type":"product_answer","productClaims":[PRODUCT_CLAIM]}
+- {"type":"policy_answer","policyClaims":[POLICY_CLAIM]}
+- {"type":"mixed_answer","productClaims":[PRODUCT_CLAIM],"policyClaims":[POLICY_CLAIM]}
+- {"type":"no_match"} only after a product lookup returns no product
+- {"type":"unavailable_reference"} only for a positional reference marked unavailable above
+
+A PRODUCT_CLAIM has productId plus at least one selected fact. Copy critical assertions exactly from that product's tool record: pricePesewas (integer), availability (stockLevel), warranty (recorded warranty text or null), and material (recorded material value or null). customerBudgetPesewas is separate from pricePesewas and may be used only for an amount the customer supplied. includeSummary and includeSpecifications are booleans. Never use one product's facts for another product.
+
+A POLICY_CLAIM copies the exact relevant getStorePolicies value, including null when unset:
+- {"topic":"delivery|payment|return","value":"exact configured value or null"}
+- {"topic":"contact","email":"exact value or null","phone":"exact value or null","whatsappUrl":"exact value or null"}
+- {"topic":"checkout","productPaymentProvider":"Paystack","productPaymentScope":"products_only","deliveryPaymentMethod":"pay_on_delivery"}
+
+The backend validates this plan and renders all customer-facing facts. Extra keys and prose fields are invalid. Use only product IDs returned by tools in this request. Do not include markdown fences.`;
 }
 
 function parseAssistantResponse(content: string) {
@@ -144,136 +153,155 @@ function parseAssistantResponse(content: string) {
   return result.data;
 }
 
-function isFactFreeClarification(response: AssistantResponse): boolean {
-  if (response.productIds.length > 0 || !/\?\s*$/.test(response.assistantMessage)) return false;
-  const hasClarificationPurpose = /\b(?:budget|price range|intended use|use it for|product name|which product|category|size preference|colour preference|color preference|feature|requirement|preference|delivery location|what are you shopping for|what do you need|could you clarify)\b/i
-    .test(response.assistantMessage)
-    || /\bwhich\b.*\b(?:one|item|product|mean)\b/i.test(response.assistantMessage);
-  return hasClarificationPurpose
-    && !/(?:https?:\/\/|\b(?:GHS|GH₵|GH¢|cedis?)\b|\d|\b(?:in stock|out of stock|currently available|warranty (?:is|has)|costs?|priced at)\b)/i
-      .test(response.assistantMessage);
+function normalizeEvidenceText(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-function isSafeSocialResponse(response: AssistantResponse): boolean {
-  if (response.productIds.length > 0) return false;
-  return !/(?:https?:\/\/|\b(?:GHS|GH₵|GH¢|cedis?)\b|\d|\b(?:in stock|out of stock|currently available|warranty|costs?|priced at|delivery is|returns? are)\b)/i
-    .test(response.assistantMessage);
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function isNoMatchOrUnavailableResponse(message: string): boolean {
-  return /\b(?:could not find|couldn't find|no matching|not found|not available|unavailable|no longer (?:available|in the public catalogue)|not currently listed)\b/i.test(message);
-}
-
-function extractMoneyAmounts(message: string): number[] {
-  const amounts: number[] = [];
+function extractCustomerAmountsPesewas(message: string): Set<number> {
+  const amounts = new Set<number>();
+  const numberPattern = '(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]{1,2})?';
   const expressions = [
-    /(?:GHS|GH₵|GH¢)\s*([0-9]+(?:\.[0-9]{1,2})?)/gi,
-    /([0-9]+(?:\.[0-9]{1,2})?)\s*(?:cedis?|GHS)/gi,
+    new RegExp(`(?:GHS|GH₵|GH¢)\\s*(${numberPattern})(?![0-9,]|\\.[0-9])`, 'gi'),
+    new RegExp(`(?<![0-9,.])(${numberPattern})(?![0-9,]|\\.[0-9])\\s*(?:cedis?|GHS)\\b`, 'gi'),
   ];
   for (const expression of expressions) {
-    for (const match of message.matchAll(expression)) amounts.push(Number(match[1]));
+    for (const match of message.matchAll(expression)) {
+      const amount = Number(match[1]!.replaceAll(',', ''));
+      try {
+        amounts.add(toPesewas(amount));
+      } catch {
+        // Malformed or overly precise amounts are not evidence for a claim.
+      }
+    }
   }
-  return amounts.filter(Number.isFinite);
+  return amounts;
 }
 
-function amountIsSupported(amount: number, allowed: number[]): boolean {
-  return allowed.some((candidate) => Math.abs(candidate - amount) < 0.001);
+function recordedFactValues(product: Record<string, unknown>, fact: 'warranty' | 'material'): string[] {
+  const values: string[] = [];
+  const specifications = Array.isArray(product.specifications)
+    ? product.specifications as Array<{ label?: unknown; value?: unknown }>
+    : [];
+  for (const specification of specifications) {
+    const label = typeof specification.label === 'string' ? specification.label : '';
+    const value = typeof specification.value === 'string' ? specification.value : '';
+    if (new RegExp(fact, 'i').test(`${label} ${value}`) && value) values.push(value);
+  }
+  const details = Array.isArray(product.details) ? product.details : [];
+  for (const detail of details) {
+    if (typeof detail === 'string' && new RegExp(fact, 'i').test(detail)) values.push(detail);
+  }
+  for (const field of [product.shortDescription, product.description]) {
+    if (typeof field === 'string' && new RegExp(fact, 'i').test(field)) values.push(field);
+  }
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
-function recordedProductText(products: Array<Record<string, unknown>>): string {
-  return products.flatMap((product) => [
-    product.name,
-    product.shortDescription,
-    product.description,
-    ...(Array.isArray(product.details) ? product.details : []),
-    ...(Array.isArray(product.specifications)
-      ? (product.specifications as Array<{ label?: unknown; value?: unknown }>).flatMap((item) => [item.label, item.value])
-      : []),
-  ]).filter((value): value is string => typeof value === 'string').join(' ').toLowerCase();
+function nullableClaimMatches(asserted: string | null, recorded: string[]): boolean {
+  if (asserted === null) return recorded.length === 0;
+  const normalized = normalizeEvidenceText(asserted);
+  return recorded.some((value) => normalizeEvidenceText(value) === normalized);
 }
 
 function productClaimsAreSupported(
   input: ChatInput,
-  response: AssistantResponse,
+  claims: ProductClaim[],
   evidence: EvidenceState,
   previousProducts: PreviousProductReference[],
 ): boolean {
-  if (isFactFreeClarification(response)) return true;
+  if (!evidence.productRetrieved) return false;
   const position = referencedPosition(input.message);
   const referenced = position === undefined ? undefined : previousProducts[position];
-  if (referenced && !referenced.available) {
-    return response.productIds.length === 0 && isNoMatchOrUnavailableResponse(response.assistantMessage);
-  }
-  if (!evidence.productRetrieved) return false;
-  if (evidence.products.size === 0) {
-    return response.productIds.length === 0 && isNoMatchOrUnavailableResponse(response.assistantMessage);
-  }
-  if (response.productIds.length === 0) return false;
-  if (response.productIds.some((id) => !evidence.products.has(id))) return false;
-  if (referenced && !response.productIds.includes(referenced.id)) return false;
+  if (referenced && !referenced.available) return false;
+  if (referenced && !claims.some((claim) => claim.productId === referenced.id)) return false;
+  const customerAmounts = extractCustomerAmountsPesewas(input.message);
 
-  const selectedProducts = response.productIds.map((id) => evidence.products.get(id)!);
-  const allowedAmounts = [
-    ...extractMoneyAmounts(input.message),
-    ...selectedProducts.flatMap((product) => [product.price, product.compareAtPrice])
-      .filter((value): value is number => typeof value === 'number'),
-  ];
-  if (extractMoneyAmounts(response.assistantMessage).some((amount) => !amountIsSupported(amount, allowedAmounts))) {
-    return false;
-  }
+  return claims.every((claim) => {
+    const product = evidence.products.get(claim.productId);
+    if (!product) return false;
+    const pricePesewas = typeof product.pricePesewas === 'number'
+      ? product.pricePesewas
+      : toPesewas(Number(product.price));
+    if (claim.pricePesewas !== undefined && claim.pricePesewas !== pricePesewas) return false;
+    if (claim.availability !== undefined && claim.availability !== product.stockLevel) return false;
+    if (hasOwn(claim, 'warranty') && !nullableClaimMatches(claim.warranty ?? null, recordedFactValues(product, 'warranty'))) {
+      return false;
+    }
+    if (hasOwn(claim, 'material') && !nullableClaimMatches(claim.material ?? null, recordedFactValues(product, 'material'))) {
+      return false;
+    }
+    if (claim.customerBudgetPesewas !== undefined) {
+      if (!customerAmounts.has(claim.customerBudgetPesewas) || pricePesewas > claim.customerBudgetPesewas) return false;
+    }
+    return true;
+  });
+}
 
-  if (/\bwarrant(?:y|ies)\b/i.test(response.assistantMessage)) {
-    const warrantyRecorded = /\bwarrant(?:y|ies)\b/i.test(recordedProductText(selectedProducts));
-    const explicitlyUnknown = /\b(?:not recorded|not listed|cannot confirm|can't confirm|unknown|no (?:warranty )?information)\b/i
-      .test(response.assistantMessage);
-    if (!warrantyRecorded && !explicitlyUnknown) return false;
-  }
-
-  const allInStock = selectedProducts.every((product) => product.inStock === true);
-  const allOutOfStock = selectedProducts.every((product) => product.inStock === false);
-  if (allOutOfStock && /\b(?:in stock|currently available)\b/i.test(response.assistantMessage)) return false;
-  if (allInStock && /\bout of stock\b/i.test(response.assistantMessage)) return false;
-  if (/https?:\/\//i.test(response.assistantMessage)) return false;
-  return true;
+function policyClaimsAreSupported(claims: PolicyClaim[], policies: StorePolicies | undefined): boolean {
+  if (!policies) return false;
+  return claims.every((claim) => {
+    if (claim.topic === 'contact') {
+      return claim.email === policies.contact.email
+        && claim.phone === policies.contact.phone
+        && claim.whatsappUrl === policies.contact.whatsappUrl;
+    }
+    if (claim.topic === 'checkout') {
+      return claim.productPaymentProvider === policies.checkout.productPaymentProvider
+        && claim.productPaymentScope === policies.checkout.productPaymentScope
+        && claim.deliveryPaymentMethod === policies.checkout.deliveryPaymentMethod;
+    }
+    const expected = claim.topic === 'delivery'
+      ? policies.deliveryPolicy
+      : claim.topic === 'payment'
+        ? policies.paymentPolicy
+        : policies.returnPolicy;
+    return claim.value === expected;
+  });
 }
 
 function responseHasRequiredEvidence(
   input: ChatInput,
-  response: AssistantResponse,
-  requirements: EvidenceRequirements,
+  response: AssistantPlan,
   evidence: EvidenceState,
   previousProducts: PreviousProductReference[],
 ): boolean {
-  if (isFactFreeClarification(response)) return true;
-  if (requirements.socialOnly) return isSafeSocialResponse(response);
-  if (requirements.policy && !evidence.policyRetrieved) return false;
-  if (requirements.product && !productClaimsAreSupported(input, response, evidence, previousProducts)) return false;
-  return true;
-}
-
-function groundingCorrection(
-  requirements: EvidenceRequirements,
-  input: ChatInput,
-  previousProducts: PreviousProductReference[],
-): string {
+  if (response.type === 'greeting' || response.type === 'clarification') return true;
   const position = referencedPosition(input.message);
   const referenced = position === undefined ? undefined : previousProducts[position];
-  const instructions = [
-    'Your draft cannot be returned because it lacks current approved evidence.',
-    requirements.product ? 'Call searchProducts or getProductDetails before making any product claim.' : '',
-    requirements.policy ? 'Call getStorePolicies before making any store policy or contact claim.' : '',
+  if (response.type === 'unavailable_reference') return Boolean(referenced && !referenced.available);
+  if (response.type === 'no_match') return evidence.productRetrieved && evidence.products.size === 0;
+  if (response.type === 'product_answer') {
+    return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts);
+  }
+  if (response.type === 'policy_answer') return policyClaimsAreSupported(response.policyClaims, evidence.policies);
+  return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts)
+    && policyClaimsAreSupported(response.policyClaims, evidence.policies);
+}
+
+function groundingCorrection(response: AssistantPlan | undefined, input: ChatInput, previousProducts: PreviousProductReference[]): string {
+  const position = referencedPosition(input.message);
+  const referenced = position === undefined ? undefined : previousProducts[position];
+  const needsProducts = response?.type === 'product_answer' || response?.type === 'mixed_answer' || response?.type === 'no_match';
+  const needsPolicies = response?.type === 'policy_answer' || response?.type === 'mixed_answer';
+  return [
+    response ? 'Your typed plan is not supported by current approved evidence.' : 'Your response did not match the required typed plan.',
+    needsProducts ? 'Use a product tool and copy each selected product assertion exactly into its own product claim.' : '',
+    needsPolicies ? 'Use getStorePolicies and copy each selected policy claim exactly, including null values.' : '',
     referenced?.available ? `The positional reference resolves only to product id ${referenced.id}; do not substitute another product.` : '',
-    referenced && !referenced.available ? `The product at position ${position! + 1} is unavailable. Say so without substituting another product.` : '',
-    'A fact-free greeting or one necessary clarification question may be returned without tools.',
-  ].filter(Boolean);
-  return instructions.join(' ');
+    referenced && !referenced.available ? `The product at position ${position! + 1} is unavailable; return unavailable_reference.` : '',
+    'Do not include customer-facing prose. A clarification may contain only an allowed purpose.',
+  ].filter(Boolean).join(' ');
 }
 
 function safeGroundingFallback(
-  requirements: EvidenceRequirements,
+  response: AssistantPlan | undefined,
   input: ChatInput,
   previousProducts: PreviousProductReference[],
-): AssistantResponse {
+): RenderedAssistantResponse {
   const position = referencedPosition(input.message);
   const referenced = position === undefined ? undefined : previousProducts[position];
   if (referenced && !referenced.available) {
@@ -283,14 +311,7 @@ function safeGroundingFallback(
       suggestedFollowUps: ['Show me an available alternative'],
     };
   }
-  if (requirements.socialOnly) {
-    return {
-      assistantMessage: 'Hello! What are you shopping for today?',
-      productIds: [],
-      suggestedFollowUps: [],
-    };
-  }
-  if (requirements.policy) {
+  if (response?.type === 'policy_answer' || response?.type === 'mixed_answer') {
     return {
       assistantMessage: 'I could not verify the approved store information needed to answer that. Please try again shortly.',
       productIds: [],
@@ -301,6 +322,162 @@ function safeGroundingFallback(
     assistantMessage: 'I could not verify current catalogue information for that answer. Which product or main feature should I check?',
     productIds: [],
     suggestedFollowUps: [],
+  };
+}
+
+function formatGhs(pesewas: number): string {
+  return `GHS ${(pesewas / 100).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function renderClarification(purpose: Extract<AssistantPlan, { type: 'clarification' }>['purpose']): string {
+  const prompts: Record<typeof purpose, string> = {
+    budget: 'What budget would you like to stay within?',
+    intended_use: 'What would you mainly like to use the product for?',
+    product: 'Which product do you mean?',
+    category: 'Which product category are you interested in?',
+    preferences: 'Which features or preferences matter most to you?',
+    delivery_location: 'Which delivery location should I consider?',
+  };
+  return prompts[purpose];
+}
+
+function renderProductClaim(claim: ProductClaim, product: Record<string, unknown>): string {
+  const name = String(product.name);
+  const pricePesewas = typeof product.pricePesewas === 'number'
+    ? product.pricePesewas
+    : toPesewas(Number(product.price));
+  const parts: string[] = [];
+  if (claim.includeSummary && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
+    parts.push(product.shortDescription.trim());
+  }
+  if (claim.pricePesewas !== undefined && claim.customerBudgetPesewas !== undefined) {
+    parts.push(`${name} costs ${formatGhs(pricePesewas)} and fits your ${formatGhs(claim.customerBudgetPesewas)} budget.`);
+  } else if (claim.pricePesewas !== undefined) {
+    parts.push(`${name} costs ${formatGhs(pricePesewas)}.`);
+  } else if (claim.customerBudgetPesewas !== undefined) {
+    parts.push(`At ${formatGhs(pricePesewas)}, ${name} fits your ${formatGhs(claim.customerBudgetPesewas)} budget.`);
+  }
+  if (claim.availability !== undefined) {
+    const availability = product.stockLevel === 'out_of_stock'
+      ? 'is not in stock (out of stock).'
+      : product.stockLevel === 'low_stock'
+        ? 'is in stock, but stock is low.'
+        : 'is in stock.';
+    parts.push(`${name} ${availability}`);
+  }
+  if (hasOwn(claim, 'warranty')) {
+    const values = recordedFactValues(product, 'warranty');
+    parts.push(values.length > 0
+      ? `${name} warranty: ${values.join('; ')}.`
+      : `Warranty information is not recorded for ${name}, so I cannot confirm one.`);
+  }
+  if (hasOwn(claim, 'material')) {
+    const values = recordedFactValues(product, 'material');
+    parts.push(values.length > 0
+      ? `${name} material: ${values.join('; ')}.`
+      : `Material information is not recorded for ${name}, so I cannot confirm it.`);
+  }
+  if (claim.includeSpecifications) {
+    const specifications = Array.isArray(product.specifications)
+      ? product.specifications as Array<{ label?: unknown; value?: unknown }>
+      : [];
+    const rendered = specifications.flatMap((specification) =>
+      typeof specification.label === 'string' && typeof specification.value === 'string'
+        ? [`${specification.label}: ${specification.value}`]
+        : []);
+    parts.push(rendered.length > 0
+      ? `${name} specifications: ${rendered.join('; ')}.`
+      : `No specifications are recorded for ${name}.`);
+  }
+  return parts.join(' ');
+}
+
+function renderPolicyClaim(claim: PolicyClaim, policies: StorePolicies): string {
+  if (claim.topic === 'return') {
+    return policies.returnPolicy
+      ? `Return policy: ${policies.returnPolicy}`
+      : 'Kawama has not published a return policy, so I cannot confirm return terms.';
+  }
+  if (claim.topic === 'delivery') {
+    return policies.deliveryPolicy
+      ? `Delivery policy: ${policies.deliveryPolicy}`
+      : 'Kawama has not published a delivery policy, so I cannot confirm delivery terms. Delivery charges are collected separately on delivery.';
+  }
+  if (claim.topic === 'payment') {
+    return policies.paymentPolicy
+      ? `Payment policy: ${policies.paymentPolicy}`
+      : 'Product payments are processed by Paystack. Kawama has not published further payment-method details, so I cannot confirm Mobile Money availability.';
+  }
+  if (claim.topic === 'contact') {
+    const methods = [
+      policies.contact.email ? `email ${policies.contact.email}` : '',
+      policies.contact.phone ? `phone ${policies.contact.phone}` : '',
+      policies.contact.whatsappUrl ? `WhatsApp ${policies.contact.whatsappUrl}` : '',
+    ].filter(Boolean);
+    return methods.length > 0
+      ? `You can reach Kawama by ${methods.join(', ')}.`
+      : 'Kawama has not published customer contact details, so I cannot confirm a contact channel.';
+  }
+  return 'Product payments are processed by Paystack. Product payment covers products only, and delivery is paid separately on delivery.';
+}
+
+function selectedProductIds(response: AssistantPlan): string[] {
+  if (response.type !== 'product_answer' && response.type !== 'mixed_answer') return [];
+  return response.productClaims.map((claim) => claim.productId);
+}
+
+function renderAssistantPlan(
+  response: AssistantPlan,
+  products: Array<Record<string, unknown>>,
+  policies: StorePolicies | undefined,
+  input: ChatInput,
+  previousProducts: PreviousProductReference[],
+): RenderedAssistantResponse {
+  if (response.type === 'greeting') {
+    return { assistantMessage: 'Hello! What are you shopping for today?', productIds: [], suggestedFollowUps: [] };
+  }
+  if (response.type === 'clarification') {
+    return { assistantMessage: renderClarification(response.purpose), productIds: [], suggestedFollowUps: [] };
+  }
+  if (response.type === 'no_match') {
+    return {
+      assistantMessage: 'I could not find a matching product in the current public catalogue. Would you like to adjust the budget, category, or preferred features?',
+      productIds: [],
+      suggestedFollowUps: ['Try a different budget', 'Try another category'],
+    };
+  }
+  if (response.type === 'unavailable_reference') {
+    const position = referencedPosition(input.message);
+    const referenced = position === undefined ? undefined : previousProducts[position];
+    return {
+      assistantMessage: `${referenced?.name ?? 'That product'} is no longer available in the public catalogue. Would you like an available alternative?`,
+      productIds: [],
+      suggestedFollowUps: ['Show me an available alternative'],
+    };
+  }
+
+  const productById = new Map(products.map((product) => [String(product.id), product]));
+  const productClaims = response.type === 'product_answer' || response.type === 'mixed_answer'
+    ? response.productClaims
+    : [];
+  const productMessages = productClaims.flatMap((claim) => {
+    const product = productById.get(claim.productId);
+    return product ? [renderProductClaim(claim, product)] : [];
+  }).filter(Boolean);
+  const policyClaims = response.type === 'policy_answer' || response.type === 'mixed_answer'
+    ? response.policyClaims
+    : [];
+  const policyMessages = policies ? policyClaims.map((claim) => renderPolicyClaim(claim, policies)) : [];
+  const assistantMessage = [...productMessages, ...policyMessages].join(' ');
+  if (!assistantMessage) return safeGroundingFallback(response, input, previousProducts);
+  const productIds = productClaims.map((claim) => claim.productId).filter((id) => productById.has(id));
+  return {
+    assistantMessage,
+    productIds,
+    suggestedFollowUps: productIds.length > 1 ? ['Would you like a closer comparison?'] : [],
   };
 }
 
@@ -379,7 +556,6 @@ export async function runShoppingChat(
   }
 
   const previousProducts = await loadPreviousProductReferences(conversation as Record<string, any> | null);
-  const requirements = classifyEvidenceRequirements(input);
   const history: ProviderMessage[] = (conversation?.messages ?? []).slice(-MAX_CONTEXT_MESSAGES).map(
     (message: { role: 'user' | 'assistant'; content: string }) => ({ role: message.role, content: message.content }),
   );
@@ -392,13 +568,13 @@ export async function runShoppingChat(
   const evidence: EvidenceState = {
     productRetrieved: false,
     productSearchPerformed: false,
-    policyRetrieved: false,
     products: new Map<string, Record<string, unknown>>(),
-    missingProductIdentifiers: new Set<string>(),
   };
   let toolExecutions = 0;
   let groundingCorrections = 0;
-  let finalResponse: AssistantResponse | undefined;
+  let finalPlan: AssistantPlan | undefined;
+  let rejectedPlan: AssistantPlan | undefined;
+  let fallbackResponse: RenderedAssistantResponse | undefined;
 
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
     const assistant = await provider.complete({ messages, tools: shoppingToolDefinitions, maxTokens: MAX_OUTPUT_TOKENS });
@@ -407,20 +583,33 @@ export async function runShoppingChat(
       if (!assistant.content) {
         throw new AppError(502, 'AI_PROVIDER_EMPTY_RESPONSE', 'The shopping assistant returned an empty response.');
       }
-      const candidate = parseAssistantResponse(assistant.content);
-      if (responseHasRequiredEvidence(input, candidate, requirements, evidence, previousProducts)) {
-        finalResponse = candidate;
+      let candidate: AssistantPlan;
+      try {
+        candidate = parseAssistantResponse(assistant.content);
+      } catch (error) {
+        if (!(error instanceof AppError) || error.code !== 'AI_PROVIDER_INVALID_RESPONSE') throw error;
+        if (groundingCorrections < 1 && modelCall + 1 < MAX_MODEL_CALLS) {
+          groundingCorrections += 1;
+          messages.push({ role: 'system', content: groundingCorrection(undefined, input, previousProducts) });
+          continue;
+        }
+        fallbackResponse = safeGroundingFallback(undefined, input, previousProducts);
         break;
       }
+      if (responseHasRequiredEvidence(input, candidate, evidence, previousProducts)) {
+        finalPlan = candidate;
+        break;
+      }
+      rejectedPlan = candidate;
       if (groundingCorrections < 1 && modelCall + 1 < MAX_MODEL_CALLS) {
         groundingCorrections += 1;
         messages.push({
           role: 'system',
-          content: groundingCorrection(requirements, input, previousProducts),
+          content: groundingCorrection(candidate, input, previousProducts),
         });
         continue;
       }
-      finalResponse = safeGroundingFallback(requirements, input, previousProducts);
+      fallbackResponse = safeGroundingFallback(candidate, input, previousProducts);
       break;
     }
     if (toolExecutions + toolCalls.length > MAX_TOOL_EXECUTIONS) {
@@ -432,9 +621,8 @@ export async function runShoppingChat(
       const result = await executeShoppingTool(toolCall.function.name, toolCall.function.arguments);
       if (result.evidenceKind === 'product') evidence.productRetrieved = true;
       if (result.evidenceSource === 'search') evidence.productSearchPerformed = true;
-      if (result.evidenceKind === 'policy') evidence.policyRetrieved = true;
+      if (result.policies) evidence.policies = result.policies;
       result.products.forEach((product) => evidence.products.set(String(product.id), product));
-      result.missingProductIdentifiers?.forEach((identifier) => evidence.missingProductIdentifiers.add(identifier));
       messages.push({
         role: 'tool',
         content: JSON.stringify(result.output),
@@ -444,14 +632,20 @@ export async function runShoppingChat(
     }
   }
 
-  if (!finalResponse && groundingCorrections > 0) {
-    finalResponse = safeGroundingFallback(requirements, input, previousProducts);
+  if (!finalPlan && !fallbackResponse && groundingCorrections > 0) {
+    fallbackResponse = safeGroundingFallback(rejectedPlan, input, previousProducts);
   }
-  if (!finalResponse) throw new AppError(502, 'AI_MODEL_CALL_LIMIT', 'The shopping assistant could not finish within the allowed steps.');
+  if (!finalPlan && !fallbackResponse) {
+    throw new AppError(502, 'AI_MODEL_CALL_LIMIT', 'The shopping assistant could not finish within the allowed steps.');
+  }
 
-  const requestedIds = finalResponse.productIds.filter((id) => evidence.products.has(id));
+  const requestedIds = finalPlan
+    ? selectedProductIds(finalPlan).filter((id) => evidence.products.has(id))
+    : fallbackResponse?.productIds ?? [];
   const selectedIds = requestedIds.slice(0, 4);
   const canonicalProducts = selectedIds.length > 0 ? await getPublicProductsByIdentifiers(selectedIds) : [];
+  const finalResponse = fallbackResponse
+    ?? renderAssistantPlan(finalPlan!, canonicalProducts, evidence.policies, input, previousProducts);
   const cards = canonicalProducts.map(toProductCard);
   const shouldReplaceShownProducts = cards.length > 0 && (evidence.productSearchPerformed || previousProducts.length === 0);
   const retainedProducts = shouldReplaceShownProducts
