@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import mongoose, { type Model } from 'mongoose';
+import { CHAT_MESSAGE_MAX_LENGTH } from '../lib/chat.js';
 
 const { Schema, model, models } = mongoose;
 
 const chatMessageSchema = new Schema(
   {
     role: { type: String, enum: ['user', 'assistant'], required: true },
-    content: { type: String, required: true, maxlength: 2_000 },
+    content: { type: String, required: true, maxlength: CHAT_MESSAGE_MAX_LENGTH },
     createdAt: { type: Date, required: true, default: Date.now },
   },
   { _id: false },
@@ -21,6 +22,13 @@ const shownProductReferenceSchema = new Schema(
   { _id: false },
 );
 
+const shoppingPreferencesSchema = new Schema(
+  {
+    budgetPesewas: { type: Number, min: 0, max: 1_000_000_000 },
+  },
+  { _id: false },
+);
+
 const chatConversationSchema = new Schema(
   {
     _id: { type: String, default: randomUUID },
@@ -30,6 +38,7 @@ const chatConversationSchema = new Schema(
     // Kept for conversations created by the first chatbot release. New writes
     // also retain this field while readers prefer the positional snapshots.
     lastShownProductIds: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
+    shoppingPreferences: { type: shoppingPreferencesSchema, default: () => ({}) },
     expiresAt: { type: Date, required: true },
   },
   { timestamps: true, versionKey: false },

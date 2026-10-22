@@ -6,6 +6,7 @@ import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import { DEFAULT_OPENROUTER_MODEL, resetEnvironmentForTests } from '../src/config/environment.js';
+import { CHAT_MESSAGE_MAX_LENGTH, CHAT_MORE_INFORMATION_NOTICE } from '../src/lib/chat.js';
 import { CategoryModel } from '../src/models/CategorySchema.js';
 import { ChatConversationModel } from '../src/models/ChatConversationSchema.js';
 import { ProductModel } from '../src/models/ProductSchema.js';
@@ -664,6 +665,233 @@ describe('shopping chat API', () => {
     expect(malformedResponse.status).toBe(200);
     expect(malformedResponse.body.data.assistantMessage).not.toContain('GHS 125.00');
     expect(malformedResponse.body.data.products).toEqual([]);
+  });
+
+  it('bounds rendered specification answers before new and follow-up persistence', async () => {
+    const maximumSpecifications = Array.from({ length: 10 }, (_, index) => ({
+      label: `Specification ${index + 1}`,
+      value: `${String(index + 1).padStart(2, '0')} ${'x'.repeat(197)}`,
+    }));
+    const first = await seedProduct({
+      slug: 'maximum-specifications-one',
+      name: 'Maximum Specifications One',
+      specifications: maximumSpecifications,
+    });
+    const second = await seedProduct({
+      slug: 'maximum-specifications-two',
+      name: 'Maximum Specifications Two',
+      specifications: maximumSpecifications.map((item) => ({ ...item, value: item.value.replaceAll('x', 'y') })),
+    });
+    const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const hasToolResult = input.messages.some((message) => message.role === 'tool');
+      const identifiers = userMessage.includes('both') ? [String(first._id), String(second._id)] : [String(first._id)];
+      if (!hasToolResult) return toolCall(`long-${identifiers.length}`, 'getProductDetails', { identifiers });
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: identifiers.map((productId) => ({ productId, includeSpecifications: true })),
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'Show every recorded specification.' });
+    expect(initial.status).toBe(200);
+    expect(initial.body.data.assistantMessage.length).toBeLessThanOrEqual(CHAT_MESSAGE_MAX_LENGTH);
+    expect(initial.body.data.assistantMessage).toContain(CHAT_MORE_INFORMATION_NOTICE);
+    expect(initial.body.data.products).toHaveLength(1);
+    let stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.messages.every((message: { content: string }) => message.content.length <= CHAT_MESSAGE_MAX_LENGTH)).toBe(true);
+
+    const followUp = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Now show every recorded specification for both products.' });
+    expect(followUp.status).toBe(200);
+    expect(followUp.body.data.assistantMessage.length).toBeLessThanOrEqual(CHAT_MESSAGE_MAX_LENGTH);
+    expect(followUp.body.data.assistantMessage).toContain(CHAT_MORE_INFORMATION_NOTICE);
+    expect(followUp.body.data.products).toHaveLength(2);
+    stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.messages).toHaveLength(4);
+    expect(stored?.messages.every((message: { content: string }) => message.content.length <= CHAT_MESSAGE_MAX_LENGTH)).toBe(true);
+  });
+
+  it('renders only validated indexed details and description sections', async () => {
+    const careProduct = await seedProduct({
+      slug: 'care-only-details',
+      name: 'Care Details Blender',
+      details: ['Wash the jug by hand only.', 'Never immerse the motor base.'],
+      description: 'A countertop blender.',
+    });
+    const careProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('care-details', 'getProductDetails', { identifiers: [String(careProduct._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(careProduct._id), detailIndexes: [0, 1] }],
+      }));
+    const care = await request(createApp({ chatProvider: careProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'How should I care for this blender?', context: { productId: String(careProduct._id) } });
+    expect(care.status).toBe(200);
+    expect(care.body.data.assistantMessage).toContain('Wash the jug by hand only.');
+    expect(care.body.data.assistantMessage).toContain('Never immerse the motor base.');
+
+    const descriptionProduct = await seedProduct({
+      slug: 'description-only-care',
+      name: 'Description Care Blender',
+      details: [],
+      description: 'Designed for everyday blending. Wipe the housing with a dry cloth only. Store with the lid removed.',
+    });
+    const descriptionProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('description-section', 'getProductDetails', { identifiers: [String(descriptionProduct._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(descriptionProduct._id), descriptionSectionIndexes: [1] }],
+      }));
+    const description = await request(createApp({ chatProvider: descriptionProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'How do I clean the housing?', context: { productId: String(descriptionProduct._id) } });
+    expect(description.status).toBe(200);
+    expect(description.body.data.assistantMessage).toContain('Wipe the housing with a dry cloth only.');
+    expect(description.body.data.assistantMessage).not.toContain('Designed for everyday blending.');
+    expect(description.body.data.assistantMessage).not.toContain('Store with the lid removed.');
+
+    const invalidReferenceProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('invalid-detail-index', 'getProductDetails', { identifiers: [String(careProduct._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(careProduct._id), detailIndexes: [99] }],
+      }));
+    const invalidReference = await request(createApp({ chatProvider: invalidReferenceProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Give me care detail 100.', context: { productId: String(careProduct._id) } });
+    expect(invalidReference.status).toBe(200);
+    expect(invalidReference.body.data.assistantMessage).toContain('could not verify current catalogue information');
+    expect(invalidReference.body.data.products).toEqual([]);
+  });
+
+  it('persists, replaces, removes, and isolates active customer budgets', async () => {
+    const original = await seedProduct({ slug: 'budget-original', name: 'Budget Original', pricePesewas: 35_000 });
+    const cheaper = await seedProduct({ slug: 'budget-cheaper', name: 'Budget Cheaper', pricePesewas: 25_000 });
+    const updated = await seedProduct({ slug: 'budget-updated', name: 'Budget Updated', pricePesewas: 30_000 });
+    const provider = new ScriptedProvider((input) => {
+      const message = [...input.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+      const hasToolResult = input.messages.some((item) => item.role === 'tool');
+      const isInitial = message.includes('GH₵400');
+      const isCheaper = message.includes('cheaper');
+      const isUpdate = message.includes('GH₵300');
+      const isRemove = message.includes('Remove');
+      const product = isInitial ? original : isCheaper ? cheaper : updated;
+      if (!hasToolResult) return toolCall(`preference-${message.length}`, 'getProductDetails', { identifiers: [String(product._id)] });
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: [{
+          productId: String(product._id),
+          pricePesewas: Number(product.pricePesewas),
+          ...(!isRemove ? { customerBudgetPesewas: isInitial || isCheaper ? 40_000 : 30_000 } : {}),
+        }],
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'My budget is GH₵400. Show me a blender.' });
+    expect(initial.status).toBe(200);
+    let stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBe(40_000);
+
+    const cheaperResponse = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Show me a cheaper one.' });
+    expect(cheaperResponse.status).toBe(200);
+    expect(cheaperResponse.body.data.assistantMessage).toContain('GHS 400.00 budget');
+
+    const updatedResponse = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Change my budget to GH₵300.' });
+    expect(updatedResponse.status).toBe(200);
+    stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBe(30_000);
+
+    const removedResponse = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Remove my budget constraint.' });
+    expect(removedResponse.status).toBe(200);
+    stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.shoppingPreferences?.budgetPesewas).toBeUndefined();
+
+    const staleBudgetResponse = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Show me another blender.' });
+    expect(staleBudgetResponse.status).toBe(200);
+    expect(staleBudgetResponse.body.data.assistantMessage).toContain('could not verify current catalogue information');
+    expect(staleBudgetResponse.body.data.products).toEqual([]);
+
+    const isolatedProvider = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('isolated-budget', 'getProductDetails', { identifiers: [String(cheaper._id)] })
+      : finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(cheaper._id), customerBudgetPesewas: 40_000 }],
+      }));
+    const isolated = await request(createApp({ chatProvider: isolatedProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Show me a cheaper blender.' });
+    expect(isolated.status).toBe(200);
+    expect(isolated.body.data.assistantMessage).toContain('could not verify current catalogue information');
+    expect(isolated.body.data.products).toEqual([]);
+  });
+
+  it('revalidates price, archive status, and availability against the final canonical snapshot', async () => {
+    const repriced = await seedProduct({ slug: 'mid-request-repriced', name: 'Mid-request Repriced', pricePesewas: 35_000 });
+    const repricedProvider = new ScriptedProvider(async (_input, call) => {
+      if (call === 1) return toolCall('repriced', 'getProductDetails', { identifiers: [String(repriced._id)] });
+      await ProductModel.findByIdAndUpdate(repriced._id, { pricePesewas: 45_000 });
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(repriced._id), pricePesewas: 35_000, customerBudgetPesewas: 40_000 }],
+      });
+    });
+    const repricedResponse = await request(createApp({ chatProvider: repricedProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'My budget is GHS 400. Is this a good option?', context: { productId: String(repriced._id) } });
+    expect(repricedResponse.status).toBe(200);
+    expect(repricedResponse.body.data.assistantMessage).toContain('product information changed');
+    expect(repricedResponse.body.data.assistantMessage).not.toContain('fits your GHS 400.00 budget');
+    expect(repricedResponse.body.data.products).toEqual([]);
+
+    const archived = await seedProduct({ slug: 'mid-request-archived', name: 'Mid-request Archived' });
+    const archivedProvider = new ScriptedProvider(async (_input, call) => {
+      if (call === 1) return toolCall('archived', 'getProductDetails', { identifiers: [String(archived._id)] });
+      await ProductModel.findByIdAndUpdate(archived._id, { status: 'archived' });
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(archived._id), availability: 'in_stock' }],
+      });
+    });
+    const archivedResponse = await request(createApp({ chatProvider: archivedProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Is this still available?', context: { productId: String(archived._id) } });
+    expect(archivedResponse.status).toBe(200);
+    expect(archivedResponse.body.data.assistantMessage).toContain('product information changed');
+    expect(archivedResponse.body.data.products).toEqual([]);
+
+    const unavailable = await seedProduct({ slug: 'mid-request-unavailable', name: 'Mid-request Unavailable', stockQuantity: 5 });
+    const unavailableProvider = new ScriptedProvider(async (_input, call) => {
+      if (call === 1) return toolCall('unavailable', 'getProductDetails', { identifiers: [String(unavailable._id)] });
+      await ProductModel.findByIdAndUpdate(unavailable._id, { stockQuantity: 0 });
+      return finalPlan({
+        type: 'product_answer',
+        productClaims: [{ productId: String(unavailable._id), availability: 'in_stock' }],
+      });
+    });
+    const unavailableResponse = await request(createApp({ chatProvider: unavailableProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Is this in stock?', context: { productId: String(unavailable._id) } });
+    expect(unavailableResponse.status).toBe(200);
+    expect(unavailableResponse.body.data.assistantMessage).toContain('product information changed');
+    expect(unavailableResponse.body.data.products).toEqual([]);
   });
 
   it('rejects unsafe tool arguments and exposes no private-data tool', async () => {

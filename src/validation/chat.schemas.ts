@@ -50,6 +50,8 @@ export const chatRequestSchema = z.object({
 export const chatSessionTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/, 'Invalid chat session token.');
 
 const productAvailabilitySchema = z.enum(['in_stock', 'low_stock', 'out_of_stock']);
+const contentReferenceIndexesSchema = z.array(z.number().int().min(0).max(999)).min(1).max(6)
+  .refine((indexes) => new Set(indexes).size === indexes.length, { message: 'Content indexes must be unique.' });
 
 const productClaimSchema = z.object({
   productId: objectIdSchema,
@@ -60,7 +62,11 @@ const productClaimSchema = z.object({
   customerBudgetPesewas: z.number().int().nonnegative().max(1_000_000_000).optional(),
   includeSummary: z.boolean().optional(),
   includeSpecifications: z.boolean().optional(),
-}).strict().refine((claim) => Object.keys(claim).some((key) => key !== 'productId'), {
+  specificationIndexes: contentReferenceIndexesSchema.optional(),
+  detailIndexes: contentReferenceIndexesSchema.optional(),
+  descriptionSectionIndexes: contentReferenceIndexesSchema.optional(),
+}).strict().refine((claim) => Object.entries(claim).some(([key, value]) =>
+  key !== 'productId' && value !== undefined && value !== false), {
   message: 'Select at least one fact to include.',
 });
 

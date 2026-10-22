@@ -2,6 +2,13 @@ import { createHash, randomBytes } from 'node:crypto';
 import { getEnvironment } from '../config/environment.js';
 import { AppError } from '../errors/AppError.js';
 import { toPesewas } from '../lib/catalog.js';
+import {
+  CHAT_MESSAGE_MAX_LENGTH,
+  CHAT_STORED_MESSAGE_LIMIT,
+  composeChatResponse,
+  descriptionSections,
+  isValidStoredChatMessage,
+} from '../lib/chat.js';
 import { ChatConversationModel } from '../models/ChatConversationSchema.js';
 import { getPublicProductsByIdentifiers } from './catalog.service.js';
 import { executeShoppingTool, shoppingToolDefinitions } from './chat-tools.service.js';
@@ -12,7 +19,6 @@ import type { z } from 'zod';
 
 const MAX_MODEL_CALLS = 4;
 const MAX_TOOL_EXECUTIONS = 6;
-const MAX_STORED_MESSAGES = 12;
 const MAX_CONTEXT_MESSAGES = 10;
 const MAX_OUTPUT_TOKENS = 550;
 
@@ -35,6 +41,10 @@ interface EvidenceState {
   productSearchPerformed: boolean;
   products: Map<string, Record<string, unknown>>;
   policies?: StorePolicies | undefined;
+}
+
+interface ShoppingPreferences {
+  budgetPesewas?: number | undefined;
 }
 
 interface RenderedAssistantResponse {
@@ -86,7 +96,11 @@ function referencedPosition(message: string): number | undefined {
   return references.find(([expression]) => expression.test(normalized))?.[1];
 }
 
-function buildSystemPrompt(previousProducts: PreviousProductReference[], context: ChatInput['context']): string {
+function buildSystemPrompt(
+  previousProducts: PreviousProductReference[],
+  context: ChatInput['context'],
+  preferences: ShoppingPreferences,
+): string {
   const previous = previousProducts.length > 0
     ? previousProducts.map((product, index) => {
       const slug = product.slug ? `, slug: ${product.slug}` : '';
@@ -96,6 +110,9 @@ function buildSystemPrompt(previousProducts: PreviousProductReference[], context
   const pageContext = context
     ? `The customer is currently viewing: ${context.productId ? `product id ${context.productId}` : `product slug ${context.productSlug}`}.`
     : 'No current product page was supplied.';
+  const preferenceContext = preferences.budgetPesewas === undefined
+    ? 'No active customer budget is stored.'
+    : `The active customer budget is ${preferences.budgetPesewas} pesewas.`;
   return `You are Kawama's friendly shopping assistant. Be concise, practical, and focused on shopping.
 
 Grounding and safety rules:
@@ -113,6 +130,7 @@ Grounding and safety rules:
 Previously shown products, in their original order:
 ${previous}
 ${pageContext}
+${preferenceContext}
 
 Resolve references such as "the second one" from that ordered list without renumbering it. Never substitute another product for a position marked unavailable. Explain that an unavailable referenced item is no longer in the public catalogue. If a reference is genuinely ambiguous, ask one clarification. Use getProductDetails with the listed id before answering current facts about an active referenced product.
 
@@ -125,7 +143,7 @@ Your final response is a typed plan. Do not write customer-facing prose. Return 
 - {"type":"no_match"} only after a product lookup returns no product
 - {"type":"unavailable_reference"} only for a positional reference marked unavailable above
 
-A PRODUCT_CLAIM has productId plus at least one selected fact. Copy critical assertions exactly from that product's tool record: pricePesewas (integer), availability (stockLevel), warranty (recorded warranty text or null), and material (recorded material value or null). customerBudgetPesewas is separate from pricePesewas and may be used only for an amount the customer supplied. includeSummary and includeSpecifications are booleans. Never use one product's facts for another product.
+A PRODUCT_CLAIM has productId plus at least one selected fact. Copy critical assertions exactly from that product's tool record: pricePesewas (integer), availability (stockLevel), warranty (recorded warranty text or null), and material (recorded material value or null). customerBudgetPesewas is separate from pricePesewas and may be used only for the active customer budget supplied in this conversation. Use specificationIndexes, detailIndexes, or descriptionSectionIndexes to select only relevant recorded content by its zero-based index; includeSummary and includeSpecifications are booleans, but prefer indexed facts over dumping every specification. Never use one product's facts for another product.
 
 A POLICY_CLAIM copies the exact relevant getStorePolicies value, including null when unset:
 - {"topic":"delivery|payment|return","value":"exact configured value or null"}
@@ -181,6 +199,65 @@ function extractCustomerAmountsPesewas(message: string): Set<number> {
   return amounts;
 }
 
+function resolveShoppingPreferences(
+  stored: ShoppingPreferences | undefined,
+  message: string,
+): ShoppingPreferences {
+  const removesBudget = /(?:\b(?:remove|clear|drop|forget|ignore)\b.{0,30}\bbudget\b|\b(?:no|without)\s+(?:a\s+)?budget\b|\bany\s+price\b|\bprice\s+(?:does\s+not|doesn't)\s+matter\b)/i.test(message);
+  if (removesBudget) return {};
+
+  const amounts = [...extractCustomerAmountsPesewas(message)];
+  const declaresBudget = /\b(?:budget|under|below|up\s+to|no\s+more\s+than|maximum|max|spend|afford)\b/i.test(message);
+  if (declaresBudget && amounts.length > 0) return { budgetPesewas: amounts.at(-1)! };
+  return stored?.budgetPesewas === undefined ? {} : { budgetPesewas: stored.budgetPesewas };
+}
+
+function productDescriptionSections(product: Record<string, unknown>): string[] {
+  if (Array.isArray(product.descriptionSections)) {
+    return product.descriptionSections.filter((value): value is string => typeof value === 'string');
+  }
+  return descriptionSections(typeof product.description === 'string' ? product.description : '');
+}
+
+function specificationAt(product: Record<string, unknown>, index: number): { label: string; value: string } | undefined {
+  if (!Array.isArray(product.specifications)) return undefined;
+  const specification = product.specifications[index] as { label?: unknown; value?: unknown } | undefined;
+  return specification && typeof specification.label === 'string' && typeof specification.value === 'string'
+    ? { label: specification.label, value: specification.value }
+    : undefined;
+}
+
+function detailAt(product: Record<string, unknown>, index: number): string | undefined {
+  if (!Array.isArray(product.details)) return undefined;
+  const detail = product.details[index];
+  return typeof detail === 'string' ? detail : undefined;
+}
+
+function referencedContentIsValid(claim: ProductClaim, product: Record<string, unknown>): boolean {
+  if (claim.specificationIndexes?.some((index) => !specificationAt(product, index))) return false;
+  if (claim.detailIndexes?.some((index) => detailAt(product, index) === undefined)) return false;
+  const sections = productDescriptionSections(product);
+  if (claim.descriptionSectionIndexes?.some((index) => sections[index] === undefined)) return false;
+  return true;
+}
+
+function referencedContentIsUnchanged(
+  claim: ProductClaim,
+  baseline: Record<string, unknown>,
+  current: Record<string, unknown>,
+): boolean {
+  if (claim.includeSummary && baseline.shortDescription !== current.shortDescription) return false;
+  if (claim.includeSpecifications
+    && JSON.stringify(baseline.specifications ?? []) !== JSON.stringify(current.specifications ?? [])) return false;
+  if (claim.specificationIndexes?.some((index) =>
+    JSON.stringify(specificationAt(baseline, index)) !== JSON.stringify(specificationAt(current, index)))) return false;
+  if (claim.detailIndexes?.some((index) => detailAt(baseline, index) !== detailAt(current, index))) return false;
+  const baselineSections = productDescriptionSections(baseline);
+  const currentSections = productDescriptionSections(current);
+  if (claim.descriptionSectionIndexes?.some((index) => baselineSections[index] !== currentSections[index])) return false;
+  return true;
+}
+
 function recordedFactValues(product: Record<string, unknown>, fact: 'warranty' | 'material'): string[] {
   const values: string[] = [];
   const specifications = Array.isArray(product.specifications)
@@ -212,17 +289,21 @@ function productClaimsAreSupported(
   claims: ProductClaim[],
   evidence: EvidenceState,
   previousProducts: PreviousProductReference[],
+  preferences: ShoppingPreferences,
+  baselineProducts?: Map<string, Record<string, unknown>>,
 ): boolean {
   if (!evidence.productRetrieved) return false;
   const position = referencedPosition(input.message);
   const referenced = position === undefined ? undefined : previousProducts[position];
   if (referenced && !referenced.available) return false;
   if (referenced && !claims.some((claim) => claim.productId === referenced.id)) return false;
-  const customerAmounts = extractCustomerAmountsPesewas(input.message);
 
   return claims.every((claim) => {
     const product = evidence.products.get(claim.productId);
     if (!product) return false;
+    if (!referencedContentIsValid(claim, product)) return false;
+    const baseline = baselineProducts?.get(claim.productId);
+    if (baseline && !referencedContentIsUnchanged(claim, baseline, product)) return false;
     const pricePesewas = typeof product.pricePesewas === 'number'
       ? product.pricePesewas
       : toPesewas(Number(product.price));
@@ -235,7 +316,9 @@ function productClaimsAreSupported(
       return false;
     }
     if (claim.customerBudgetPesewas !== undefined) {
-      if (!customerAmounts.has(claim.customerBudgetPesewas) || pricePesewas > claim.customerBudgetPesewas) return false;
+      if (preferences.budgetPesewas !== claim.customerBudgetPesewas || pricePesewas > claim.customerBudgetPesewas) {
+        return false;
+      }
     }
     return true;
   });
@@ -268,6 +351,7 @@ function responseHasRequiredEvidence(
   response: AssistantPlan,
   evidence: EvidenceState,
   previousProducts: PreviousProductReference[],
+  preferences: ShoppingPreferences,
 ): boolean {
   if (response.type === 'greeting' || response.type === 'clarification') return true;
   const position = referencedPosition(input.message);
@@ -275,10 +359,10 @@ function responseHasRequiredEvidence(
   if (response.type === 'unavailable_reference') return Boolean(referenced && !referenced.available);
   if (response.type === 'no_match') return evidence.productRetrieved && evidence.products.size === 0;
   if (response.type === 'product_answer') {
-    return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts);
+    return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts, preferences);
   }
   if (response.type === 'policy_answer') return policyClaimsAreSupported(response.policyClaims, evidence.policies);
-  return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts)
+  return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts, preferences)
     && policyClaimsAreSupported(response.policyClaims, evidence.policies);
 }
 
@@ -344,14 +428,19 @@ function renderClarification(purpose: Extract<AssistantPlan, { type: 'clarificat
   return prompts[purpose];
 }
 
-function renderProductClaim(claim: ProductClaim, product: Record<string, unknown>): string {
+function completeSentence(value: string): string {
+  const trimmed = value.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function renderProductClaim(claim: ProductClaim, product: Record<string, unknown>): string[] {
   const name = String(product.name);
   const pricePesewas = typeof product.pricePesewas === 'number'
     ? product.pricePesewas
     : toPesewas(Number(product.price));
   const parts: string[] = [];
   if (claim.includeSummary && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
-    parts.push(product.shortDescription.trim());
+    parts.push(`${name}: ${completeSentence(product.shortDescription)}`);
   }
   if (claim.pricePesewas !== undefined && claim.customerBudgetPesewas !== undefined) {
     parts.push(`${name} costs ${formatGhs(pricePesewas)} and fits your ${formatGhs(claim.customerBudgetPesewas)} budget.`);
@@ -370,45 +459,57 @@ function renderProductClaim(claim: ProductClaim, product: Record<string, unknown
   }
   if (hasOwn(claim, 'warranty')) {
     const values = recordedFactValues(product, 'warranty');
-    parts.push(values.length > 0
-      ? `${name} warranty: ${values.join('; ')}.`
-      : `Warranty information is not recorded for ${name}, so I cannot confirm one.`);
+    if (values.length > 0) values.forEach((value) => parts.push(`${name} warranty: ${completeSentence(value)}`));
+    else parts.push(`Warranty information is not recorded for ${name}, so I cannot confirm one.`);
   }
   if (hasOwn(claim, 'material')) {
     const values = recordedFactValues(product, 'material');
-    parts.push(values.length > 0
-      ? `${name} material: ${values.join('; ')}.`
-      : `Material information is not recorded for ${name}, so I cannot confirm it.`);
+    if (values.length > 0) values.forEach((value) => parts.push(`${name} material: ${completeSentence(value)}`));
+    else parts.push(`Material information is not recorded for ${name}, so I cannot confirm it.`);
   }
-  if (claim.includeSpecifications) {
-    const specifications = Array.isArray(product.specifications)
-      ? product.specifications as Array<{ label?: unknown; value?: unknown }>
-      : [];
-    const rendered = specifications.flatMap((specification) =>
-      typeof specification.label === 'string' && typeof specification.value === 'string'
-        ? [`${specification.label}: ${specification.value}`]
-        : []);
-    parts.push(rendered.length > 0
-      ? `${name} specifications: ${rendered.join('; ')}.`
-      : `No specifications are recorded for ${name}.`);
+  const allSpecificationIndexes = Array.isArray(product.specifications)
+    ? product.specifications.map((_value, index) => index)
+    : [];
+  const selectedSpecificationIndexes = claim.includeSpecifications
+    ? allSpecificationIndexes
+    : claim.specificationIndexes ?? [];
+  if (claim.includeSpecifications && selectedSpecificationIndexes.length === 0) {
+    parts.push(`No specifications are recorded for ${name}.`);
   }
-  return parts.join(' ');
+  selectedSpecificationIndexes.forEach((index) => {
+    const specification = specificationAt(product, index);
+    if (specification) parts.push(`${name} — ${specification.label}: ${completeSentence(specification.value)}`);
+  });
+  claim.detailIndexes?.forEach((index) => {
+    const detail = detailAt(product, index);
+    if (detail) parts.push(`${name}: ${completeSentence(detail)}`);
+  });
+  const sections = productDescriptionSections(product);
+  claim.descriptionSectionIndexes?.forEach((index) => {
+    const section = sections[index];
+    if (section) parts.push(`${name}: ${completeSentence(section)}`);
+  });
+  return parts;
 }
 
 function renderPolicyClaim(claim: PolicyClaim, policies: StorePolicies): string {
+  const labelledPolicy = (label: string, value: string): string => {
+    const labelled = `${label}: ${value}`;
+    return labelled.length <= CHAT_MESSAGE_MAX_LENGTH ? labelled : value;
+  };
   if (claim.topic === 'return') {
     return policies.returnPolicy
-      ? `Return policy: ${policies.returnPolicy}`
+      ? labelledPolicy('Return policy', policies.returnPolicy)
       : 'Kawama has not published a return policy, so I cannot confirm return terms.';
   }
   if (claim.topic === 'delivery') {
     return policies.deliveryPolicy
-      ? `Delivery policy: ${policies.deliveryPolicy}`
+      ? labelledPolicy('Delivery policy', policies.deliveryPolicy)
       : 'Kawama has not published a delivery policy, so I cannot confirm delivery terms. Delivery charges are collected separately on delivery.';
   }
   if (claim.topic === 'payment') {
     return policies.paymentPolicy
-      ? `Payment policy: ${policies.paymentPolicy}`
+      ? labelledPolicy('Payment policy', policies.paymentPolicy)
       : 'Product payments are processed by Paystack. Kawama has not published further payment-method details, so I cannot confirm Mobile Money availability.';
   }
   if (claim.topic === 'contact') {
@@ -463,19 +564,19 @@ function renderAssistantPlan(
   const productClaims = response.type === 'product_answer' || response.type === 'mixed_answer'
     ? response.productClaims
     : [];
-  const productMessages = productClaims.flatMap((claim) => {
+  const productSections = productClaims.flatMap((claim) => {
     const product = productById.get(claim.productId);
-    return product ? [renderProductClaim(claim, product)] : [];
+    return product ? renderProductClaim(claim, product) : [];
   }).filter(Boolean);
   const policyClaims = response.type === 'policy_answer' || response.type === 'mixed_answer'
     ? response.policyClaims
     : [];
-  const policyMessages = policies ? policyClaims.map((claim) => renderPolicyClaim(claim, policies)) : [];
-  const assistantMessage = [...productMessages, ...policyMessages].join(' ');
-  if (!assistantMessage) return safeGroundingFallback(response, input, previousProducts);
+  const policySections = policies ? policyClaims.map((claim) => renderPolicyClaim(claim, policies)) : [];
+  const composed = composeChatResponse([...productSections, ...policySections]);
+  if (!composed.content) return safeGroundingFallback(response, input, previousProducts);
   const productIds = productClaims.map((claim) => claim.productId).filter((id) => productById.has(id));
   return {
-    assistantMessage,
+    assistantMessage: composed.content,
     productIds,
     suggestedFollowUps: productIds.length > 1 ? ['Would you like a closer comparison?'] : [],
   };
@@ -556,11 +657,15 @@ export async function runShoppingChat(
   }
 
   const previousProducts = await loadPreviousProductReferences(conversation as Record<string, any> | null);
+  const storedPreferences: ShoppingPreferences = typeof conversation?.shoppingPreferences?.budgetPesewas === 'number'
+    ? { budgetPesewas: conversation.shoppingPreferences.budgetPesewas }
+    : {};
+  const shoppingPreferences = resolveShoppingPreferences(storedPreferences, input.message);
   const history: ProviderMessage[] = (conversation?.messages ?? []).slice(-MAX_CONTEXT_MESSAGES).map(
     (message: { role: 'user' | 'assistant'; content: string }) => ({ role: message.role, content: message.content }),
   );
   const messages: ProviderMessage[] = [
-    { role: 'system', content: buildSystemPrompt(previousProducts, input.context) },
+    { role: 'system', content: buildSystemPrompt(previousProducts, input.context, shoppingPreferences) },
     ...history,
     { role: 'user', content: input.message },
   ];
@@ -596,7 +701,7 @@ export async function runShoppingChat(
         fallbackResponse = safeGroundingFallback(undefined, input, previousProducts);
         break;
       }
-      if (responseHasRequiredEvidence(input, candidate, evidence, previousProducts)) {
+      if (responseHasRequiredEvidence(input, candidate, evidence, previousProducts, shoppingPreferences)) {
         finalPlan = candidate;
         break;
       }
@@ -643,9 +748,36 @@ export async function runShoppingChat(
     ? selectedProductIds(finalPlan).filter((id) => evidence.products.has(id))
     : fallbackResponse?.productIds ?? [];
   const selectedIds = requestedIds.slice(0, 4);
-  const canonicalProducts = selectedIds.length > 0 ? await getPublicProductsByIdentifiers(selectedIds) : [];
+  let canonicalProducts = selectedIds.length > 0 ? await getPublicProductsByIdentifiers(selectedIds) : [];
+  if (finalPlan?.type === 'product_answer' || finalPlan?.type === 'mixed_answer') {
+    const canonicalEvidence: EvidenceState = {
+      productRetrieved: true,
+      productSearchPerformed: evidence.productSearchPerformed,
+      products: new Map(canonicalProducts.map((product) => [String(product.id), product])),
+      ...(evidence.policies ? { policies: evidence.policies } : {}),
+    };
+    const stillSupported = productClaimsAreSupported(
+      input,
+      finalPlan.productClaims,
+      canonicalEvidence,
+      previousProducts,
+      shoppingPreferences,
+      evidence.products,
+    );
+    if (!stillSupported) {
+      fallbackResponse = {
+        assistantMessage: 'The product information changed while I was checking it, so I could not confirm that recommendation. Please ask me to check the latest options again.',
+        productIds: [],
+        suggestedFollowUps: ['Check the latest options'],
+      };
+      canonicalProducts = [];
+    }
+  }
   const finalResponse = fallbackResponse
     ?? renderAssistantPlan(finalPlan!, canonicalProducts, evidence.policies, input, previousProducts);
+  if (!isValidStoredChatMessage(finalResponse.assistantMessage)) {
+    throw new AppError(500, 'CHAT_RESPONSE_LENGTH_INVALID', 'The shopping assistant could not produce a storable response.');
+  }
   const cards = canonicalProducts.map(toProductCard);
   const shouldReplaceShownProducts = cards.length > 0 && (evidence.productSearchPerformed || previousProducts.length === 0);
   const retainedProducts = shouldReplaceShownProducts
@@ -656,7 +788,10 @@ export async function runShoppingChat(
     ...(conversation?.messages ?? []),
     { role: 'user', content: input.message, createdAt: now },
     { role: 'assistant', content: finalResponse.assistantMessage, createdAt: now },
-  ].slice(-MAX_STORED_MESSAGES);
+  ].slice(-CHAT_STORED_MESSAGE_LIMIT);
+  if (nextMessages.some((message) => !isValidStoredChatMessage(message.content))) {
+    throw new AppError(500, 'CHAT_HISTORY_LENGTH_INVALID', 'The shopping assistant could not store the conversation history.');
+  }
 
   let conversationId: string;
   if (conversation) {
@@ -666,8 +801,10 @@ export async function runShoppingChat(
         messages: nextMessages,
         lastShownProducts: retainedProducts,
         lastShownProductIds: retainedIds,
+        shoppingPreferences,
         expiresAt: conversationExpiry(),
       } },
+      { runValidators: true },
     );
     conversationId = String(conversation._id);
   } else {
@@ -676,6 +813,7 @@ export async function runShoppingChat(
       messages: nextMessages,
       lastShownProducts: retainedProducts,
       lastShownProductIds: retainedIds,
+      shoppingPreferences,
       expiresAt: conversationExpiry(),
     });
     conversationId = String(created._id);

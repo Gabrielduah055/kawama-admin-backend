@@ -322,7 +322,7 @@ export const openApiDocument = {
             required: ['conversationId', 'assistantMessage', 'products'],
             properties: {
               conversationId: { type: 'string', format: 'uuid' },
-              assistantMessage: { type: 'string' },
+              assistantMessage: { type: 'string', maxLength: 2_000 },
               products: { type: 'array', maxItems: 4, items: { $ref: '#/components/schemas/ProductCard' } },
               suggestedFollowUps: { type: 'array', maxItems: 3, items: { type: 'string' } },
             },

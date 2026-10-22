@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { toPesewas } from '../lib/catalog.js';
+import { descriptionSections } from '../lib/chat.js';
 import { getPublicProductsByIdentifiers, searchPublicProducts, type PublicProductSort } from './catalog.service.js';
 import { getApprovedStorePolicies, type StorePolicies } from './store-policy.service.js';
 import {
@@ -87,6 +88,7 @@ function withEvidencePrices(products: Array<Record<string, unknown>>): Array<Rec
   return products.map((product) => ({
     ...product,
     pricePesewas: toPesewas(Number(product.price)),
+    descriptionSections: descriptionSections(typeof product.description === 'string' ? product.description : ''),
     ...(typeof product.compareAtPrice === 'number'
       ? { compareAtPricePesewas: toPesewas(product.compareAtPrice) }
       : {}),
