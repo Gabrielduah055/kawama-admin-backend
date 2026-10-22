@@ -10,7 +10,7 @@ export function createChatHandler(provider: ChatProvider): RequestHandler {
     const sessionToken = suppliedSessionToken === undefined
       ? undefined
       : chatSessionTokenSchema.parse(suppliedSessionToken);
-    const result = await runShoppingChat(input, sessionToken, provider);
+    const result = await runShoppingChat(input, sessionToken, provider, String(request.id));
     response.setHeader('X-Chat-Session', result.sessionToken);
     response.setHeader('Cache-Control', 'no-store');
     response.status(200).json({
