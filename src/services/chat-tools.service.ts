@@ -1,9 +1,15 @@
 import { z } from 'zod';
 import { toPesewas } from '../lib/catalog.js';
 import { descriptionSections } from '../lib/chat.js';
-import { getPublicProductsByIdentifiers, searchPublicProducts, type PublicProductSort } from './catalog.service.js';
+import {
+  getActivePublicCategoryNames,
+  getPublicProductsByIdentifiers,
+  searchPublicProducts,
+  type PublicProductSort,
+} from './catalog.service.js';
 import { getApprovedStorePolicies, type StorePolicies } from './store-policy.service.js';
 import {
+  continueProductSearchToolSchema,
   getProductDetailsToolSchema,
   getStorePoliciesToolSchema,
   searchProductsToolSchema,
@@ -29,6 +35,29 @@ export const shoppingToolDefinitions: ProviderToolDefinition[] = [
           limit: { type: 'integer', minimum: 1, maximum: 6 },
         },
       },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'continueProductSearch',
+      description: 'Continue the active product search. Use mode more for other options, only this, or anything else; cheaper for lower-priced unseen options; and count for the number of matching options. This preserves the active product subject and prevents repeated cards.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          mode: { type: 'string', enum: ['more', 'count', 'cheaper'] },
+          limit: { type: 'integer', minimum: 1, maximum: 6 },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'getStoreOverview',
+      description: 'Get Kawama’s active public catalogue categories and a few currently available products. Use only for general questions about what the store sells, not for a named product or category request.',
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
     },
   },
   {
@@ -61,17 +90,56 @@ export const shoppingToolDefinitions: ProviderToolDefinition[] = [
   },
 ];
 
+export interface ShoppingSearchContext {
+  query?: string | undefined;
+  category?: string | undefined;
+  minPricePesewas?: number | undefined;
+  maxPricePesewas?: number | undefined;
+  availability: 'any' | 'in_stock' | 'out_of_stock';
+  sort: 'relevance' | 'price_asc' | 'price_desc' | 'newest' | 'name';
+  totalMatches: number;
+  seenProductIds: string[];
+}
+
 export interface ShoppingToolResult {
   output: Record<string, unknown>;
   products: Array<Record<string, unknown>>;
   policies?: StorePolicies | undefined;
   evidenceKind?: 'product' | 'policy' | undefined;
-  evidenceSource?: 'search' | 'details' | 'policy' | undefined;
+  evidenceSource?: 'search' | 'details' | 'overview' | 'policy' | undefined;
   totalMatches?: number | undefined;
+  remainingMatches?: number | undefined;
+  continuationMode?: 'more' | 'count' | 'cheaper' | undefined;
+  previousMatchCount?: number | undefined;
+  searchContext?: ShoppingSearchContext | undefined;
+  categories?: string[] | undefined;
 }
 
 export interface ShoppingToolOptions {
   excludeProductIds?: string[] | undefined;
+  activeSearch?: ShoppingSearchContext | undefined;
+}
+
+const sortMap: Record<ShoppingSearchContext['sort'], PublicProductSort> = {
+  relevance: 'relevance',
+  price_asc: 'priceAsc',
+  price_desc: 'priceDesc',
+  newest: 'newest',
+  name: 'name',
+};
+
+function publicSearchInput(context: ShoppingSearchContext, limit: number, excludeProductIds: string[] = []) {
+  return {
+    ...(context.query ? { query: context.query } : {}),
+    ...(context.category ? { category: context.category } : {}),
+    ...(context.minPricePesewas !== undefined ? { minPrice: context.minPricePesewas / 100 } : {}),
+    ...(context.maxPricePesewas !== undefined ? { maxPrice: context.maxPricePesewas / 100 } : {}),
+    ...(context.availability !== 'any' ? { availability: context.availability } : {}),
+    sort: sortMap[context.sort],
+    page: 1,
+    limit,
+    ...(excludeProductIds.length > 0 ? { excludeProductIds } : {}),
+  };
 }
 
 function invalidToolArguments(error: unknown): ShoppingToolResult {
@@ -115,13 +183,6 @@ export async function executeShoppingTool(
   try {
     if (name === 'searchProducts') {
       const input = searchProductsToolSchema.parse(raw);
-      const sortMap: Record<typeof input.sort, PublicProductSort> = {
-        relevance: 'relevance',
-        price_asc: 'priceAsc',
-        price_desc: 'priceDesc',
-        newest: 'newest',
-        name: 'name',
-      };
       const result = await searchPublicProducts({
         ...(input.query ? { query: input.query } : {}),
         ...(input.category ? { category: input.category } : {}),
@@ -134,12 +195,110 @@ export async function executeShoppingTool(
         ...(options.excludeProductIds?.length ? { excludeProductIds: options.excludeProductIds } : {}),
       });
       const products = withEvidencePrices(result.products);
+      const searchContext: ShoppingSearchContext = {
+        ...(input.query ? { query: input.query } : {}),
+        ...(input.category ? { category: input.category } : {}),
+        ...(input.minPrice !== undefined ? { minPricePesewas: toPesewas(input.minPrice) } : {}),
+        ...(input.maxPrice !== undefined ? { maxPricePesewas: toPesewas(input.maxPrice) } : {}),
+        availability: input.availability,
+        sort: input.sort,
+        totalMatches: result.total,
+        seenProductIds: [],
+      };
       return {
-        output: { products, totalMatches: result.total },
+        output: { products, totalMatches: result.total, searchContext },
         products,
         evidenceKind: 'product',
         evidenceSource: 'search',
         totalMatches: result.total,
+        searchContext,
+      };
+    }
+    if (name === 'continueProductSearch') {
+      const input = continueProductSearchToolSchema.parse(raw);
+      const activeSearch = options.activeSearch;
+      if (!activeSearch) {
+        return {
+          output: {
+            error: {
+              code: 'NO_ACTIVE_PRODUCT_SEARCH',
+              message: 'There is no active product search to continue. Start a new product search.',
+            },
+          },
+          products: [],
+        };
+      }
+      let continuationContext = activeSearch;
+      if (input.mode === 'cheaper') {
+        const shownProducts = withEvidencePrices(await getPublicProductsByIdentifiers(activeSearch.seenProductIds));
+        const currentLowestPrice = shownProducts.reduce<number | undefined>((lowest, product) => {
+          const price = typeof product.pricePesewas === 'number' ? product.pricePesewas : undefined;
+          if (price === undefined) return lowest;
+          return lowest === undefined ? price : Math.min(lowest, price);
+        }, undefined);
+        if (currentLowestPrice === undefined || currentLowestPrice <= 0) {
+          return {
+            output: {
+              error: {
+                code: 'NO_ACTIVE_REFERENCE_PRICE',
+                message: 'No current displayed product price is available for a cheaper-options search.',
+              },
+            },
+            products: [],
+          };
+        }
+        continuationContext = {
+          ...activeSearch,
+          maxPricePesewas: Math.min(activeSearch.maxPricePesewas ?? currentLowestPrice - 1, currentLowestPrice - 1),
+          sort: 'price_desc',
+        };
+      }
+      const fullResultPromise = searchPublicProducts(publicSearchInput(continuationContext, Math.min(input.limit, 4)));
+      const selectedResultPromise = input.mode === 'more' || input.mode === 'cheaper'
+        ? searchPublicProducts(publicSearchInput(continuationContext, input.limit, activeSearch.seenProductIds))
+        : fullResultPromise;
+      const [fullResult, selectedResult] = await Promise.all([fullResultPromise, selectedResultPromise]);
+      const products = withEvidencePrices(selectedResult.products);
+      const remainingMatches = input.mode === 'more' || input.mode === 'cheaper'
+        ? selectedResult.total
+        : Math.max(0, fullResult.total - activeSearch.seenProductIds.length);
+      const searchContext: ShoppingSearchContext = {
+        ...continuationContext,
+        totalMatches: fullResult.total,
+        seenProductIds: activeSearch.seenProductIds,
+      };
+      return {
+        output: {
+          mode: input.mode,
+          products,
+          totalMatches: fullResult.total,
+          remainingMatches,
+          searchContext,
+        },
+        products,
+        evidenceKind: 'product',
+        evidenceSource: 'search',
+        totalMatches: fullResult.total,
+        remainingMatches,
+        continuationMode: input.mode,
+        previousMatchCount: activeSearch.totalMatches,
+        searchContext,
+      };
+    }
+    if (name === 'getStoreOverview') {
+      getStorePoliciesToolSchema.parse(raw);
+      const [categories, catalogue] = await Promise.all([
+        getActivePublicCategoryNames(),
+        searchPublicProducts({ availability: 'in_stock', sort: 'featured', page: 1, limit: 4 }),
+      ]);
+      const products = withEvidencePrices(catalogue.products);
+      return {
+        output: { categories, products, totalActiveProducts: catalogue.total },
+        products,
+        evidenceKind: 'product',
+        evidenceSource: 'overview',
+        totalMatches: catalogue.total,
+        categories,
       };
     }
     if (name === 'getProductDetails') {

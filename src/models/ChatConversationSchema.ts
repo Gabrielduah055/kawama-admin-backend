@@ -29,6 +29,27 @@ const shoppingPreferencesSchema = new Schema(
   { _id: false },
 );
 
+const searchContextSchema = new Schema(
+  {
+    query: { type: String, trim: true, maxlength: 120 },
+    category: { type: String, trim: true, maxlength: 80 },
+    minPricePesewas: { type: Number, min: 0, max: 1_000_000_000 },
+    maxPricePesewas: { type: Number, min: 0, max: 1_000_000_000 },
+    availability: { type: String, enum: ['any', 'in_stock', 'out_of_stock'], required: true },
+    sort: { type: String, enum: ['relevance', 'price_asc', 'price_desc', 'newest', 'name'], required: true },
+    totalMatches: { type: Number, min: 0, required: true },
+    seenProductIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
+      default: [],
+      validate: {
+        validator: (values: unknown[]) => values.length <= 100,
+        message: 'A search context cannot retain more than 100 product references.',
+      },
+    },
+  },
+  { _id: false },
+);
+
 const clarificationPurposes = [
   'budget',
   'intended_use',
@@ -48,6 +69,7 @@ const chatConversationSchema = new Schema(
     // also retain this field while readers prefer the positional snapshots.
     lastShownProductIds: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
     shoppingPreferences: { type: shoppingPreferencesSchema, default: () => ({}) },
+    lastSearch: { type: searchContextSchema, default: null },
     pendingClarificationPurpose: { type: String, enum: clarificationPurposes, default: null },
     expiresAt: { type: Date, required: true },
   },

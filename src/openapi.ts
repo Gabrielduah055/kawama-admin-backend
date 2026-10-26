@@ -24,6 +24,7 @@ export const openApiDocument = {
   paths: {
     '/': { get: { responses: { '200': { description: 'Kawama API is running.' } } } },
     '/health/live': { get: { responses: { '200': { description: 'Process is alive.' } } } },
+    '/health/version': { get: { responses: { '200': { description: 'Non-secret application version and deployment commit metadata. Commit is null when the runtime does not supply build metadata.' } } } },
     '/health/ready': { get: { responses: { '200': { description: 'Database is connected.' }, '503': { description: 'Database is unavailable.' } } } },
     '/api/v1/auth/login': {
       post: {

@@ -17,6 +17,7 @@ export interface ProviderMessage {
   tool_calls?: ProviderToolCall[] | undefined;
   tool_call_id?: string | undefined;
   name?: string | undefined;
+  finish_reason?: string | undefined;
 }
 
 export interface ProviderToolDefinition {
@@ -54,6 +55,7 @@ const providerResponseSchema = z.object({
       content: z.string().nullable().optional(),
       tool_calls: z.array(providerToolCallSchema).max(12).optional(),
     }),
+    finish_reason: z.string().max(100).nullable().optional(),
   })).min(1),
 });
 
@@ -128,7 +130,8 @@ export function createOpenRouterProvider(fetchImpl: typeof fetch = fetch): ChatP
         if (!parsed.success) {
           throw unavailable('AI_PROVIDER_INVALID_RESPONSE', 'The shopping assistant returned an invalid response.', 502);
         }
-        const message = parsed.data.choices[0]!.message;
+        const choice = parsed.data.choices[0]!;
+        const message = choice.message;
         const content = message.content ?? null;
         const toolCalls = message.tool_calls;
         if ((!content || content.trim().length === 0) && (!toolCalls || toolCalls.length === 0)) {
@@ -138,6 +141,7 @@ export function createOpenRouterProvider(fetchImpl: typeof fetch = fetch): ChatP
           role: 'assistant',
           content,
           ...(toolCalls ? { tool_calls: toolCalls } : {}),
+          ...(choice.finish_reason ? { finish_reason: choice.finish_reason } : {}),
         };
       }
       throw unavailable(
