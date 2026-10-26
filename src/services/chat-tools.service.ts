@@ -109,6 +109,8 @@ export interface ShoppingToolResult {
   evidenceSource?: 'search' | 'details' | 'overview' | 'policy' | undefined;
   totalMatches?: number | undefined;
   remainingMatches?: number | undefined;
+  continuationMode?: 'more' | 'count' | 'cheaper' | undefined;
+  previousMatchCount?: number | undefined;
   searchContext?: ShoppingSearchContext | undefined;
   categories?: string[] | undefined;
 }
@@ -201,7 +203,7 @@ export async function executeShoppingTool(
         availability: input.availability,
         sort: input.sort,
         totalMatches: result.total,
-        seenProductIds: products.map((product) => String(product.id)),
+        seenProductIds: [],
       };
       return {
         output: { products, totalMatches: result.total, searchContext },
@@ -257,17 +259,13 @@ export async function executeShoppingTool(
         : fullResultPromise;
       const [fullResult, selectedResult] = await Promise.all([fullResultPromise, selectedResultPromise]);
       const products = withEvidencePrices(selectedResult.products);
-      const seenProductIds = [...new Set([
-        ...activeSearch.seenProductIds,
-        ...products.map((product) => String(product.id)),
-      ])].slice(0, 100);
       const remainingMatches = input.mode === 'more' || input.mode === 'cheaper'
-        ? Math.max(0, selectedResult.total - products.length)
-        : Math.max(0, fullResult.total - seenProductIds.length);
+        ? selectedResult.total
+        : Math.max(0, fullResult.total - activeSearch.seenProductIds.length);
       const searchContext: ShoppingSearchContext = {
         ...continuationContext,
         totalMatches: fullResult.total,
-        seenProductIds,
+        seenProductIds: activeSearch.seenProductIds,
       };
       return {
         output: {
@@ -282,6 +280,8 @@ export async function executeShoppingTool(
         evidenceSource: 'search',
         totalMatches: fullResult.total,
         remainingMatches,
+        continuationMode: input.mode,
+        previousMatchCount: activeSearch.totalMatches,
         searchContext,
       };
     }

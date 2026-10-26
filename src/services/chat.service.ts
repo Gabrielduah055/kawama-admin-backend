@@ -30,8 +30,7 @@ const MAX_OUTPUT_TOKENS = 550;
 
 type ChatInput = z.infer<typeof chatRequestSchema>;
 type AssistantPlan = z.infer<typeof assistantResponseSchema>;
-type GroundedAnswerPlan = Extract<AssistantPlan, { type: 'grounded_answer' }>;
-type ProductPlan = Extract<AssistantPlan, { type: 'product_answer' | 'mixed_answer' }>;
+type ProductPlan = Extract<AssistantPlan, { type: 'product_answer' | 'grounded_answer' | 'mixed_answer' }>;
 type ProductClaim = ProductPlan['productClaims'][number];
 type PolicyPlan = Extract<AssistantPlan, { type: 'policy_answer' | 'mixed_answer' }>;
 type PolicyClaim = PolicyPlan['policyClaims'][number];
@@ -50,6 +49,8 @@ interface EvidenceState {
   products: Map<string, Record<string, unknown>>;
   searchTotalMatches?: number | undefined;
   remainingMatches?: number | undefined;
+  continuationMode?: 'more' | 'count' | 'cheaper' | undefined;
+  previousMatchCount?: number | undefined;
   searchContext?: ShoppingSearchContext | undefined;
   storeCategories?: string[] | undefined;
   policies?: StorePolicies | undefined;
@@ -171,7 +172,7 @@ function asksForProductCount(message: string): boolean {
 }
 
 function asksForComparison(message: string): boolean {
-  return /\b(?:compare|comparison|difference|differentiate|versus|vs\.?|which\s+(?:one\s+)?is\s+better|closer\s+comparison)\b/i
+  return /\b(?:compare|comparison|difference|different|differentiate|versus|vs\.?|which\s+(?:one\s+)?is\s+better|closer\s+comparison)\b/i
     .test(message);
 }
 
@@ -243,17 +244,10 @@ ${activeSearchContext}
 
 Resolve references such as "the second one" from that ordered list without renumbering it. Never substitute another product for a position marked unavailable. Explain that an unavailable referenced item is no longer in the public catalogue. If a reference is genuinely ambiguous, ask one clarification. Use getProductDetails with the listed id before answering current facts about an active referenced product.
 
-Your final response must be one JSON object. For product answers, prefer a grounded_answer so the explanation can sound natural without copying catalogue values:
-- {"type":"grounded_answer","intent":"search|details|alternatives|count|comparison|recommendation","answerTemplate":"natural text with verified placeholders","productIds":["PRODUCT_ID"],"suggestedFollowUps":["optional concise question"]}
+Your final response must be one JSON object. For product answers, prefer a grounded_answer:
+- {"type":"grounded_answer","intent":"search|details|alternatives|count|comparison|recommendation","productClaims":[PRODUCT_CLAIM],"suggestedFollowUps":["optional concise question"]}
 
-Every product name, price, availability statement, summary, specification, detail, description fact, warranty/material statement, result count, remaining count, or price difference inside answerTemplate must use one of these placeholders:
-- {{product:PRODUCT_ID:name}}, {{product:PRODUCT_ID:price}}, {{product:PRODUCT_ID:availability}}, {{product:PRODUCT_ID:summary}}
-- {{product:PRODUCT_ID:spec:INDEX}}, {{product:PRODUCT_ID:detail:INDEX}}, {{product:PRODUCT_ID:description:INDEX}}
-- {{product:PRODUCT_ID:missing:specifications}} only when that product has no recorded specifications
-- {{product:PRODUCT_ID:warranty}}, {{product:PRODUCT_ID:material}}
-- {{difference:PRODUCT_ID:PRODUCT_ID}}, {{count}}, {{remaining}}, {{categories}}
-
-The backend expands placeholders from freshly revalidated records. Use natural connective language around them, answer the question first, and stay concise. Never type a product name, monetary amount, stock claim, or other product fact directly into answerTemplate. For suitability, cite the recorded summary/detail/specification that supports it; do not infer performance from the product name. Include only product IDs retrieved during this request.
+The backend turns typed claims into friendly customer-facing language using freshly revalidated catalogue records. Select only the facts needed to answer the question. For count-only answers or a store overview with no product cards, productClaims may be empty. Do not write customer-facing product or policy facts yourself.
 
 Other allowed final plans are:
 - {"type":"greeting"}
@@ -496,113 +490,6 @@ function nullableClaimMatches(asserted: string | null, recorded: string[]): bool
   return recorded.some((value) => normalizeEvidenceText(value) === normalized);
 }
 
-function groundedTemplateValue(
-  token: string,
-  selectedIds: Set<string>,
-  products: Map<string, Record<string, unknown>>,
-  evidence: EvidenceState,
-): { value: string; productId?: string } | undefined {
-  if (token === 'count') {
-    return evidence.searchTotalMatches === undefined ? undefined : { value: String(evidence.searchTotalMatches) };
-  }
-  if (token === 'remaining') {
-    return evidence.remainingMatches === undefined ? undefined : { value: String(evidence.remainingMatches) };
-  }
-  if (token === 'categories') {
-    return evidence.storeCategories?.length ? { value: joinNaturalList(evidence.storeCategories) } : undefined;
-  }
-  const parts = token.split(':');
-  if (parts[0] === 'difference' && parts.length === 3) {
-    const left = products.get(parts[1]!);
-    const right = products.get(parts[2]!);
-    if (!left || !right || !selectedIds.has(parts[1]!) || !selectedIds.has(parts[2]!)) return undefined;
-    const differencePesewas = Math.abs(toPesewas(Number(left.price)) - toPesewas(Number(right.price)));
-    return { value: formatGhs(differencePesewas) };
-  }
-  if (parts[0] !== 'product' || parts.length < 3) return undefined;
-  const productId = parts[1]!;
-  const field = parts[2]!;
-  const product = products.get(productId);
-  if (!product || !selectedIds.has(productId)) return undefined;
-  if (field === 'name' && parts.length === 3) return { value: String(product.name), productId };
-  if (field === 'price' && parts.length === 3) {
-    return { value: formatGhs(toPesewas(Number(product.price))), productId };
-  }
-  if (field === 'availability' && parts.length === 3) {
-    const value = product.stockLevel === 'out_of_stock'
-      ? 'out of stock'
-      : product.stockLevel === 'low_stock' ? 'in stock with low stock remaining' : 'in stock';
-    return { value, productId };
-  }
-  if (field === 'summary' && parts.length === 3 && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
-    return { value: product.shortDescription.trim(), productId };
-  }
-  if (field === 'warranty' && parts.length === 3) {
-    const values = recordedFactValues(product, 'warranty');
-    return { value: values[0] ?? 'warranty information is not recorded', productId };
-  }
-  if (field === 'material' && parts.length === 3) {
-    const values = recordedFactValues(product, 'material');
-    return { value: values[0] ?? 'material information is not recorded', productId };
-  }
-  if (field === 'missing' && parts.length === 4 && parts[3] === 'specifications') {
-    const specifications = Array.isArray(product.specifications) ? product.specifications : [];
-    return specifications.length === 0
-      ? { value: `No specifications are recorded for ${String(product.name)}`, productId }
-      : undefined;
-  }
-  const index = Number(parts[3]);
-  if (!Number.isInteger(index) || index < 0 || parts.length !== 4) return undefined;
-  if (field === 'spec') {
-    const specification = specificationAt(product, index);
-    return specification ? { value: `${specification.label}: ${specification.value}`, productId } : undefined;
-  }
-  if (field === 'detail') {
-    const detail = detailAt(product, index);
-    return detail ? { value: detail, productId } : undefined;
-  }
-  if (field === 'description') {
-    const section = productDescriptionSections(product)[index];
-    return section ? { value: section, productId } : undefined;
-  }
-  return undefined;
-}
-
-function renderGroundedAnswer(
-  plan: GroundedAnswerPlan,
-  products: Map<string, Record<string, unknown>>,
-  evidence: EvidenceState,
-): string | undefined {
-  if (plan.productIds.some((productId) => !products.has(productId))) return undefined;
-  const selectedIds = new Set(plan.productIds);
-  const rawText = plan.answerTemplate.replace(/\{\{[^{}]+\}\}/g, ' ');
-  if (/\b(?:GHS|GH₵|GH¢)\b|\b\d+(?:\.\d{1,2})?\s*cedis?\b|\b(?:in stock|out of stock|low stock)\b/i.test(rawText)) {
-    return undefined;
-  }
-  if (plan.productIds.some((productId) => {
-    const name = String(products.get(productId)?.name ?? '').trim().toLowerCase();
-    return name.length > 0 && rawText.toLowerCase().includes(name);
-  })) return undefined;
-
-  const referencedProducts = new Set<string>();
-  let usedGroundedToken = false;
-  let invalidToken = false;
-  const rendered = plan.answerTemplate.replace(/\{\{([^{}]{1,200})\}\}/g, (_match, token: string) => {
-    const resolved = groundedTemplateValue(token.trim(), selectedIds, products, evidence);
-    if (!resolved) {
-      invalidToken = true;
-      return '';
-    }
-    usedGroundedToken = true;
-    if (resolved.productId) referencedProducts.add(resolved.productId);
-    return resolved.value;
-  });
-  if (invalidToken || !usedGroundedToken || /\{\{|\}\}/.test(rendered)) return undefined;
-  if (plan.productIds.some((productId) => !referencedProducts.has(productId))) return undefined;
-  const normalized = rendered.trim().replace(/[ \t]+/g, ' ');
-  return isValidStoredChatMessage(normalized) ? normalized : undefined;
-}
-
 function productClaimsAreSupported(
   input: ChatInput,
   claims: ProductClaim[],
@@ -679,9 +566,19 @@ function responseHasRequiredEvidence(
   if (response.type === 'unavailable_reference') return Boolean(referenced && !referenced.available);
   if (response.type === 'no_match') return evidence.productRetrieved && evidence.products.size === 0;
   if (response.type === 'grounded_answer') {
-    return evidence.productRetrieved
-      && (!referenced || (referenced.available && response.productIds.includes(referenced.id)))
-      && renderGroundedAnswer(response, evidence.products, evidence) !== undefined;
+    if (response.productClaims.length === 0) {
+      return evidence.productRetrieved
+        && !referenced
+        && ((response.intent === 'count' && evidence.searchTotalMatches !== undefined)
+          || (response.intent === 'search' && evidence.storeCategories !== undefined));
+    }
+    return productClaimsAreSupported(
+      input,
+      response.productClaims,
+      evidence,
+      previousProducts,
+      preferences,
+    );
   }
   if (response.type === 'product_answer') {
     return productClaimsAreSupported(input, response.productClaims, evidence, previousProducts, preferences);
@@ -701,11 +598,11 @@ function groundingCorrection(response: AssistantPlan | undefined, input: ChatInp
   const needsPolicies = response?.type === 'policy_answer' || response?.type === 'mixed_answer';
   return [
     response ? 'Your typed plan is not supported by current approved evidence.' : 'Your response did not match the required typed plan.',
-    needsProducts ? 'Use a product tool. Prefer grounded_answer with verified placeholders and only product IDs retrieved in this request.' : '',
+    needsProducts ? 'Use a product tool. Prefer grounded_answer with typed productClaims copied from products retrieved in this request.' : '',
     needsPolicies ? 'Use getStorePolicies and copy each selected policy claim exactly, including null values.' : '',
     referenced?.available ? `The positional reference resolves only to product id ${referenced.id}; do not substitute another product.` : '',
     referenced && !referenced.available ? `The product at position ${position! + 1} is unavailable; return unavailable_reference.` : '',
-    'A clarification may contain only an allowed purpose. Do not type catalogue values directly into a grounded answer template.',
+    'A clarification may contain only an allowed purpose. Do not write customer-facing catalogue facts directly; select typed claims for the backend renderer.',
   ].filter(Boolean).join(' ');
 }
 
@@ -737,6 +634,39 @@ function safeGroundingFallback(
   };
 }
 
+function renderEmptySearchResult(
+  evidence: EvidenceState,
+  previousProducts: PreviousProductReference[],
+): RenderedAssistantResponse {
+  const previousMatchCount = evidence.previousMatchCount ?? evidence.searchContext?.totalMatches ?? 0;
+  const activePreviousProducts = previousProducts.filter((product) => product.available);
+  if (evidence.continuationMode === 'cheaper' && previousMatchCount > 0) {
+    const reference = activePreviousProducts.length === 1
+      ? ` ${activePreviousProducts[0]!.name} remains the current option already shown.`
+      : '';
+    return {
+      assistantMessage: `I could not find any additional cheaper options that satisfy the current search filters.${reference} Would you like to change the budget or another preference?`,
+      productIds: [],
+      suggestedFollowUps: ['Change my budget', 'Change my preferences'],
+    };
+  }
+  if (evidence.continuationMode === 'more' && previousMatchCount > 0) {
+    const subject = previousMatchCount === 1 && activePreviousProducts[0]
+      ? `${activePreviousProducts[0].name} is the only current match for that search, and you’ve already seen it.`
+      : `You’ve already seen all ${previousMatchCount} current matches for that search.`;
+    return {
+      assistantMessage: `${subject} I could not find any additional matching options. Would you like to change the product type, budget, or another preference?`,
+      productIds: [],
+      suggestedFollowUps: ['Try another category', 'Change my budget'],
+    };
+  }
+  return {
+    assistantMessage: 'I could not find a matching product in Kawama’s current public catalogue. Would you like to try a different product type, budget, or feature?',
+    productIds: [],
+    suggestedFollowUps: ['Try another category', 'Change my budget'],
+  };
+}
+
 function groundedEvidenceFallback(
   response: AssistantPlan | undefined,
   input: ChatInput,
@@ -747,11 +677,7 @@ function groundedEvidenceFallback(
     return safeGroundingFallback(response, input, previousProducts);
   }
   if (evidence.productRetrieved && evidence.products.size === 0) {
-    return {
-      assistantMessage: 'I could not find a matching product in Kawama’s current public catalogue. Would you like to try a different category, budget, or feature?',
-      productIds: [],
-      suggestedFollowUps: ['Try another category', 'Change my budget'],
-    };
+    return renderEmptySearchResult(evidence, previousProducts);
   }
   const products = [...evidence.products.values()].slice(0, 4);
   if (products.length === 0) return safeGroundingFallback(response, input, previousProducts);
@@ -807,8 +733,6 @@ function renderProductClaim(
   const parts: string[] = [];
   const asksForWarranty = /\b(?:warranty|guarantee)\b/i.test(customerMessage);
   const asksForMaterial = /\b(?:material|made\s+(?:of|from)|composition)\b/i.test(customerMessage);
-  const asksForRecordedDetails = /\b(?:all|every|specification|specs?|feature|detail|settings?|size|capacity|dimension|litres?|liters?|jug|care|clean|wash|use|handle|lid)\b/i
-    .test(customerMessage);
   const asksForEverySpecification = asksForExhaustiveDetails(customerMessage);
   if (claim.includeSummary && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
     parts.push(`${name}: ${completeSentence(product.shortDescription)}`);
@@ -841,22 +765,22 @@ function renderProductClaim(
   const allSpecificationIndexes = Array.isArray(product.specifications)
     ? product.specifications.map((_value, index) => index)
     : [];
-  const selectedSpecificationIndexes = claim.includeSpecifications && (asksForRecordedDetails || asksForMaterial)
+  const selectedSpecificationIndexes = claim.includeSpecifications
     ? allSpecificationIndexes
-    : asksForRecordedDetails || asksForMaterial ? claim.specificationIndexes ?? [] : [];
-  if (claim.includeSpecifications && asksForRecordedDetails && selectedSpecificationIndexes.length === 0) {
+    : claim.specificationIndexes ?? [];
+  if (claim.includeSpecifications && selectedSpecificationIndexes.length === 0) {
     parts.push(`No specifications are recorded for ${name}.`);
   }
   selectedSpecificationIndexes.forEach((index) => {
     const specification = specificationAt(product, index);
     if (specification) parts.push(`${name} — ${specification.label}: ${completeSentence(specification.value)}`);
   });
-  (asksForRecordedDetails ? claim.detailIndexes ?? [] : []).forEach((index) => {
+  (claim.detailIndexes ?? []).forEach((index) => {
     const detail = detailAt(product, index);
     if (detail) parts.push(`${name}: ${completeSentence(detail)}`);
   });
   const sections = productDescriptionSections(product);
-  (asksForRecordedDetails ? claim.descriptionSectionIndexes ?? [] : []).forEach((index) => {
+  (claim.descriptionSectionIndexes ?? []).forEach((index) => {
     const section = sections[index];
     if (section) parts.push(`${name}: ${completeSentence(section)}`);
   });
@@ -884,7 +808,16 @@ function comparisonFacts(product: Record<string, unknown>, claim: ProductClaim |
   if (claim.includeSummary && typeof product.shortDescription === 'string' && product.shortDescription.trim()) {
     facts.push(product.shortDescription.trim());
   }
-  for (const index of claim.specificationIndexes ?? []) {
+  const specifications = Array.isArray(product.specifications)
+    ? product.specifications as Array<{ label?: unknown; value?: unknown }>
+    : [];
+  if (claim.includeSpecifications && specifications.length === 0) {
+    facts.push(`No specifications are recorded for ${String(product.name)}`);
+  }
+  const specificationIndexes = claim.includeSpecifications
+    ? specifications.map((_value, index) => index)
+    : claim.specificationIndexes ?? [];
+  for (const index of specificationIndexes) {
     const specification = specificationAt(product, index);
     if (specification) facts.push(`${specification.label}: ${specification.value}`);
   }
@@ -964,25 +897,32 @@ function relevantRecordedFacts(message: string, product: Record<string, unknown>
     .map((candidate) => completeSentence(candidate.fact));
 }
 
+function requestedRecordedFactStatements(message: string, product: Record<string, unknown>): string[] {
+  const name = String(product.name);
+  const statements: string[] = [];
+  if (/\b(?:warranty|guarantee)\b/i.test(message)) {
+    const warranties = recordedFactValues(product, 'warranty');
+    statements.push(...(warranties.length > 0
+      ? warranties.map((value) => `${name} warranty: ${completeSentence(value)}`)
+      : [`Warranty information is not recorded for ${name}, so I cannot confirm one.`]));
+  }
+  if (/\b(?:material|made\s+(?:of|from)|composition)\b/i.test(message)) {
+    const materials = recordedFactValues(product, 'material');
+    statements.push(...(materials.length > 0
+      ? materials.map((value) => `${name} material: ${completeSentence(value)}`)
+      : [`Material information is not recorded for ${name}, so I cannot confirm it.`]));
+  }
+  return statements;
+}
+
 function renderCanonicalFallback(
   input: ChatInput,
   products: Array<Record<string, unknown>>,
   evidence: EvidenceState,
+  previousProducts: PreviousProductReference[],
 ): RenderedAssistantResponse {
   if (products.length === 0) {
-    if (evidence.remainingMatches === 0 && evidence.searchContext) {
-      const total = evidence.searchTotalMatches ?? evidence.searchContext.totalMatches;
-      return {
-        assistantMessage: `You’ve now seen all ${total} current ${total === 1 ? 'match' : 'matches'} for that search. Would you like to change the budget, product type, or another preference?`,
-        productIds: [],
-        suggestedFollowUps: ['Try another category'],
-      };
-    }
-    return {
-      assistantMessage: 'I could not find a matching product in Kawama’s current public catalogue. Would you like to try a different product type, budget, or feature?',
-      productIds: [],
-      suggestedFollowUps: ['Try another category', 'Change my budget'],
-    };
+    return renderEmptySearchResult(evidence, previousProducts);
   }
   const productIds = products.map((product) => String(product.id));
   if (products.length > 1 || asksForComparison(input.message) || asksForProductCount(input.message)) {
@@ -994,7 +934,10 @@ function renderCanonicalFallback(
   }
   const product = products[0]!;
   const name = String(product.name);
-  const facts = relevantRecordedFacts(input.message, product);
+  const facts = [
+    ...requestedRecordedFactStatements(input.message, product),
+    ...relevantRecordedFacts(input.message, product),
+  ];
   return {
     assistantMessage: [
       `I found one current match: ${name}.`,
@@ -1040,9 +983,59 @@ function renderPolicyClaim(claim: PolicyClaim, policies: StorePolicies): string 
 }
 
 function selectedProductIds(response: AssistantPlan): string[] {
-  if (response.type === 'grounded_answer') return response.productIds;
-  if (response.type !== 'product_answer' && response.type !== 'mixed_answer') return [];
+  if (response.type !== 'product_answer' && response.type !== 'grounded_answer' && response.type !== 'mixed_answer') return [];
   return response.productClaims.map((claim) => claim.productId);
+}
+
+function renderGroundedProductPlan(
+  response: Extract<AssistantPlan, { type: 'grounded_answer' }>,
+  products: Array<Record<string, unknown>>,
+  input: ChatInput,
+  evidence: EvidenceState,
+): RenderedAssistantResponse {
+  const productById = new Map(products.map((product) => [String(product.id), product]));
+  const productIds = response.productClaims.map((claim) => claim.productId).filter((id) => productById.has(id));
+  const total = evidence.searchTotalMatches ?? products.length;
+  let sections: string[] = [];
+
+  if (response.intent === 'count') {
+    sections.push(`There are ${total} current matching ${total === 1 ? 'option' : 'options'} in Kawama’s public catalogue.`);
+    sections.push(...products.map((product) => compactProductLine(product, false)));
+  } else if (response.intent === 'comparison') {
+    sections.push(renderProductCollection(products, input, evidence.searchTotalMatches, response.productClaims));
+  } else {
+    if (response.intent === 'search' && evidence.storeCategories?.length) {
+      sections.push(`Kawama sells home and kitchen products in ${joinNaturalList(evidence.storeCategories)}.`);
+    } else if (response.intent === 'search') {
+      sections.push(products.length === 1 ? 'I found a current match for you.' : 'Here are the current matches I found for you.');
+    } else if (response.intent === 'alternatives') {
+      sections.push(/\bonly\b/i.test(input.message) && products.length > 1
+        ? 'No—the current options are not all the same. Here are the recorded differences.'
+        : 'Here are the additional current options I found.');
+    } else if (response.intent === 'recommendation') {
+      sections.push('Based on the recorded catalogue details, I’d start with this option.');
+    }
+    sections.push(...response.productClaims.flatMap((claim) => {
+      const product = productById.get(claim.productId);
+      return product ? renderProductClaim(claim, product, input.message) : [];
+    }));
+  }
+
+  const composed = composeChatResponse(sections);
+  if (!composed.content) {
+    return {
+      assistantMessage: 'I could not verify current catalogue information for that answer. Which product or main feature should I check?',
+      productIds: [],
+      suggestedFollowUps: [],
+    };
+  }
+  return {
+    assistantMessage: composed.content,
+    productIds,
+    suggestedFollowUps: response.suggestedFollowUps ?? (
+      productIds.length > 1 && response.intent !== 'comparison' ? ['Compare these products'] : []
+    ),
+  };
 }
 
 function renderAssistantPlan(
@@ -1051,9 +1044,7 @@ function renderAssistantPlan(
   policies: StorePolicies | undefined,
   input: ChatInput,
   previousProducts: PreviousProductReference[],
-  searchTotalMatches?: number,
-  remainingMatches?: number,
-  storeCategories?: string[],
+  evidence: EvidenceState,
 ): RenderedAssistantResponse {
   if (response.type === 'greeting') {
     return {
@@ -1066,11 +1057,7 @@ function renderAssistantPlan(
     return { assistantMessage: renderClarification(response.purpose), productIds: [], suggestedFollowUps: [] };
   }
   if (response.type === 'no_match') {
-    return {
-      assistantMessage: 'I could not find a matching product in the current public catalogue. Would you like to adjust the budget, category, or preferred features?',
-      productIds: [],
-      suggestedFollowUps: ['Try a different budget', 'Try another category'],
-    };
+    return renderEmptySearchResult(evidence, previousProducts);
   }
   if (response.type === 'unavailable_reference') {
     const position = referencedPosition(input.message);
@@ -1082,29 +1069,16 @@ function renderAssistantPlan(
     };
   }
 
-  const productById = new Map(products.map((product) => [String(product.id), product]));
   if (response.type === 'grounded_answer') {
-    const assistantMessage = renderGroundedAnswer(response, productById, {
-      productRetrieved: true,
-      productSearchPerformed: false,
-      products: productById,
-      ...(searchTotalMatches !== undefined ? { searchTotalMatches } : {}),
-      ...(remainingMatches !== undefined ? { remainingMatches } : {}),
-      ...(storeCategories ? { storeCategories } : {}),
-    });
-    if (!assistantMessage) return safeGroundingFallback(response, input, previousProducts);
-    return {
-      assistantMessage,
-      productIds: response.productIds,
-      suggestedFollowUps: response.suggestedFollowUps ?? [],
-    };
+    return renderGroundedProductPlan(response, products, input, evidence);
   }
+  const productById = new Map(products.map((product) => [String(product.id), product]));
   const productClaims = response.type === 'product_answer' || response.type === 'mixed_answer'
     ? response.productClaims
     : [];
   const useCompactCollection = products.length > 1 && !asksForExhaustiveDetails(input.message);
   const productSections = useCompactCollection
-    ? [renderProductCollection(products, input, searchTotalMatches, productClaims)]
+    ? [renderProductCollection(products, input, evidence.searchTotalMatches, productClaims)]
     : productClaims.flatMap((claim) => {
       const product = productById.get(claim.productId);
       return product ? renderProductClaim(claim, product, input.message) : [];
@@ -1425,6 +1399,8 @@ export async function runShoppingChat(
       }
       if (result.totalMatches !== undefined) evidence.searchTotalMatches = result.totalMatches;
       if (result.remainingMatches !== undefined) evidence.remainingMatches = result.remainingMatches;
+      if (result.continuationMode !== undefined) evidence.continuationMode = result.continuationMode;
+      if (result.previousMatchCount !== undefined) evidence.previousMatchCount = result.previousMatchCount;
       if (result.searchContext) evidence.searchContext = result.searchContext;
       if (result.categories) evidence.storeCategories = result.categories;
       if (result.policies) evidence.policies = result.policies;
@@ -1454,14 +1430,17 @@ export async function runShoppingChat(
     : fallbackResponse?.productIds ?? [];
   const selectedIds = requestedIds.slice(0, 4);
   let canonicalProducts = selectedIds.length > 0 ? await getPublicProductsByIdentifiers(selectedIds) : [];
-  if (finalPlan?.type === 'product_answer' || finalPlan?.type === 'mixed_answer') {
+  if (finalPlan?.type === 'product_answer' || finalPlan?.type === 'grounded_answer' || finalPlan?.type === 'mixed_answer') {
     const canonicalEvidence: EvidenceState = {
       productRetrieved: true,
       productSearchPerformed: evidence.productSearchPerformed,
       products: new Map(canonicalProducts.map((product) => [String(product.id), product])),
       ...(evidence.searchTotalMatches !== undefined ? { searchTotalMatches: evidence.searchTotalMatches } : {}),
       ...(evidence.remainingMatches !== undefined ? { remainingMatches: evidence.remainingMatches } : {}),
+      ...(evidence.continuationMode !== undefined ? { continuationMode: evidence.continuationMode } : {}),
+      ...(evidence.previousMatchCount !== undefined ? { previousMatchCount: evidence.previousMatchCount } : {}),
       ...(evidence.searchContext ? { searchContext: evidence.searchContext } : {}),
+      ...(evidence.storeCategories ? { storeCategories: evidence.storeCategories } : {}),
       ...(evidence.policies ? { policies: evidence.policies } : {}),
     };
     const stillSupported = productClaimsAreSupported(
@@ -1481,29 +1460,15 @@ export async function runShoppingChat(
       canonicalProducts = [];
     }
   }
-  if (finalPlan?.type === 'grounded_answer') {
-    const canonicalById = new Map(canonicalProducts.map((product) => [String(product.id), product]));
-    if (canonicalProducts.length !== selectedIds.length
-      || renderGroundedAnswer(finalPlan, canonicalById, evidence) === undefined) {
-      fallbackResponse = {
-        assistantMessage: 'The product information changed while I was checking it, so I could not confirm that answer. Please ask me to check the latest options again.',
-        productIds: [],
-        suggestedFollowUps: ['Check the latest options'],
-      };
-      canonicalProducts = [];
-    }
-  }
   const finalResponse = fallbackResponse?.groundedFallback
-    ? renderCanonicalFallback(input, canonicalProducts, evidence)
+    ? renderCanonicalFallback(input, canonicalProducts, evidence, previousProducts)
     : fallbackResponse ?? renderAssistantPlan(
       finalPlan!,
       canonicalProducts,
       evidence.policies,
       input,
       previousProducts,
-      evidence.searchTotalMatches,
-      evidence.remainingMatches,
-      evidence.storeCategories,
+      evidence,
     );
   const pendingClarificationPurpose = finalPlan?.type === 'clarification' && !fallbackResponse
     ? finalPlan.purpose
@@ -1517,7 +1482,15 @@ export async function runShoppingChat(
     ? cards.map((card) => ({ productId: card.id, name: card.name, slug: card.slug }))
     : previousProducts.map((product) => ({ productId: product.id, name: product.name, slug: product.slug ?? 'unavailable-product' }));
   const retainedIds = retainedProducts.map((product) => product.productId);
-  const retainedSearchContext = evidence.searchContext ?? activeSearch ?? null;
+  const currentSearchContext = evidence.searchContext ?? activeSearch;
+  const retainedSearchContext = currentSearchContext
+    ? {
+      ...currentSearchContext,
+      seenProductIds: evidence.productSearchPerformed
+        ? [...new Set([...currentSearchContext.seenProductIds, ...cards.map((card) => card.id)])].slice(0, 100)
+        : currentSearchContext.seenProductIds,
+    }
+    : null;
   const nextMessages = [
     ...(conversation?.messages ?? []),
     { role: 'user', content: input.message, createdAt: now },

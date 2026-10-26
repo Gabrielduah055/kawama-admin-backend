@@ -247,6 +247,188 @@ describe('shopping chat API', () => {
     expect(followUp.body.data.products.map((product: { id: string }) => product.id)).toEqual([String(third._id)]);
   });
 
+  it('marks only displayed search candidates as seen and keeps undisplayed matches available', async () => {
+    const products = [];
+    for (let index = 0; index < 6; index += 1) {
+      products.push(await seedProduct({
+        slug: `candidate-${index + 1}`,
+        name: `Candidate Blender ${index + 1}`,
+        pricePesewas: 20_000 + index * 1_000,
+      }));
+    }
+    const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      if (!lastTool) {
+        return userMessage.toLowerCase().includes('other')
+          ? toolCall(`more-${provider.calls.length}`, 'continueProductSearch', { mode: 'more', limit: 4 })
+          : toolCall('candidate-search', 'searchProducts', { query: 'candidate blender', sort: 'price_asc', limit: 6 });
+      }
+      const candidates = productsFromLastTool(input);
+      const displayed = userMessage.toLowerCase().includes('other') ? candidates : candidates.slice(0, 1);
+      return finalPlan({
+        type: 'grounded_answer',
+        intent: userMessage.toLowerCase().includes('other') ? 'alternatives' : 'search',
+        productClaims: displayed.map((product) => ({ productId: String(product.id), pricePesewas: product.pricePesewas })),
+      });
+    });
+    const app = createApp({ chatProvider: provider });
+
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me a candidate blender.' });
+    expect(initial.status).toBe(200);
+    expect(initial.body.data.products).toHaveLength(1);
+    let stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(stored?.lastSearch?.seenProductIds.map(String)).toEqual([initial.body.data.products[0].id]);
+
+    const firstMore = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Show me other options.' });
+    expect(firstMore.status).toBe(200);
+    expect(firstMore.body.data.products).toHaveLength(4);
+    expect(firstMore.body.data.products.map((product: { id: string }) => product.id)).not.toContain(initial.body.data.products[0].id);
+
+    const secondMore = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Any other options?' });
+    expect(secondMore.status).toBe(200);
+    expect(secondMore.body.data.products).toHaveLength(1);
+
+    const displayedIds = [
+      ...initial.body.data.products,
+      ...firstMore.body.data.products,
+      ...secondMore.body.data.products,
+    ].map((product: { id: string }) => product.id);
+    expect(new Set(displayedIds).size).toBe(6);
+    expect(new Set(displayedIds)).toEqual(new Set(products.map((product) => String(product._id))));
+    stored = await ChatConversationModel.findById(initial.body.data.conversationId).lean();
+    expect(new Set(stored?.lastSearch?.seenProductIds.map(String))).toEqual(new Set(displayedIds));
+
+    const countProvider = new ScriptedProvider((input) => input.messages.some((message) => message.role === 'tool')
+      ? finalPlan({ type: 'grounded_answer', intent: 'count', productClaims: [] })
+      : toolCall('candidate-count', 'searchProducts', { query: 'candidate blender', limit: 6 }));
+    const countOnly = await request(createApp({ chatProvider: countProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'How many candidate blenders are there?' });
+    expect(countOnly.status).toBe(200);
+    expect(countOnly.body.data.assistantMessage).toContain('There are 6 current matching options');
+    expect(countOnly.body.data.products).toEqual([]);
+    const countStored = await ChatConversationModel.findById(countOnly.body.data.conversationId).lean();
+    expect(countStored?.lastSearch?.seenProductIds).toEqual([]);
+
+    const fallbackProvider = new ScriptedProvider((input) => input.messages.some((message) => message.role === 'tool')
+      ? { role: 'assistant', content: 'Here are all six products.' }
+      : toolCall('candidate-fallback', 'searchProducts', { query: 'candidate blender', limit: 6 }));
+    const fallback = await request(createApp({ chatProvider: fallbackProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Show me candidate blenders.' });
+    expect(fallback.status).toBe(200);
+    expect(fallback.body.data.products).toHaveLength(4);
+    const fallbackStored = await ChatConversationModel.findById(fallback.body.data.conversationId).lean();
+    expect(new Set(fallbackStored?.lastSearch?.seenProductIds.map(String))).toEqual(new Set(
+      fallback.body.data.products.map((product: { id: string }) => product.id),
+    ));
+
+    const recommendationProvider = new ScriptedProvider((input) => {
+      if (!input.messages.some((message) => message.role === 'tool')) {
+        return toolCall('candidate-recommendation', 'searchProducts', { query: 'candidate blender', limit: 6 });
+      }
+      const candidates = productsFromLastTool(input);
+      return finalPlan({
+        type: 'grounded_answer',
+        intent: 'recommendation',
+        productClaims: [{ productId: String(candidates[2]!.id), includeSummary: true }],
+      });
+    });
+    const recommendation = await request(createApp({ chatProvider: recommendationProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Recommend a candidate blender.' });
+    expect(recommendation.status).toBe(200);
+    expect(recommendation.body.data.products).toHaveLength(1);
+    const recommendationStored = await ChatConversationModel.findById(recommendation.body.data.conversationId).lean();
+    expect(recommendationStored?.lastSearch?.seenProductIds.map(String)).toEqual([
+      recommendation.body.data.products[0].id,
+    ]);
+  });
+
+  it('distinguishes exhausted continuations from an empty initial search for valid and malformed plans', async () => {
+    await seedProduct({ slug: 'only-match', name: 'Only Match Blender' });
+    for (const malformed of [false, true]) {
+      const provider = new ScriptedProvider((input) => {
+        const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+        const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+        if (!lastTool) {
+          return userMessage.includes('other')
+            ? toolCall(`exhausted-${malformed}`, 'continueProductSearch', { mode: 'more', limit: 4 })
+            : toolCall(`only-${malformed}`, 'searchProducts', { query: 'only match blender', limit: 4 });
+        }
+        const candidates = productsFromLastTool(input);
+        if (userMessage.includes('other')) {
+          return malformed ? { role: 'assistant', content: 'No more products.' } : finalPlan({ type: 'no_match' });
+        }
+        return finalPlan({
+          type: 'grounded_answer',
+          intent: 'search',
+          productClaims: [{ productId: String(candidates[0]!.id), includeSummary: true }],
+        });
+      });
+      const app = createApp({ chatProvider: provider });
+      const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me the only match blender.' });
+      const exhausted = await request(app)
+        .post('/api/ai/chat')
+        .set('x-chat-session', String(initial.headers['x-chat-session']))
+        .send({ conversationId: initial.body.data.conversationId, message: 'Any other options?' });
+
+      expect(exhausted.status).toBe(200);
+      expect(exhausted.body.data.assistantMessage).toContain('Only Match Blender is the only current match');
+      expect(exhausted.body.data.assistantMessage).toContain('already seen');
+      expect(exhausted.body.data.products).toEqual([]);
+    }
+
+    const emptyProvider = new ScriptedProvider((input) => input.messages.some((message) => message.role === 'tool')
+      ? finalPlan({ type: 'no_match' })
+      : toolCall('empty-initial', 'searchProducts', { query: 'missing lunar cooker', limit: 4 }));
+    const empty = await request(createApp({ chatProvider: emptyProvider }))
+      .post('/api/ai/chat')
+      .send({ message: 'Do you sell a missing lunar cooker?' });
+    expect(empty.status).toBe(200);
+    expect(empty.body.data.assistantMessage).toContain('could not find a matching product');
+    expect(empty.body.data.assistantMessage).not.toContain('already seen');
+  });
+
+  it('reports when no additional cheaper options satisfy the active search filters', async () => {
+    const only = await seedProduct({ slug: 'only-priced-match', name: 'Only Priced Blender', pricePesewas: 35_000 });
+    const provider = new ScriptedProvider((input) => {
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const lastTool = [...input.messages].reverse().find((message) => message.role === 'tool');
+      if (!lastTool) {
+        return userMessage.toLowerCase().includes('cheaper')
+          ? toolCall('no-cheaper', 'continueProductSearch', { mode: 'cheaper', limit: 4 })
+          : toolCall('only-priced', 'searchProducts', { query: 'only priced blender', limit: 4 });
+      }
+      const candidates = productsFromLastTool(input);
+      return candidates.length === 0
+        ? finalPlan({ type: 'no_match' })
+        : finalPlan({
+          type: 'grounded_answer',
+          intent: 'search',
+          productClaims: [{ productId: String(candidates[0]!.id), pricePesewas: candidates[0]!.pricePesewas }],
+        });
+    });
+    const app = createApp({ chatProvider: provider });
+    const initial = await request(app).post('/api/ai/chat').send({ message: 'Show me the only priced blender.' });
+    expect(initial.body.data.products[0].id).toBe(String(only._id));
+    const cheaper = await request(app)
+      .post('/api/ai/chat')
+      .set('x-chat-session', String(initial.headers['x-chat-session']))
+      .send({ conversationId: initial.body.data.conversationId, message: 'Any cheaper options?' });
+    expect(cheaper.status).toBe(200);
+    expect(cheaper.body.data.assistantMessage).toContain('additional cheaper options');
+    expect(cheaper.body.data.assistantMessage).toContain('Only Priced Blender');
+    expect(cheaper.body.data.products).toEqual([]);
+  });
+
   it('retains the active product subject when finding a cheaper unseen alternative', async () => {
     const premium = await seedProduct({ slug: 'premium-subject-blender', name: 'Premium Subject Blender', pricePesewas: 50_000 });
     const value = await seedProduct({ slug: 'value-subject-blender', name: 'Value Subject Blender', pricePesewas: 30_000 });
@@ -263,8 +445,11 @@ describe('shopping chat API', () => {
       return finalPlan({
         type: 'grounded_answer',
         intent: userMessage.toLowerCase().includes('cheaper') ? 'alternatives' : 'search',
-        answerTemplate: `{{product:${productId}:name}} is {{product:${productId}:availability}} at {{product:${productId}:price}}.`,
-        productIds: [productId],
+        productClaims: [{
+          productId,
+          availability: products[0]!.stockLevel,
+          pricePesewas: products[0]!.pricePesewas,
+        }],
       });
     });
     const app = createApp({ chatProvider: provider });
@@ -379,6 +564,45 @@ describe('shopping chat API', () => {
     expect(response.body.data.products).toEqual([]);
   });
 
+  it('rejects free-form grounded facts and renders supported material and missing warranty claims', async () => {
+    const product = await seedProduct();
+    const productId = String(product._id);
+    const unsupported = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('unsafe-grounded-details', 'getProductDetails', { identifiers: [productId] })
+      : finalPlan({
+        type: 'grounded_answer',
+        intent: 'details',
+        answerTemplate: `{{product:${productId}:name}} has a ceramic jug and a lifetime warranty.`,
+        productIds: [productId],
+      }));
+    const rejected = await request(createApp({ chatProvider: unsupported }))
+      .post('/api/ai/chat')
+      .send({ message: 'What material is this blender made from, and what warranty does it have?' });
+
+    expect(rejected.status).toBe(200);
+    expect(rejected.body.data.assistantMessage).not.toContain('ceramic jug');
+    expect(rejected.body.data.assistantMessage).not.toContain('lifetime warranty');
+    expect(rejected.body.data.assistantMessage).toContain('BPA-free plastic');
+    expect(rejected.body.data.assistantMessage).toContain('Warranty information is not recorded');
+
+    const supported = new ScriptedProvider((_input, call) => call === 1
+      ? toolCall('supported-grounded-details', 'getProductDetails', { identifiers: [productId] })
+      : finalPlan({
+        type: 'grounded_answer',
+        intent: 'details',
+        productClaims: [{ productId, material: 'BPA-free plastic', warranty: null }],
+        suggestedFollowUps: ['Would you like its recorded price?'],
+      }));
+    const accepted = await request(createApp({ chatProvider: supported }))
+      .post('/api/ai/chat')
+      .send({ message: 'What material is this blender made from, and what warranty does it have?' });
+
+    expect(accepted.status).toBe(200);
+    expect(accepted.body.data.assistantMessage).toContain('BPA-free plastic');
+    expect(accepted.body.data.assistantMessage).toContain('Warranty information is not recorded');
+    expect(accepted.body.data.suggestedFollowUps).toEqual(['Would you like its recorded price?']);
+  });
+
   it('does not allow policy answers to bypass the approved policy tool', async () => {
     const invented = new ScriptedProvider(() => finalPlan({
       type: 'policy_answer',
@@ -420,8 +644,7 @@ describe('shopping chat API', () => {
       return finalPlan({
         type: 'grounded_answer',
         intent: 'search',
-        answerTemplate: `Kawama carries home and kitchen products across {{categories}}. One current option is {{product:${String(products[0]!.id)}:name}}.`,
-        productIds: [String(products[0]!.id)],
+        productClaims: [{ productId: String(products[0]!.id), includeSummary: true }],
       });
     });
 
@@ -500,8 +723,7 @@ describe('shopping chat API', () => {
         return finalPlan({
           type: 'grounded_answer',
           intent: 'search',
-          answerTemplate: `Kawama sells home and kitchen products across {{categories}}. Current examples include {{product:${blenderId}:name}}, {{product:${stockPotId}:name}}, and {{product:${cookwareSetId}:name}}.`,
-          productIds: [blenderId, stockPotId, cookwareSetId],
+          productClaims: [blenderId, stockPotId, cookwareSetId].map((productId) => ({ productId, includeSummary: true })),
           suggestedFollowUps: ['Show me blenders'],
         });
       }
@@ -509,16 +731,14 @@ describe('shopping chat API', () => {
         return finalPlan({
           type: 'grounded_answer',
           intent: 'search',
-          answerTemplate: `I found {{product:${blenderId}:name}}. It is {{product:${blenderId}:availability}} at {{product:${blenderId}:price}}. {{product:${blenderId}:summary}}`,
-          productIds: [blenderId],
+          productClaims: [{ productId: blenderId, availability: 'in_stock', pricePesewas: 35_000, includeSummary: true }],
         });
       }
       if (normalized.includes('poot')) {
         return finalPlan({
           type: 'grounded_answer',
           intent: 'search',
-          answerTemplate: `A strong current match is {{product:${stockPotId}:name}} at {{product:${stockPotId}:price}}. {{product:${stockPotId}:summary}}`,
-          productIds: [stockPotId],
+          productClaims: [{ productId: stockPotId, pricePesewas: 32_000, includeSummary: true }],
           suggestedFollowUps: ['Show me the other cookware options'],
         });
       }
@@ -526,31 +746,36 @@ describe('shopping chat API', () => {
         return finalPlan({
           type: 'grounded_answer',
           intent: 'count',
-          answerTemplate: `There are {{count}} current matching options: {{product:${stockPotId}:name}} and {{product:${cookwareSetId}:name}}.`,
-          productIds: [stockPotId, cookwareSetId],
+          productClaims: [
+            { productId: stockPotId, availability: 'in_stock' },
+            { productId: cookwareSetId, availability: 'in_stock' },
+          ],
         });
       }
       if (normalized.includes('only ceramic')) {
         return finalPlan({
           type: 'grounded_answer',
           intent: 'alternatives',
-          answerTemplate: `No—the options are not all the same. {{product:${cookwareSetId}:name}} records {{product:${cookwareSetId}:spec:0}} and {{product:${cookwareSetId}:spec:1}}, while {{product:${stockPotId}:name}} records {{product:${stockPotId}:spec:0}}.`,
-          productIds: [cookwareSetId, stockPotId],
+          productClaims: [
+            { productId: cookwareSetId, specificationIndexes: [0, 1] },
+            { productId: stockPotId, specificationIndexes: [0] },
+          ],
         });
       }
       if (normalized.includes('compare') || normalized.includes('different')) {
         return finalPlan({
           type: 'grounded_answer',
           intent: 'comparison',
-          answerTemplate: `{{product:${stockPotId}:name}} costs {{product:${stockPotId}:price}}; {{product:${stockPotId}:spec:0}}. {{product:${cookwareSetId}:name}} costs {{product:${cookwareSetId}:price}}; {{product:${cookwareSetId}:spec:0}}. Their current price difference is {{difference:${stockPotId}:${cookwareSetId}}}.`,
-          productIds: [stockPotId, cookwareSetId],
+          productClaims: [
+            { productId: stockPotId, pricePesewas: 32_000, specificationIndexes: [0] },
+            { productId: cookwareSetId, pricePesewas: 28_900, specificationIndexes: [0] },
+          ],
         });
       }
       return finalPlan({
         type: 'grounded_answer',
         intent: 'recommendation',
-        answerTemplate: `I would start with {{product:${stockPotId}:name}} because {{product:${stockPotId}:summary}} {{product:${stockPotId}:spec:1}}.`,
-        productIds: [stockPotId],
+        productClaims: [{ productId: stockPotId, includeSummary: true, specificationIndexes: [1] }],
       });
     });
     const app = createApp({ chatProvider: provider });
@@ -634,8 +859,7 @@ describe('shopping chat API', () => {
       return finalPlan({
         type: 'grounded_answer',
         intent: 'search',
-        answerTemplate: `I found {{product:${blenderId}:name}} at {{product:${blenderId}:price}}. {{product:${blenderId}:summary}}`,
-        productIds: [blenderId],
+        productClaims: [{ productId: blenderId, pricePesewas: 35_000, includeSummary: true }],
       });
     });
 
@@ -697,8 +921,10 @@ describe('shopping chat API', () => {
       : finalPlan({
         type: 'grounded_answer',
         intent: 'comparison',
-        answerTemplate: `{{product:${specifiedId}:name}} records {{product:${specifiedId}:spec:0}}. {{product:${unspecifiedId}:missing:specifications}}, so I cannot compare their capacity from the catalogue.`,
-        productIds: [specifiedId, unspecifiedId],
+        productClaims: [
+          { productId: specifiedId, includeSpecifications: true },
+          { productId: unspecifiedId, includeSpecifications: true },
+        ],
       }));
 
     const response = await request(createApp({ chatProvider: provider }))

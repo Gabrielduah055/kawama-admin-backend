@@ -100,7 +100,7 @@ const policyClaimSchema = z.discriminatedUnion('topic', [
   checkoutPolicyClaimSchema,
 ]);
 
-const productClaimsSchema = z.array(productClaimSchema).min(1).max(4).superRefine((claims, context) => {
+const uniqueProductClaims = (minimum: number) => z.array(productClaimSchema).min(minimum).max(4).superRefine((claims, context) => {
   const seen = new Set<string>();
   claims.forEach((claim, index) => {
     if (seen.has(claim.productId)) {
@@ -109,6 +109,9 @@ const productClaimsSchema = z.array(productClaimSchema).min(1).max(4).superRefin
     seen.add(claim.productId);
   });
 });
+
+const productClaimsSchema = uniqueProductClaims(1);
+const optionalProductClaimsSchema = uniqueProductClaims(0);
 
 const policyClaimsSchema = z.array(policyClaimSchema).min(1).max(5).superRefine((claims, context) => {
   const seen = new Set<string>();
@@ -119,11 +122,6 @@ const policyClaimsSchema = z.array(policyClaimSchema).min(1).max(5).superRefine(
     seen.add(claim.topic);
   });
 });
-
-const groundedProductIdsSchema = z.array(objectIdSchema).max(4).refine(
-  (identifiers) => new Set(identifiers).size === identifiers.length,
-  { message: 'Grounded product IDs must be unique.' },
-);
 
 const suggestedFollowUpsSchema = z.array(z.string().trim().min(1).max(100)).max(2).optional();
 
@@ -137,8 +135,7 @@ export const assistantResponseSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('grounded_answer'),
     intent: z.enum(['search', 'details', 'alternatives', 'count', 'comparison', 'recommendation']),
-    answerTemplate: z.string().trim().min(1).max(1_500),
-    productIds: groundedProductIdsSchema,
+    productClaims: optionalProductClaimsSchema,
     suggestedFollowUps: suggestedFollowUpsSchema,
   }).strict(),
   z.object({ type: z.literal('policy_answer'), policyClaims: policyClaimsSchema }).strict(),
