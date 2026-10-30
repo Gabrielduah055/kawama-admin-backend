@@ -15,6 +15,9 @@ const managedEnvironmentKeys = [
   'STORE_DELIVERY_POLICY',
   'STORE_PAYMENT_POLICY',
   'STORE_RETURN_POLICY',
+  'STORE_CONTACT_EMAIL',
+  'STORE_CONTACT_PHONE',
+  'STORE_CONTACT_WHATSAPP_URL',
 ] as const;
 const originalEnvironment = new Map(managedEnvironmentKeys.map((key) => [key, process.env[key]]));
 
@@ -54,6 +57,9 @@ beforeAll(async () => {
   process.env.STORE_DELIVERY_POLICY = 'Delivery fees are quoted separately and paid on delivery.';
   process.env.STORE_PAYMENT_POLICY = 'Product payments are processed securely before fulfilment.';
   process.env.STORE_RETURN_POLICY = 'Unused items may be returned within seven days.';
+  process.env.STORE_CONTACT_EMAIL = 'support@kawama.example';
+  process.env.STORE_CONTACT_PHONE = '+233 20 000 0000';
+  process.env.STORE_CONTACT_WHATSAPP_URL = 'https://wa.me/233200000000';
   resetEnvironmentForTests();
   app = createApp({ orderBridgeApiKey: integrationKey });
 
@@ -126,6 +132,34 @@ describe('OrderBridge commerce integration', () => {
     expect(JSON.stringify(response.body)).not.toMatch(/reservedQuantity|updatedBy|publicId/);
   });
 
+  it('does not let preferences exclude valid query matches and treats preference-only searches as alternatives', async () => {
+    await seedProduct();
+    await seedProduct({
+      slug: 'stainless-pot',
+      name: 'Stainless Pot',
+      description: 'A quiet stainless pot for soups.',
+      pricePesewas: 40_000,
+      specifications: [{ label: 'Material', value: 'Stainless steel' }],
+    });
+
+    const queryWithPreference = await request(app)
+      .get('/api/integrations/orderbridge/products/search')
+      .set(authorized())
+      .query({ query: 'ceramic', preference: 'quiet', limit: 10 });
+    expect(queryWithPreference.status).toBe(200);
+    expect(queryWithPreference.body.products.map((product: { name: string }) => product.name)).toContain('Ceramic Pan');
+
+    const preferenceOnly = await request(app)
+      .get('/api/integrations/orderbridge/products/search')
+      .set(authorized())
+      .query({ preference: ['ceramic', 'stainless'], sort: 'price_asc', limit: 10 });
+    expect(preferenceOnly.status).toBe(200);
+    expect(preferenceOnly.body.products.map((product: { name: string }) => product.name)).toEqual([
+      'Ceramic Pan',
+      'Stainless Pot',
+    ]);
+  });
+
   it('returns active product details, live available stock, policies, and safe not-found responses', async () => {
     const product = await seedProduct();
     const productId = String(product._id);
@@ -149,6 +183,20 @@ describe('OrderBridge commerce integration', () => {
     expect(policies.body).toEqual({
       policies: [{ name: 'Returns', content: 'Unused items may be returned within seven days.' }],
     });
+
+    const integrationPolicies = await request(app)
+      .get('/api/integrations/orderbridge/policies')
+      .set(authorized());
+    expect(integrationPolicies.body.policies).toEqual(expect.arrayContaining([
+      {
+        name: 'Checkout',
+        content: 'Currency: GHS. Product payment provider: Paystack. Product payment scope: products only. Delivery payment method: pay on delivery.',
+      },
+      {
+        name: 'Contact',
+        content: 'Email: support@kawama.example. Phone: +233 20 000 0000. WhatsApp: https://wa.me/233200000000.',
+      },
+    ]));
 
     await ProductModel.findByIdAndUpdate(productId, { status: 'archived' });
     const archived = await request(app)

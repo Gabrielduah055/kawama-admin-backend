@@ -4,6 +4,7 @@ import {
   getPublicProductAvailabilityByIdentifiers,
   getPublicProductsByIdentifiers,
   searchPublicProducts,
+  type PublicProductSearchInput,
   type PublicProductSort,
 } from './catalog.service.js';
 import { getApprovedStorePolicies } from './store-policy.service.js';
@@ -94,9 +95,7 @@ function toOrderBridgeProduct(
 }
 
 export async function searchOrderBridgeProducts(input: OrderBridgeProductSearchInput) {
-  const searchText = [input.query, ...input.preferences].filter(Boolean).join(' ');
-  const result = await searchPublicProducts({
-    ...(searchText ? { query: searchText } : {}),
+  const baseSearch = {
     ...(input.category ? { category: input.category } : {}),
     ...(input.minPrice !== undefined ? { minPrice: input.minPrice } : {}),
     ...(input.maxPrice !== undefined ? { maxPrice: input.maxPrice } : {}),
@@ -104,14 +103,31 @@ export async function searchOrderBridgeProducts(input: OrderBridgeProductSearchI
     sort: orderBridgeSorts[input.sort],
     page: 1,
     limit: input.limit,
-  });
+  } satisfies PublicProductSearchInput;
+  const searchTerms = input.query
+    ? [input.query]
+    : input.category || input.preferences.length === 0
+      ? [undefined]
+      : input.preferences;
+  const results = await Promise.all(searchTerms.map((query) => searchPublicProducts({
+    ...baseSearch,
+    ...(query ? { query } : {}),
+  })));
+  const productsById = new Map<string, Record<string, unknown>>();
+  for (const result of results) {
+    for (const product of result.products) productsById.set(String(product.id), product);
+  }
+  const products = [...productsById.values()];
+  if (input.sort === 'price_asc') products.sort((first, second) => Number(first.price) - Number(second.price));
+  if (input.sort === 'price_desc') products.sort((first, second) => Number(second.price) - Number(first.price));
+  const selectedProducts = products.slice(0, input.limit);
   const availability = await getPublicProductAvailabilityByIdentifiers(
-    result.products.map((product) => String(product.id)),
+    selectedProducts.map((product) => String(product.id)),
   );
   return {
-    products: result.products.map((product) =>
+    products: selectedProducts.map((product) =>
       toOrderBridgeProduct(product, availability.get(String(product.id))?.stockQuantity)),
-    total: result.total,
+    total: results.length === 1 ? results[0]!.total : products.length,
   };
 }
 
@@ -133,7 +149,22 @@ export async function getOrderBridgeProductAvailability(productId: string) {
 
 export function getOrderBridgePolicies(topic?: string) {
   const approved = getApprovedStorePolicies();
+  const contactContent = [
+    approved.contact.email ? `Email: ${approved.contact.email}.` : '',
+    approved.contact.phone ? `Phone: ${approved.contact.phone}.` : '',
+    approved.contact.whatsappUrl ? `WhatsApp: ${approved.contact.whatsappUrl}.` : '',
+  ].filter(Boolean).join(' ');
   const policies = [
+    {
+      name: 'Checkout',
+      content: [
+        `Currency: ${approved.currency}.`,
+        `Product payment provider: ${approved.checkout.productPaymentProvider}.`,
+        `Product payment scope: ${approved.checkout.productPaymentScope.replaceAll('_', ' ')}.`,
+        `Delivery payment method: ${approved.checkout.deliveryPaymentMethod.replaceAll('_', ' ')}.`,
+      ].join(' '),
+    },
+    ...(contactContent ? [{ name: 'Contact', content: contactContent }] : []),
     { name: 'Delivery', content: approved.deliveryPolicy },
     { name: 'Payment', content: approved.paymentPolicy },
     { name: 'Returns', content: approved.returnPolicy },
