@@ -26,6 +26,12 @@ export interface PublicProductSearchResult {
   total: number;
 }
 
+export interface PublicProductAvailability {
+  productId: string;
+  available: boolean;
+  stockQuantity: number;
+}
+
 function normalizeQueryWords(value: string): string[] {
   return value
     .normalize('NFKD')
@@ -217,4 +223,22 @@ export async function getPublicProductsByIdentifiers(identifiers: string[]): Pro
     const product = mapped.get(identifier);
     return product ? [product] : [];
   });
+}
+
+export async function getPublicProductAvailabilityByIdentifiers(
+  identifiers: string[],
+): Promise<Map<string, PublicProductAvailability>> {
+  const objectIds = identifiers
+    .filter((identifier) => Types.ObjectId.isValid(identifier))
+    .map((identifier) => new Types.ObjectId(identifier));
+  if (objectIds.length === 0) return new Map();
+
+  const products = await ProductModel.find({ _id: { $in: objectIds }, status: 'active' })
+    .select('_id stockQuantity reservedQuantity')
+    .lean();
+  return new Map(products.map((product) => {
+    const stockQuantity = Math.max(0, product.stockQuantity - (product.reservedQuantity ?? 0));
+    const productId = String(product._id);
+    return [productId, { productId, available: stockQuantity > 0, stockQuantity }];
+  }));
 }

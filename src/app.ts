@@ -8,6 +8,7 @@ import { AppError } from './errors/AppError.js';
 import { getBuildMetadata } from './lib/build.js';
 import { createAdministratorAuthentication } from './middlewares/auth.js';
 import { errorHandler, notFoundHandler } from './middlewares/errors.js';
+import { createOrderBridgeAuthentication } from './middlewares/orderbridge-auth.js';
 import { requestContext } from './middlewares/requestContext.js';
 import { openApiDocument } from './openapi.js';
 import { createAdminRouter } from './route/adminRouter.js';
@@ -15,6 +16,7 @@ import { authRouter } from './route/authRouter.js';
 import { createCheckoutRouter, createPaystackWebhookRouter } from './route/checkoutRouter.js';
 import { createChatRouter } from './route/chatRouter.js';
 import { createProductRouter } from './route/productRouter.js';
+import { orderBridgeRouter } from './route/orderbridgeRouter.js';
 import { publicRouter } from './route/publicRouter.js';
 import { verifyDatabaseAdminToken, type AdminTokenVerifier } from './services/auth.service.js';
 import { cloudinaryMediaService, type MediaService } from './services/cloudinary.service.js';
@@ -26,6 +28,7 @@ export interface ApplicationDependencies {
   mediaService?: MediaService;
   paystackGateway?: PaystackGateway;
   chatProvider?: ChatProvider;
+  orderBridgeApiKey?: string;
 }
 
 const corsOptions: Omit<CorsOptions, 'origin'> = {
@@ -119,6 +122,11 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
   app.use('/api/v1/checkout', createCheckoutRouter(selectedPaystackGateway));
   app.use('/api/v1/webhooks', createPaystackWebhookRouter(selectedPaystackGateway));
   app.use('/api/ai', createChatRouter(dependencies.chatProvider ?? openRouterProvider));
+  app.use(
+    '/api/integrations/orderbridge',
+    createOrderBridgeAuthentication(dependencies.orderBridgeApiKey ?? environment.ORDERBRIDGE_API_KEY),
+    orderBridgeRouter,
+  );
   app.use('/api/v1', publicRouter);
   app.use(
     '/api/v1/admin',

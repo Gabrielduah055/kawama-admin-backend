@@ -12,6 +12,7 @@ export const openApiDocument = {
     { name: 'Public reviews' },
     { name: 'Public checkout' },
     { name: 'Shopping assistant' },
+    { name: 'OrderBridge integration' },
     { name: 'Paystack webhooks' },
     { name: 'Admin dashboard' },
     { name: 'Admin orders' },
@@ -102,6 +103,64 @@ export const openApiDocument = {
           '502': { description: 'The model returned an invalid response or exceeded its bounded tool cycle.' },
           '503': { description: 'Chat is disabled, unconfigured, rate-limited upstream, or temporarily unavailable.' },
           '504': { description: 'The model provider timed out.' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/products/search': {
+      get: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        description: 'Searches active Kawama products using the external OrderBridge commerce API contract.',
+        parameters: [
+          { name: 'query', in: 'query', schema: { type: 'string', maxLength: 300 } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 10, default: 10 } },
+          { name: 'minPrice', in: 'query', schema: { type: 'number', minimum: 0 }, description: 'Minimum price in Ghana cedis.' },
+          { name: 'maxPrice', in: 'query', schema: { type: 'number', minimum: 0 }, description: 'Maximum price in Ghana cedis.' },
+          { name: 'category', in: 'query', schema: { type: 'string', maxLength: 100 } },
+          { name: 'available', in: 'query', schema: { type: 'boolean' } },
+          { name: 'preference', in: 'query', schema: { type: 'array', maxItems: 10, items: { type: 'string', maxLength: 100 } }, style: 'form', explode: true },
+          { name: 'sort', in: 'query', schema: { enum: ['relevance', 'price_asc', 'price_desc'], default: 'relevance' } },
+        ],
+        responses: {
+          '200': { description: 'Matching active products.', content: { 'application/json': { schema: { type: 'object', required: ['products', 'total'], properties: { products: { type: 'array', items: { $ref: '#/components/schemas/OrderBridgeProduct' } }, total: { type: 'integer', minimum: 0 } } } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+          '503': { description: 'The API key or canonical storefront URL is not configured.' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/products/{productId}': {
+      get: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        parameters: [{ $ref: '#/components/parameters/ProductId' }],
+        responses: {
+          '200': { description: 'Active product detail.', content: { 'application/json': { schema: { type: 'object', required: ['product'], properties: { product: { $ref: '#/components/schemas/OrderBridgeProduct' } } } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/products/{productId}/availability': {
+      get: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        parameters: [{ $ref: '#/components/parameters/ProductId' }],
+        responses: {
+          '200': { description: 'Current sellable stock after active reservations.', content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeAvailability' } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/policies': {
+      get: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        parameters: [{ name: 'topic', in: 'query', schema: { type: 'string', maxLength: 200 } }],
+        responses: {
+          '200': { description: 'Approved customer-facing store policies.', content: { 'application/json': { schema: { type: 'object', required: ['policies'], properties: { policies: { type: 'array', maxItems: 20, items: { $ref: '#/components/schemas/OrderBridgePolicy' } } } } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
         },
       },
     },
@@ -264,7 +323,10 @@ export const openApiDocument = {
     '/api/v1/admin/uploads': { delete: { tags: ['Admin uploads'], security: [{ bearerAuth: [] }], requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['publicId'], properties: { publicId: { type: 'string' } } } } } }, responses: { '200': { description: 'Unreferenced asset destroyed.' }, '409': { description: 'ASSET_IN_USE.' } } } },
   },
   components: {
-    securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } },
+    securitySchemes: {
+      bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+      orderBridgeApiKey: { type: 'http', scheme: 'bearer', bearerFormat: 'API key' },
+    },
     parameters: {
       Page: { name: 'page', in: 'query', schema: { type: 'integer', minimum: 1, default: 1 } },
       Limit: { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 24 } },
@@ -276,6 +338,7 @@ export const openApiDocument = {
       Unauthorized: { description: 'INVALID_CREDENTIALS, ADMIN_TOKEN_REQUIRED, or INVALID_ADMIN_TOKEN.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
       NotFound: { description: 'Requested resource does not exist.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
       Conflict: { description: 'DUPLICATE_RESOURCE, CATEGORY_IN_USE, or ASSET_IN_USE.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+      OrderBridgeUnauthorized: { description: 'The server-to-server OrderBridge API key is missing or invalid.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
     },
     schemas: {
       Error: { type: 'object', required: ['error'], properties: { error: { type: 'object', required: ['code', 'message', 'requestId'], properties: { code: { type: 'string' }, message: { type: 'string' }, requestId: { type: 'string' }, details: {} } } } },
@@ -337,6 +400,23 @@ export const openApiDocument = {
       CategoryPatch: { allOf: [{ $ref: '#/components/schemas/CategoryInput' }], description: 'All properties optional; slug is not accepted.' },
       Product: { type: 'object', required: ['id', 'slug', 'name', 'category', 'categorySlug', 'price', 'currency', 'images', 'inStock', 'stockLevel', 'featured'], properties: { id: { type: 'string' }, slug: { type: 'string' }, name: { type: 'string' }, category: { type: 'string' }, categorySlug: { type: 'string' }, shortDescription: { type: 'string' }, description: { type: 'string' }, price: { type: 'number' }, compareAtPrice: { type: 'number' }, currency: { const: 'GHS' }, images: { type: 'array', items: { $ref: '#/components/schemas/Image' } }, inStock: { type: 'boolean' }, stockLevel: { enum: ['in_stock', 'low_stock', 'out_of_stock'] }, featured: { type: 'boolean' }, isNew: { type: 'boolean' }, isBestSeller: { type: 'boolean' }, complementaryCategories: { type: 'array', items: { type: 'string' } }, details: { type: 'array', items: { type: 'string' } }, specifications: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, value: { type: 'string' } } } } } },
       ProductList: { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Product' } }, meta: { $ref: '#/components/schemas/Meta' } } },
+      OrderBridgeProduct: {
+        type: 'object',
+        required: ['id', 'name', 'price', 'currency', 'available', 'canonicalUrl'],
+        properties: {
+          id: { type: 'string' },
+          name: { type: 'string', maxLength: 300 },
+          description: { type: 'string', maxLength: 4_000 },
+          price: { type: 'number', minimum: 0, description: 'Current price in Ghana cedis.' },
+          currency: { const: 'GHS' },
+          available: { type: 'boolean' },
+          stockQuantity: { type: 'integer', minimum: 0, description: 'Sellable quantity after active reservations.' },
+          specifications: { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean'] }, maxProperties: 50 },
+          canonicalUrl: { type: 'string', format: 'uri', pattern: '^https://' },
+        },
+      },
+      OrderBridgeAvailability: { type: 'object', required: ['productId', 'available', 'stockQuantity'], properties: { productId: { type: 'string' }, available: { type: 'boolean' }, stockQuantity: { type: 'integer', minimum: 0 } } },
+      OrderBridgePolicy: { type: 'object', required: ['name', 'content'], properties: { name: { type: 'string', maxLength: 200 }, content: { type: 'string', maxLength: 8_000 }, url: { type: 'string', format: 'uri' } } },
       ProductInput: { type: 'object', required: ['slug', 'name', 'categoryId'], properties: { slug: { type: 'string' }, name: { type: 'string' }, categoryId: { type: 'string' }, shortDescription: { type: 'string' }, description: { type: 'string' }, price: { type: 'number', minimum: 0 }, compareAtPrice: { type: 'number' }, images: { type: 'array', maxItems: 8, items: { $ref: '#/components/schemas/Image' } }, stockQuantity: { type: 'integer', minimum: 0 }, lowStockThreshold: { type: 'integer', minimum: 0 }, featured: { type: 'boolean' }, isNew: { type: 'boolean' }, isBestSeller: { type: 'boolean' }, complementaryCategoryIds: { type: 'array', items: { type: 'string' } }, details: { type: 'array', items: { type: 'string' } }, specifications: { type: 'array', items: { type: 'object', required: ['label', 'value'], properties: { label: { type: 'string' }, value: { type: 'string' } } } }, status: { enum: ['draft', 'active'] } } },
       ProductPatch: { allOf: [{ $ref: '#/components/schemas/ProductInput' }], description: 'All properties optional; slug is not accepted.' },
       AdminOrderSummary: {
