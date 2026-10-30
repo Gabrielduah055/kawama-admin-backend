@@ -9,6 +9,7 @@ const managedKeys = [
   'STORE_PAYMENT_POLICY',
   'STORE_RETURN_POLICY',
   'STOREFRONT_PRODUCT_URL_TEMPLATE',
+  'ORDERBRIDGE_API_KEY',
 ] as const;
 const originals = new Map(managedKeys.map((key) => [key, process.env[key]]));
 
@@ -30,6 +31,7 @@ describe('optional store configuration', () => {
     process.env.STORE_PAYMENT_POLICY = '  ';
     process.env.STORE_RETURN_POLICY = '';
     process.env.STOREFRONT_PRODUCT_URL_TEMPLATE = '';
+    process.env.ORDERBRIDGE_API_KEY = '';
     resetEnvironmentForTests();
 
     const environment = getEnvironment();

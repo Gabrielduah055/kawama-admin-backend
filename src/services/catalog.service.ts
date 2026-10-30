@@ -10,6 +10,7 @@ export type PublicProductSort = (typeof publicProductSorts)[number];
 
 export interface PublicProductSearchInput {
   query?: string | undefined;
+  anyQueries?: string[] | undefined;
   category?: string | undefined;
   minPrice?: number | undefined;
   maxPrice?: number | undefined;
@@ -24,6 +25,12 @@ export interface PublicProductSearchInput {
 export interface PublicProductSearchResult {
   products: Array<Record<string, unknown>>;
   total: number;
+}
+
+export interface PublicProductAvailability {
+  productId: string;
+  available: boolean;
+  stockQuantity: number;
 }
 
 function normalizeQueryWords(value: string): string[] {
@@ -149,11 +156,14 @@ export async function searchPublicProducts(input: PublicProductSearchInput): Pro
   if (input.category?.trim() && categoryId === undefined) return { products: [], total: 0 };
 
   const baseFilter = buildBaseFilter(input, categoryId);
-  const queryWords = input.query ? normalizeQueryWords(input.query) : [];
-  if (input.query?.trim() && queryWords.length === 0) return { products: [], total: 0 };
-  const selectedSort = input.sort ?? (queryWords.length > 0 ? 'relevance' : 'featured');
+  const queryGroups = input.query
+    ? [normalizeQueryWords(input.query)]
+    : (input.anyQueries ?? []).map(normalizeQueryWords).filter((words) => words.length > 0);
+  const hasKeywordInput = Boolean(input.query?.trim()) || (input.anyQueries ?? []).some((query) => query.trim());
+  if (hasKeywordInput && queryGroups.length === 0) return { products: [], total: 0 };
+  const selectedSort = input.sort ?? (queryGroups.length > 0 ? 'relevance' : 'featured');
 
-  if (queryWords.length === 0) {
+  if (queryGroups.length === 0) {
     const sort = selectedSort === 'relevance' ? mongoSorts.featured : mongoSorts[selectedSort];
     const [products, total] = await Promise.all([
       ProductModel.find(baseFilter)
@@ -171,16 +181,44 @@ export async function searchPublicProducts(input: PublicProductSearchInput): Pro
     };
   }
 
+  const sort = selectedSort === 'relevance' ? mongoSorts.featured : mongoSorts[selectedSort];
+  if (!input.query) {
+    const preferenceFilters = await Promise.all(queryGroups.map(async (words) => {
+      const exactKeyword = exactKeywordFilter(words);
+      const exactTotal = await ProductModel.countDocuments({ ...baseFilter, ...exactKeyword });
+      return exactTotal > 0 ? exactKeyword : fuzzyKeywordFilter(words) ?? exactKeyword;
+    }));
+    const preferenceFilter = preferenceFilters.length === 1
+      ? preferenceFilters[0]!
+      : { $or: preferenceFilters };
+    const selectedFilter = { ...baseFilter, ...preferenceFilter };
+    const [products, total] = await Promise.all([
+      ProductModel.find(selectedFilter)
+        .populate('category', 'name slug')
+        .populate('complementaryCategories', 'name slug')
+        .sort(sort)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      ProductModel.countDocuments(selectedFilter),
+    ]);
+    return {
+      products: products.map((product) => toPublicProduct(product as Record<string, any>)),
+      total,
+    };
+  }
+
+  const queryWords = queryGroups[0]!;
   const exactFilter = { ...baseFilter, ...exactKeywordFilter(queryWords) };
   const exactTotal = await ProductModel.countDocuments(exactFilter);
-  const fuzzyFilter = exactTotal === 0 ? fuzzyKeywordFilter(queryWords) : undefined;
+  const fuzzyKeyword = exactTotal === 0 ? fuzzyKeywordFilter(queryWords) : undefined;
+  const fuzzyFilter = fuzzyKeyword ? { ...baseFilter, ...fuzzyKeyword } : undefined;
   const selectedFilter = exactTotal > 0 || !fuzzyFilter
     ? exactFilter
-    : { ...baseFilter, ...fuzzyFilter };
+    : fuzzyFilter;
   const total = exactTotal > 0 || !fuzzyFilter
     ? exactTotal
     : await ProductModel.countDocuments(selectedFilter);
-  const sort = selectedSort === 'relevance' ? mongoSorts.featured : mongoSorts[selectedSort];
   const products = await ProductModel.find(selectedFilter)
     .populate('category', 'name slug')
     .populate('complementaryCategories', 'name slug')
@@ -217,4 +255,22 @@ export async function getPublicProductsByIdentifiers(identifiers: string[]): Pro
     const product = mapped.get(identifier);
     return product ? [product] : [];
   });
+}
+
+export async function getPublicProductAvailabilityByIdentifiers(
+  identifiers: string[],
+): Promise<Map<string, PublicProductAvailability>> {
+  const objectIds = identifiers
+    .filter((identifier) => Types.ObjectId.isValid(identifier))
+    .map((identifier) => new Types.ObjectId(identifier));
+  if (objectIds.length === 0) return new Map();
+
+  const products = await ProductModel.find({ _id: { $in: objectIds }, status: 'active' })
+    .select('_id stockQuantity reservedQuantity')
+    .lean();
+  return new Map(products.map((product) => {
+    const stockQuantity = Math.max(0, product.stockQuantity - (product.reservedQuantity ?? 0));
+    const productId = String(product._id);
+    return [productId, { productId, available: stockQuantity > 0, stockQuantity }];
+  }));
 }

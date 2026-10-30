@@ -48,6 +48,10 @@ const environmentSchema = z.object({
   ),
   OPENROUTER_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(60_000).default(30_000),
   AI_CHAT_CONVERSATION_TTL_HOURS: z.coerce.number().int().min(1).max(168).default(24),
+  ORDERBRIDGE_API_KEY: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().min(32).max(512).optional(),
+  ),
   STOREFRONT_PRODUCT_URL_TEMPLATE: optionalContactText(2_000),
   STORE_CONTACT_EMAIL: optionalContactEmail,
   STORE_CONTACT_PHONE: optionalContactText(40),
