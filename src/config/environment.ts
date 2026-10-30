@@ -61,7 +61,7 @@ const environmentSchema = z.object({
     emptyStringToUndefined,
     z.string().trim().min(32).max(512).optional(),
   ),
-  ORDERBRIDGE_CHAT_TIMEOUT_MS: z.coerce.number().int().min(500).max(15_000).default(10_000),
+  ORDERBRIDGE_CHAT_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(120_000).default(60_000),
   ORDERBRIDGE_API_KEY: z.preprocess(
     emptyStringToUndefined,
     z.string().trim().min(32).max(512).optional(),

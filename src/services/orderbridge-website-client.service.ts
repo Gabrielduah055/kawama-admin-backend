@@ -3,6 +3,7 @@ import { AppError } from '../errors/AppError.js';
 
 const conversationIdSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const conversationTokenSchema = z.string().regex(/^v1\.[A-Za-z0-9_-]{43}$/);
+const commerceFactFreshnessSchema = z.enum(['live', 'cached', 'unverified']);
 
 const orderBridgeProductSchema = z.object({
   id: z.union([z.string(), z.number()]).transform(String),
@@ -19,6 +20,13 @@ const responseSchema = z.object({
   data: z.object({
     products: z.array(orderBridgeProductSchema).max(20).optional(),
     product: orderBridgeProductSchema.optional(),
+    commerceDataFreshness: z.object({
+      products: z.array(z.object({
+        productId: z.union([z.string(), z.number()]).transform(String),
+        price: commerceFactFreshnessSchema,
+        availability: commerceFactFreshnessSchema,
+      })).max(20).optional(),
+    }).passthrough().optional(),
   }).passthrough().optional(),
   conversation: z.object({
     conversationId: conversationIdSchema,

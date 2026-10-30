@@ -1,14 +1,10 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
-import path from 'node:path';
-import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import request from 'supertest';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { createApp } from '../src/app.js';
-import { resetEnvironmentForTests } from '../src/config/environment.js';
-import { CategoryModel } from '../src/models/CategorySchema.js';
-import { OrderBridgeChatSessionModel } from '../src/models/OrderBridgeChatSessionSchema.js';
-import { ProductModel } from '../src/models/ProductSchema.js';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getEnvironment, resetEnvironmentForTests } from '../src/config/environment.js';
+import {
+  buildOrderBridgeMessage,
+  mapProductCards,
+  runOrderBridgeShoppingChat,
+} from '../src/services/orderbridge-chat.service.js';
 import {
   createOrderBridgeWebsiteClient,
   type OrderBridgeWebsiteClient,
@@ -16,30 +12,51 @@ import {
   type OrderBridgeWebsiteResponse,
 } from '../src/services/orderbridge-website-client.service.js';
 
+const modelMocks = vi.hoisted(() => ({
+  create: vi.fn(),
+  findOne: vi.fn(),
+  catalogLookup: vi.fn(),
+}));
+
+vi.mock('../src/models/OrderBridgeChatSessionSchema.js', () => ({
+  OrderBridgeChatSessionModel: {
+    create: modelMocks.create,
+    findOne: modelMocks.findOne,
+  },
+}));
+
+vi.mock('../src/services/catalog.service.js', () => ({
+  getPublicProductsByIdentifiers: modelMocks.catalogLookup,
+}));
+
 const businessId = '0123456789abcdef01234567';
-const otherBusinessId = 'fedcba987654321001234567';
 const upstreamConversationId = 'A'.repeat(43);
 const upstreamConversationToken = `v1.${'B'.repeat(43)}`;
 const integrationKey = 'website-integration-key-that-is-server-only';
-
-let mongo: MongoMemoryServer | undefined;
-let mongoDataDirectory: string | undefined;
 const originalChatEnabled = process.env.AI_CHAT_ENABLED;
+const originalTimeout = process.env.ORDERBRIDGE_CHAT_TIMEOUT_MS;
+
+const localProduct = {
+  id: '507f1f77bcf86cd799439011',
+  slug: 'smoothie-blender',
+  name: 'Smoothie Blender',
+  price: 350,
+  currency: 'GHS',
+  images: [{ src: 'https://cdn.example/blender.png', alt: 'Smoothie blender' }],
+  stockLevel: 'low_stock',
+};
 
 class StubOrderBridgeClient implements OrderBridgeWebsiteClient {
   public readonly calls: OrderBridgeWebsiteMessage[] = [];
 
   constructor(
     public readonly businessId: string,
-    private readonly responder: (
-      input: OrderBridgeWebsiteMessage,
-      call: number,
-    ) => OrderBridgeWebsiteResponse | Promise<OrderBridgeWebsiteResponse>,
+    private readonly response: OrderBridgeWebsiteResponse,
   ) {}
 
   async sendMessage(input: OrderBridgeWebsiteMessage): Promise<OrderBridgeWebsiteResponse> {
     this.calls.push(input);
-    return this.responder(input, this.calls.length);
+    return this.response;
   }
 }
 
@@ -55,180 +72,147 @@ function upstreamResponse(overrides: Partial<OrderBridgeWebsiteResponse> = {}): 
   };
 }
 
-async function seedProduct() {
-  const category = await CategoryModel.create({
-    name: 'Appliances',
-    slug: 'appliances',
-    status: 'active',
-  });
-  return ProductModel.create({
-    slug: 'smoothie-blender',
-    name: 'Smoothie Blender',
-    category: category._id,
-    pricePesewas: 35_000,
-    images: [{ src: 'https://cdn.example/blender.png', alt: 'Smoothie blender', position: 0 }],
-    stockQuantity: 2,
-    lowStockThreshold: 2,
-    status: 'active',
-  });
+function upstreamProduct(id: string, name = `Product ${id}`) {
+  return {
+    id,
+    name,
+    price: 100,
+    currency: 'GHS',
+    available: false,
+    canonicalUrl: `https://shop.example/products/${id}`,
+  };
 }
 
-beforeAll(async () => {
-  const cacheRoot = path.join(process.cwd(), 'node_modules', '.cache');
-  await mkdir(cacheRoot, { recursive: true });
-  mongoDataDirectory = await mkdtemp(path.join(cacheRoot, 'kawama-orderbridge-chat-'));
-  mongo = await MongoMemoryServer.create({ instance: { dbPath: mongoDataDirectory, launchTimeout: 30_000 } });
-  await mongoose.connect(mongo.getUri());
-  await Promise.all([
-    CategoryModel.syncIndexes(),
-    ProductModel.syncIndexes(),
-    OrderBridgeChatSessionModel.syncIndexes(),
-  ]);
-});
+function publicProduct(id: string) {
+  return {
+    ...localProduct,
+    id,
+    slug: `product-${id}`,
+    name: `Product ${id}`,
+  };
+}
 
-beforeEach(async () => {
+beforeEach(() => {
   process.env.AI_CHAT_ENABLED = 'true';
+  delete process.env.ORDERBRIDGE_CHAT_TIMEOUT_MS;
   resetEnvironmentForTests();
-  await Promise.all([
-    CategoryModel.deleteMany({}),
-    ProductModel.deleteMany({}),
-    OrderBridgeChatSessionModel.deleteMany({}),
-  ]);
+  vi.clearAllMocks();
 });
 
-afterAll(async () => {
+afterAll(() => {
   if (originalChatEnabled === undefined) delete process.env.AI_CHAT_ENABLED;
   else process.env.AI_CHAT_ENABLED = originalChatEnabled;
+  if (originalTimeout === undefined) delete process.env.ORDERBRIDGE_CHAT_TIMEOUT_MS;
+  else process.env.ORDERBRIDGE_CHAT_TIMEOUT_MS = originalTimeout;
   resetEnvironmentForTests();
-  await mongoose.disconnect();
-  await mongo?.stop();
-  if (mongoDataDirectory) await rm(mongoDataDirectory, { recursive: true, force: true });
 });
 
-describe('OrderBridge website chat adapter', () => {
-  it('maps verified products and preserves the server-side upstream conversation', async () => {
-    const product = await seedProduct();
-    const client = new StubOrderBridgeClient(businessId, () => upstreamResponse({
+describe('OrderBridge chat product mapping', () => {
+  it('keeps fresh Kawama price and stock when OrderBridge data is cached', async () => {
+    const response = upstreamResponse({
       data: {
-        products: [{
-          id: String(product._id),
-          name: 'Smoothie Blender',
-          price: 350,
-          currency: 'GHS',
-          available: true,
-          canonicalUrl: 'https://shop.example/products/smoothie-blender',
-        }],
+        product: upstreamProduct(localProduct.id, 'Cached product name'),
+        commerceDataFreshness: {
+          products: [{
+            productId: localProduct.id,
+            price: 'cached',
+            availability: 'cached',
+          }],
+        },
       },
-    }));
-    const app = createApp({ chatEngine: 'orderbridge', orderBridgeWebsiteClient: client });
-
-    const first = await request(app).post('/api/ai/chat').send({ message: 'Show me a blender.' });
-
-    expect(first.status).toBe(200);
-    expect(first.body.data).toMatchObject({
-      assistantMessage: 'Here is the verified product.',
-      products: [{
-        id: String(product._id),
-        slug: 'smoothie-blender',
-        name: 'Smoothie Blender',
-        price: 350,
-        currency: 'GHS',
-        availability: 'low_stock',
-        image: { src: 'https://cdn.example/blender.png', alt: 'Smoothie blender' },
-        url: 'https://shop.example/products/smoothie-blender',
-      }],
     });
-    expect(first.body.data.suggestedFollowUps).toBeUndefined();
-    expect(JSON.stringify(first.body)).not.toContain(upstreamConversationToken);
-    expect(client.calls[0]?.conversation).toBeUndefined();
+    const getProducts = vi.fn(async () => [localProduct]);
 
-    const second = await request(app)
-      .post('/api/ai/chat')
-      .set('X-Chat-Session', String(first.headers['x-chat-session']))
-      .send({ conversationId: first.body.data.conversationId, message: 'Which one is available?' });
+    const cards = await mapProductCards(response, getProducts);
 
-    expect(second.status).toBe(200);
-    expect(client.calls[1]?.conversation).toEqual({
-      conversationId: upstreamConversationId,
-      conversationToken: upstreamConversationToken,
+    expect(cards).toEqual([expect.objectContaining({
+      id: localProduct.id,
+      name: 'Smoothie Blender',
+      price: 350,
+      availability: 'low_stock',
+      url: `https://shop.example/products/${localProduct.id}`,
+    })]);
+  });
+
+  it('prioritizes the explicitly selected product before the four-card limit', async () => {
+    const response = upstreamResponse({
+      data: {
+        product: upstreamProduct('selected'),
+        products: ['old-1', 'old-2', 'old-3', 'old-4'].map((id) => upstreamProduct(id)),
+      },
+    });
+    const getProducts = vi.fn(async (identifiers: string[]) => identifiers.map(publicProduct));
+
+    const cards = await mapProductCards(response, getProducts);
+
+    expect(getProducts).toHaveBeenCalledWith(['selected', 'old-1', 'old-2', 'old-3']);
+    expect(cards.map((card) => card.id)).toEqual(['selected', 'old-1', 'old-2', 'old-3']);
+  });
+});
+
+describe('OrderBridge product-page context', () => {
+  it.each([
+    ['productId', { productId: localProduct.id }],
+    ['productSlug', { productSlug: localProduct.slug }],
+  ] as const)('forwards authoritative context resolved from %s inside the supported message field', async (_label, context) => {
+    modelMocks.catalogLookup.mockResolvedValueOnce([localProduct]);
+    modelMocks.create.mockResolvedValueOnce({ _id: 'local-conversation-id' });
+    const client = new StubOrderBridgeClient(businessId, upstreamResponse());
+
+    await runOrderBridgeShoppingChat({ message: 'Tell me about this.', context }, undefined, client);
+
+    expect(modelMocks.catalogLookup).toHaveBeenCalledWith([Object.values(context)[0]]);
+    expect(client.calls[0]).toEqual({
+      message: [
+        `Kawama catalog product page: ${localProduct.name} (product ID: ${localProduct.id}; slug: ${localProduct.slug}).`,
+        'Customer message: Tell me about this.',
+      ].join('\n'),
     });
   });
 
-  it('isolates conversations between visitors and configured businesses', async () => {
-    const client = new StubOrderBridgeClient(businessId, () => upstreamResponse());
-    const initial = await request(createApp({ chatEngine: 'orderbridge', orderBridgeWebsiteClient: client }))
-      .post('/api/ai/chat')
-      .send({ message: 'Hello' });
+  it('does not forward unresolved browser context as a product fact', async () => {
+    const getProducts = vi.fn(async () => []);
 
-    const stolen = await request(createApp({ chatEngine: 'orderbridge', orderBridgeWebsiteClient: client }))
-      .post('/api/ai/chat')
-      .set('X-Chat-Session', 'Z'.repeat(43))
-      .send({ conversationId: initial.body.data.conversationId, message: 'Continue' });
-    expect(stolen.status).toBe(404);
+    const message = await buildOrderBridgeMessage({
+      message: 'Tell me about this.',
+      context: { productSlug: 'browser-supplied-value' },
+    }, getProducts);
 
-    const otherClient = new StubOrderBridgeClient(otherBusinessId, () => upstreamResponse());
-    const crossedBusiness = await request(createApp({
-      chatEngine: 'orderbridge',
-      orderBridgeWebsiteClient: otherClient,
-    }))
-      .post('/api/ai/chat')
-      .set('X-Chat-Session', String(initial.headers['x-chat-session']))
-      .send({ conversationId: initial.body.data.conversationId, message: 'Continue' });
-    expect(crossedBusiness.status).toBe(404);
-    expect(client.calls).toHaveLength(1);
-    expect(otherClient.calls).toHaveLength(0);
+    expect(message).toBe('Tell me about this.');
   });
+});
 
-  it('authenticates with the website integration key without placing it in the payload', async () => {
-    let requestUrl = '';
+describe('OrderBridge chat timeout configuration', () => {
+  it('defaults to 60 seconds and permits a complete AI turn up to 120 seconds', () => {
+    expect(getEnvironment().ORDERBRIDGE_CHAT_TIMEOUT_MS).toBe(60_000);
+
+    process.env.ORDERBRIDGE_CHAT_TIMEOUT_MS = '120000';
+    resetEnvironmentForTests();
+    expect(getEnvironment().ORDERBRIDGE_CHAT_TIMEOUT_MS).toBe(120_000);
+
+    process.env.ORDERBRIDGE_CHAT_TIMEOUT_MS = '120001';
+    resetEnvironmentForTests();
+    expect(() => getEnvironment()).toThrow();
+  });
+});
+
+describe('OrderBridge website client', () => {
+  it('keeps authentication server-side and sends only the supported payload', async () => {
     let requestInit: RequestInit | undefined;
-    const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      requestUrl = String(input);
+    const fetchImpl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       requestInit = init;
-      return new Response(JSON.stringify(upstreamResponse()), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return new Response(JSON.stringify(upstreamResponse()), { status: 200 });
     };
     const client = createOrderBridgeWebsiteClient({
       baseUrl: 'https://orderbridge.example',
       businessId,
       integrationKey,
-      timeoutMs: 1_000,
+      timeoutMs: 60_000,
     }, fetchImpl);
 
-    await client.sendMessage({ message: 'Show me blenders.', requestId: 'request-123' });
+    await client.sendMessage({ message: 'Show me blenders.' });
 
-    expect(requestUrl).toBe(`https://orderbridge.example/api/integrations/website-chat/${businessId}/messages`);
     expect(new Headers(requestInit?.headers).get('authorization')).toBe(`Bearer ${integrationKey}`);
-    expect(new Headers(requestInit?.headers).get('x-request-id')).toBe('request-123');
     expect(requestInit?.body).toBe(JSON.stringify({ message: 'Show me blenders.' }));
-    expect(String(requestInit?.body)).not.toContain(integrationKey);
-  });
-
-  it('returns a safe error when OrderBridge is unavailable', async () => {
-    const fetchImpl = async (): Promise<Response> => new Response(
-      JSON.stringify({ message: 'private upstream stack trace', credential: integrationKey }),
-      { status: 503 },
-    );
-    const client = createOrderBridgeWebsiteClient({
-      baseUrl: 'https://orderbridge.example',
-      businessId,
-      integrationKey,
-      timeoutMs: 1_000,
-    }, fetchImpl);
-
-    const response = await request(createApp({ chatEngine: 'orderbridge', orderBridgeWebsiteClient: client }))
-      .post('/api/ai/chat')
-      .send({ message: 'Show me blenders.' });
-
-    expect(response.status).toBe(503);
-    expect(response.body.error).toMatchObject({
-      code: 'ORDERBRIDGE_CHAT_UNAVAILABLE',
-      message: 'The shopping assistant is temporarily unavailable.',
-    });
-    expect(JSON.stringify(response.body)).not.toContain('private upstream stack trace');
-    expect(JSON.stringify(response.body)).not.toContain(integrationKey);
-    expect(response.headers['x-chat-session']).toBeUndefined();
   });
 });

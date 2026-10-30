@@ -16,40 +16,71 @@ import type {
   OrderBridgeWebsiteResponse,
 } from './orderbridge-website-client.service.js';
 
-function verifiedProducts(response: OrderBridgeWebsiteResponse) {
+type ProductLookup = typeof getPublicProductsByIdentifiers;
+
+function selectedProducts(response: OrderBridgeWebsiteResponse) {
   const candidates = [
-    ...(response.data?.products ?? []),
     ...(response.data?.product ? [response.data.product] : []),
+    ...(response.data?.products ?? []),
   ];
   const seen = new Set<string>();
   return candidates.filter((product) => {
     if (seen.has(product.id)) return false;
     seen.add(product.id);
-    return product.currency === 'GHS'
-      && typeof product.price === 'number'
-      && typeof product.available === 'boolean';
+    return product.currency === undefined || product.currency === 'GHS';
   }).slice(0, 4);
 }
 
-async function mapProductCards(response: OrderBridgeWebsiteResponse): Promise<ProductCard[]> {
-  const products = verifiedProducts(response);
+export async function mapProductCards(
+  response: OrderBridgeWebsiteResponse,
+  getProducts: ProductLookup = getPublicProductsByIdentifiers,
+): Promise<ProductCard[]> {
+  const products = selectedProducts(response);
   if (products.length === 0) return [];
-  const localProducts = await getPublicProductsByIdentifiers(products.map((product) => product.id));
+  const localProducts = await getProducts(products.map((product) => product.id));
   const byId = new Map(localProducts.map((product) => [String(product.id), product]));
+  const freshnessById = new Map(
+    (response.data?.commerceDataFreshness?.products ?? [])
+      .map((freshness) => [freshness.productId, freshness] as const),
+  );
   return products.flatMap((product) => {
     const localProduct = byId.get(product.id);
     if (!localProduct) return [];
     const localCard = toProductCard(localProduct);
+    const freshness = freshnessById.get(product.id);
+    const price = freshness?.price === 'live' && typeof product.price === 'number'
+      ? product.price
+      : localCard.price;
+    const availability = freshness?.availability === 'live' && typeof product.available === 'boolean'
+      ? (product.available
+          ? (localCard.availability === 'low_stock' ? 'low_stock' : 'in_stock')
+          : 'out_of_stock')
+      : localCard.availability;
     return [{
       ...localCard,
-      name: product.name,
-      price: product.price!,
-      availability: product.available
-        ? (localCard.availability === 'low_stock' ? 'low_stock' : 'in_stock')
-        : 'out_of_stock',
+      price,
+      availability,
       url: product.canonicalUrl,
     }];
   });
+}
+
+export async function buildOrderBridgeMessage(
+  input: ChatInput,
+  getProducts: ProductLookup = getPublicProductsByIdentifiers,
+): Promise<string> {
+  const identifiers = [input.context?.productId, input.context?.productSlug]
+    .filter((identifier): identifier is string => typeof identifier === 'string');
+  if (identifiers.length === 0) return input.message;
+
+  const products = await getProducts(identifiers);
+  const uniqueProducts = new Map(products.map((product) => [String(product.id), product]));
+  if (uniqueProducts.size !== 1) return input.message;
+  const product = [...uniqueProducts.values()][0]!;
+  return [
+    `Kawama catalog product page: ${String(product.name)} (product ID: ${String(product.id)}; slug: ${String(product.slug)}).`,
+    `Customer message: ${input.message}`,
+  ].join('\n');
 }
 
 export async function runOrderBridgeShoppingChat(
@@ -86,7 +117,7 @@ export async function runOrderBridgeShoppingChat(
   }
 
   const response = await client.sendMessage({
-    message: input.message,
+    message: await buildOrderBridgeMessage(input),
     ...(existing
       ? {
           conversation: {
