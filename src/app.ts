@@ -19,7 +19,13 @@ import { createProductRouter } from './route/productRouter.js';
 import { orderBridgeRouter } from './route/orderbridgeRouter.js';
 import { publicRouter } from './route/publicRouter.js';
 import { verifyDatabaseAdminToken, type AdminTokenVerifier } from './services/auth.service.js';
+import { runShoppingChat } from './services/chat.service.js';
 import { cloudinaryMediaService, type MediaService } from './services/cloudinary.service.js';
+import { runOrderBridgeShoppingChat } from './services/orderbridge-chat.service.js';
+import {
+  createOrderBridgeWebsiteClient,
+  type OrderBridgeWebsiteClient,
+} from './services/orderbridge-website-client.service.js';
 import { paystackGateway, type PaystackGateway } from './services/paystack.service.js';
 import { openRouterProvider, type ChatProvider } from './services/openrouter.service.js';
 
@@ -28,6 +34,8 @@ export interface ApplicationDependencies {
   mediaService?: MediaService;
   paystackGateway?: PaystackGateway;
   chatProvider?: ChatProvider;
+  chatEngine?: 'orderbridge' | 'legacy';
+  orderBridgeWebsiteClient?: OrderBridgeWebsiteClient;
   orderBridgeApiKey?: string;
 }
 
@@ -121,7 +129,25 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
   const selectedPaystackGateway = dependencies.paystackGateway ?? paystackGateway;
   app.use('/api/v1/checkout', createCheckoutRouter(selectedPaystackGateway));
   app.use('/api/v1/webhooks', createPaystackWebhookRouter(selectedPaystackGateway));
-  app.use('/api/ai', createChatRouter(dependencies.chatProvider ?? openRouterProvider));
+  const chatEngine = dependencies.chatEngine ?? (dependencies.chatProvider ? 'legacy' : environment.AI_CHAT_ENGINE);
+  const legacyProvider = dependencies.chatProvider ?? openRouterProvider;
+  const orderBridgeWebsiteClient = dependencies.orderBridgeWebsiteClient ?? createOrderBridgeWebsiteClient({
+    baseUrl: environment.ORDERBRIDGE_BASE_URL,
+    businessId: environment.ORDERBRIDGE_BUSINESS_ID,
+    integrationKey: environment.ORDERBRIDGE_WEBSITE_INTEGRATION_KEY,
+    timeoutMs: environment.ORDERBRIDGE_CHAT_TIMEOUT_MS,
+    allowInsecureLocalhost: environment.NODE_ENV !== 'production',
+  });
+  app.use('/api/ai', createChatRouter(
+    chatEngine === 'legacy'
+      ? (input, sessionToken, requestId) => runShoppingChat(input, sessionToken, legacyProvider, requestId)
+      : (input, sessionToken, requestId) => runOrderBridgeShoppingChat(
+          input,
+          sessionToken,
+          orderBridgeWebsiteClient,
+          requestId,
+        ),
+  ));
   app.use(
     '/api/integrations/orderbridge',
     createOrderBridgeAuthentication(dependencies.orderBridgeApiKey ?? environment.ORDERBRIDGE_API_KEY),

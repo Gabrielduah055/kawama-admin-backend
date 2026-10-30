@@ -43,21 +43,28 @@ Alternatively, import `postman/Kawama API.postman_collection.json`, set its `adm
 
 ## AI shopping assistant
 
-`POST /api/ai/chat` starts or continues a customer shopping conversation. It searches active MongoDB catalogue records through bounded server-side tools and returns only a final customer-facing reply plus canonical product cards. Product prices are returned in GHS. Current availability is calculated from stock minus active reservations. The assistant cannot mutate products, inventory, orders, payments, or customer records.
+`POST /api/ai/chat` starts or continues a customer shopping conversation. By default, Kawama's backend sends the message to OrderBridge's existing website channel and adapts its verified response to the existing frontend format. OrderBridge reads current catalogue and policy facts through Kawama's read-only `/api/integrations/orderbridge` endpoints; the website channel cannot create orders or payments. Upstream conversation credentials remain server-side and are bound to Kawama's existing `X-Chat-Session` visitor session.
 
 Configure the server with:
 
 ```text
 AI_CHAT_ENABLED=true
-OPENROUTER_API_KEY=your-server-only-key
-OPENROUTER_MODEL=google/gemma-4-31b-it:free
+AI_CHAT_ENGINE=orderbridge
+ORDERBRIDGE_BASE_URL=https://your-orderbridge-deployment.example
+ORDERBRIDGE_BUSINESS_ID=0123456789abcdef01234567
+ORDERBRIDGE_WEBSITE_INTEGRATION_KEY=generate-a-separate-server-only-key
+ORDERBRIDGE_CHAT_TIMEOUT_MS=10000
 ```
 
-`google/gemma-4-31b-it:free` is the default model. `OPENROUTER_MODEL` may explicitly select another OpenRouter model without a source change; the provider sends exactly that one model ID and never adds automatic fallback or upgrade models. A missing key or `AI_CHAT_ENABLED=false` affects only the chat route. `OPENROUTER_TIMEOUT_MS` and `AI_CHAT_CONVERSATION_TTL_HOURS` optionally control the provider timeout and guest-history expiry.
+The OrderBridge business must be an active or trial ecommerce business with the `website` channel, `website_chat` and `commerce_catalog_read` capabilities, and an enabled website integration whose key matches `ORDERBRIDGE_WEBSITE_INTEGRATION_KEY`. Its commerce integration must use this backend's HTTPS origin and `ORDERBRIDGE_API_KEY`, with `paths.search` set to `/api/integrations/orderbridge/products/search`, `paths.product` to `/api/integrations/orderbridge/products/{productId}`, `paths.availability` to `/api/integrations/orderbridge/products/{productId}/availability`, and `paths.policies` to `/api/integrations/orderbridge/policies`. Add Kawama's storefront hostname to `canonicalProductHosts`. Keep both keys server-only and distinct.
+
+Set `AI_CHAT_ENGINE=legacy` for an explicit rollback to the previous chatbot; then configure `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and `OPENROUTER_TIMEOUT_MS` as before. One request is sent to only the selected engine. `AI_CHAT_ENABLED=false` disables the chat route without affecting catalogue or checkout routes, and `AI_CHAT_CONVERSATION_TTL_HOURS` controls the lifetime of visitor-bound conversation state.
+
+`google/gemma-4-31b-it:free` remains the default legacy model. `OPENROUTER_MODEL` may explicitly select another OpenRouter model without a source change; the legacy provider sends exactly that one model ID and never adds automatic fallback or upgrade models.
 
 Store policy answers come from `STORE_DELIVERY_POLICY`, `STORE_PAYMENT_POLICY`, `STORE_RETURN_POLICY`, `STORE_CONTACT_EMAIL`, `STORE_CONTACT_PHONE`, and `STORE_CONTACT_WHATSAPP_URL`. Blank or whitespace-only optional settings are treated as unset; invalid nonblank emails and URLs are rejected. Unset policy values remain unknown. `STOREFRONT_PRODUCT_URL_TEMPLATE` may contain a literal `{slug}` for canonical product-card links.
 
-Grounding is enforced through typed internal tool calls and response plans. The model may compose concise customer-facing connective prose, but every product name, price, availability statement, selected catalogue fact, result count, category list, and price difference is inserted by the backend through validated placeholders. The backend then re-fetches the selected records before rendering cards and factual wording. Legacy product-specific claim plans remain supported. Clarifications select one allowed purpose, and policy, checkout, and contact claims must exactly match the actual `getStorePolicies` result, including `null` for missing information.
+When the legacy engine is selected, grounding is enforced through typed internal tool calls and response plans. The model may compose concise customer-facing connective prose, but every product name, price, availability statement, selected catalogue fact, result count, category list, and price difference is inserted by the backend through validated placeholders. The backend then re-fetches the selected records before rendering cards and factual wording. Legacy product-specific claim plans remain supported. Clarifications select one allowed purpose, and policy, checkout, and contact claims must exactly match the actual `getStorePolicies` result, including `null` for missing information.
 
 Customer budgets remain separate from selling prices and product measurements, including when currency is formatted with valid thousands separators. A budget supplied by the customer is stored only inside that owner-bound conversation, remains active on later turns, and can be replaced or removed by later customer input. Budget amounts are associated with currency, explicit spending-limit statements, or monetary context instead of unrelated prices, dimensions, quantities, or time limits in the same message. When the backend-rendered response asks for a budget, that constrained clarification purpose is stored on the conversation so a direct GHS amount (or an unambiguous bare number) can answer it on the next turn. Numbered product questions continue through the normal grounded-answer flow; only a reply shaped like competing budget amounts triggers another focused budget question. The purpose is cleared or replaced with the next validated state; assistant output, product prices, and other conversations never create preference state. Product claims are validated once against tool evidence and again against the final active catalogue snapshot used for rendering; a price, stock, content, or archive change produces a safe retry suggestion rather than a stale recommendation.
 

@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { rateLimit } from 'express-rate-limit';
-import { createChatHandler } from '../controllers/chatController.js';
-import type { ChatProvider } from '../services/openrouter.service.js';
+import { createChatHandler, type ShoppingChatRunner } from '../controllers/chatController.js';
 
 const chatLimiter = rateLimit({
   windowMs: 15 * 60 * 1_000,
@@ -17,8 +16,8 @@ const chatLimiter = rateLimit({
   }),
 });
 
-export function createChatRouter(provider: ChatProvider): Router {
+export function createChatRouter(runChat: ShoppingChatRunner): Router {
   const router = Router();
-  router.post('/chat', chatLimiter, createChatHandler(provider));
+  router.post('/chat', chatLimiter, createChatHandler(runChat));
   return router;
 }

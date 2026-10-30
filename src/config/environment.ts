@@ -48,6 +48,20 @@ const environmentSchema = z.object({
   ),
   OPENROUTER_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(60_000).default(30_000),
   AI_CHAT_CONVERSATION_TTL_HOURS: z.coerce.number().int().min(1).max(168).default(24),
+  AI_CHAT_ENGINE: z.enum(['orderbridge', 'legacy']).default('orderbridge'),
+  ORDERBRIDGE_BASE_URL: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().url().optional(),
+  ),
+  ORDERBRIDGE_BUSINESS_ID: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().regex(/^[a-fA-F0-9]{24}$/).optional(),
+  ),
+  ORDERBRIDGE_WEBSITE_INTEGRATION_KEY: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().min(32).max(512).optional(),
+  ),
+  ORDERBRIDGE_CHAT_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(120_000).default(60_000),
   ORDERBRIDGE_API_KEY: z.preprocess(
     emptyStringToUndefined,
     z.string().trim().min(32).max(512).optional(),
