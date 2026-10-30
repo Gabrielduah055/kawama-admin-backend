@@ -82,7 +82,7 @@ export const openApiDocument = {
     '/api/ai/chat': {
       post: {
         tags: ['Shopping assistant'],
-        description: 'Starts or continues a server-managed guest shopping conversation. Factual product and policy answers require approved current-request retrieval. Simple greetings are rendered immediately, store-overview answers come from active catalogue records, and requests for other options exclude previously shown products. Store the X-Chat-Session response header and send it on follow-ups; a conversation ID alone does not grant access.',
+        description: 'Starts or continues a server-managed guest shopping conversation using the configured OrderBridge website channel or the explicit legacy rollback engine. Product and policy facts come from approved read-only catalogue retrieval. Store the X-Chat-Session response header and send it on follow-ups; upstream credentials remain server-side and a conversation ID alone does not grant access.',
         parameters: [{
           name: 'X-Chat-Session',
           in: 'header',
@@ -100,8 +100,8 @@ export const openApiDocument = {
           '404': { description: 'Conversation not found for this guest session.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
           '422': { $ref: '#/components/responses/BadRequest' },
           '429': { description: 'Chat rate limit exceeded.' },
-          '502': { description: 'The model returned an invalid response or exceeded its bounded tool cycle.' },
-          '503': { description: 'Chat is disabled, unconfigured, rate-limited upstream, or temporarily unavailable.' },
+          '502': { description: 'The legacy model returned an invalid response or exceeded its bounded tool cycle.' },
+          '503': { description: 'Chat is disabled, unconfigured, or temporarily unavailable upstream.' },
           '504': { description: 'The model provider timed out.' },
         },
       },

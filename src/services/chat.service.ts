@@ -28,7 +28,7 @@ const MAX_TOOL_EXECUTIONS = 6;
 const MAX_CONTEXT_MESSAGES = 10;
 const MAX_OUTPUT_TOKENS = 550;
 
-type ChatInput = z.infer<typeof chatRequestSchema>;
+export type ChatInput = z.infer<typeof chatRequestSchema>;
 type AssistantPlan = z.infer<typeof assistantResponseSchema>;
 type ProductPlan = Extract<AssistantPlan, { type: 'product_answer' | 'grounded_answer' | 'mixed_answer' }>;
 type ProductClaim = ProductPlan['productClaims'][number];
@@ -93,15 +93,15 @@ export interface ShoppingChatResult {
   suggestedFollowUps: string[];
 }
 
-function sessionHash(token: string): string {
+export function sessionHash(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function newSessionToken(): string {
+export function newSessionToken(): string {
   return randomBytes(32).toString('base64url');
 }
 
-function conversationExpiry(): Date {
+export function conversationExpiry(): Date {
   const hours = getEnvironment().AI_CHAT_CONVERSATION_TTL_HOURS;
   return new Date(Date.now() + hours * 60 * 60 * 1_000);
 }
@@ -1110,7 +1110,7 @@ function buildProductUrl(slug: string): string | undefined {
   }
 }
 
-function toProductCard(product: Record<string, unknown>): ProductCard {
+export function toProductCard(product: Record<string, unknown>): ProductCard {
   const images = Array.isArray(product.images) ? product.images as Array<{ src?: unknown; alt?: unknown }> : [];
   const firstImage = images[0];
   const stockLevel = product.stockLevel;
