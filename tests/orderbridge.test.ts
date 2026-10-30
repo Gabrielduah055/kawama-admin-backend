@@ -160,6 +160,29 @@ describe('OrderBridge commerce integration', () => {
     ]);
   });
 
+  it('reports the unique preference match total before applying the response limit', async () => {
+    await seedProduct();
+    await seedProduct({
+      slug: 'quiet-stainless-pot',
+      name: 'Quiet Stainless Pot',
+      description: 'A quiet stainless pot for soups.',
+    });
+    await seedProduct({
+      slug: 'quiet-ceramic-bowl',
+      name: 'Quiet Ceramic Bowl',
+      description: 'A quiet ceramic bowl for serving.',
+    });
+
+    const response = await request(app)
+      .get('/api/integrations/orderbridge/products/search')
+      .set(authorized())
+      .query({ preference: ['ceramic', 'quiet'], limit: 1 });
+
+    expect(response.status).toBe(200);
+    expect(response.body.products).toHaveLength(1);
+    expect(response.body.total).toBe(3);
+  });
+
   it('returns active product details, live available stock, policies, and safe not-found responses', async () => {
     const product = await seedProduct();
     const productId = String(product._id);

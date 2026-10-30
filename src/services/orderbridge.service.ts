@@ -95,7 +95,12 @@ function toOrderBridgeProduct(
 }
 
 export async function searchOrderBridgeProducts(input: OrderBridgeProductSearchInput) {
-  const baseSearch = {
+  const result = await searchPublicProducts({
+    ...(input.query
+      ? { query: input.query }
+      : !input.category && input.preferences.length > 0
+        ? { anyQueries: input.preferences }
+        : {}),
     ...(input.category ? { category: input.category } : {}),
     ...(input.minPrice !== undefined ? { minPrice: input.minPrice } : {}),
     ...(input.maxPrice !== undefined ? { maxPrice: input.maxPrice } : {}),
@@ -103,31 +108,14 @@ export async function searchOrderBridgeProducts(input: OrderBridgeProductSearchI
     sort: orderBridgeSorts[input.sort],
     page: 1,
     limit: input.limit,
-  } satisfies PublicProductSearchInput;
-  const searchTerms = input.query
-    ? [input.query]
-    : input.category || input.preferences.length === 0
-      ? [undefined]
-      : input.preferences;
-  const results = await Promise.all(searchTerms.map((query) => searchPublicProducts({
-    ...baseSearch,
-    ...(query ? { query } : {}),
-  })));
-  const productsById = new Map<string, Record<string, unknown>>();
-  for (const result of results) {
-    for (const product of result.products) productsById.set(String(product.id), product);
-  }
-  const products = [...productsById.values()];
-  if (input.sort === 'price_asc') products.sort((first, second) => Number(first.price) - Number(second.price));
-  if (input.sort === 'price_desc') products.sort((first, second) => Number(second.price) - Number(first.price));
-  const selectedProducts = products.slice(0, input.limit);
+  } satisfies PublicProductSearchInput);
   const availability = await getPublicProductAvailabilityByIdentifiers(
-    selectedProducts.map((product) => String(product.id)),
+    result.products.map((product) => String(product.id)),
   );
   return {
-    products: selectedProducts.map((product) =>
+    products: result.products.map((product) =>
       toOrderBridgeProduct(product, availability.get(String(product.id))?.stockQuantity)),
-    total: results.length === 1 ? results[0]!.total : products.length,
+    total: result.total,
   };
 }
 
