@@ -53,10 +53,13 @@ AI_CHAT_ENGINE=orderbridge
 ORDERBRIDGE_BASE_URL=https://your-orderbridge-deployment.example
 ORDERBRIDGE_BUSINESS_ID=0123456789abcdef01234567
 ORDERBRIDGE_WEBSITE_INTEGRATION_KEY=generate-a-separate-server-only-key
+ORDERBRIDGE_PAID_ORDER_EVENTS_ENABLED=false
 ORDERBRIDGE_CHAT_TIMEOUT_MS=10000
 ```
 
 The OrderBridge business must be an active or trial ecommerce business with the `website` channel, `website_chat` and `commerce_catalog_read` capabilities, and an enabled website integration whose key matches `ORDERBRIDGE_WEBSITE_INTEGRATION_KEY`. Its commerce integration must use this backend's HTTPS origin and `ORDERBRIDGE_API_KEY`, with `paths.search` set to `/api/integrations/orderbridge/products/search`, `paths.product` to `/api/integrations/orderbridge/products/{productId}`, `paths.availability` to `/api/integrations/orderbridge/products/{productId}/availability`, and `paths.policies` to `/api/integrations/orderbridge/policies`. Add Kawama's storefront hostname to `canonicalProductHosts`. Keep both keys server-only and distinct.
+
+Set `ORDERBRIDGE_PAID_ORDER_EVENTS_ENABLED=true` to durably forward newly verified paid orders to the configured OrderBridge business. This requires the HTTPS `ORDERBRIDGE_BASE_URL`, `ORDERBRIDGE_BUSINESS_ID`, and `ORDERBRIDGE_WEBSITE_INTEGRATION_KEY`. Payment finalization stores one immutable event in MongoDB before committing; a background worker then delivers it with an expiring lease. Network, timeout, rate-limit, and server failures retry with exponential backoff capped at 15 minutes. Conflicts, other non-success responses, and invalid acknowledgements remain retained as failed outbox records for diagnosis. Pending records remain bound to their persisted business ID and are never redirected by a later configuration change. Enabling this does not backfill orders that were already paid.
 
 Set `AI_CHAT_ENGINE=legacy` for an explicit rollback to the previous chatbot; then configure `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and `OPENROUTER_TIMEOUT_MS` as before. One request is sent to only the selected engine. `AI_CHAT_ENABLED=false` disables the chat route without affecting catalogue or checkout routes, and `AI_CHAT_CONVERSATION_TTL_HOURS` controls the lifetime of visitor-bound conversation state.
 

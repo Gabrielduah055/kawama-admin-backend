@@ -7,6 +7,7 @@ import { OrderModel } from '../models/OrderSchema.js';
 import { PaymentAttemptModel } from '../models/PaymentAttemptSchema.js';
 import { ProductModel } from '../models/ProductSchema.js';
 import { buildPendingOrderDraft, type CheckoutInput } from './order.service.js';
+import { createPaidOrderOutboxEvent } from './orderbridge-paid-order-events.service.js';
 import type { PaystackGateway, PaystackVerification } from './paystack.service.js';
 
 const RESERVATION_MINUTES = 30;
@@ -716,6 +717,10 @@ export async function finalizeVerifiedPayment(
       order.inventoryCommittedAt = new Date();
       order.paidAt = paidAt;
       await order.save({ session });
+
+      // The immutable integration snapshot is committed atomically with the
+      // first paid transition. Delivery happens later, outside this transaction.
+      await createPaidOrderOutboxEvent(order, session);
 
       await PaymentAttemptModel.updateOne(
         { order: order._id, reference: order.paymentReference },
