@@ -268,12 +268,17 @@ async function deliverEvent(
     }
     return { delivered: true, retryable: false, httpStatus: response.status };
   } catch (error) {
+    const permanentErrorCode = error instanceof Error
+      && (error.message === 'RESPONSE_TOO_LARGE' || error.message === 'INVALID_ACKNOWLEDGEMENT')
+      ? error.message
+      : undefined;
     return {
       delivered: false,
-      retryable: false,
-      errorCode: error instanceof Error && error.message === 'RESPONSE_TOO_LARGE'
-        ? 'RESPONSE_TOO_LARGE'
-        : 'INVALID_ACKNOWLEDGEMENT',
+      retryable: permanentErrorCode === undefined,
+      errorCode: permanentErrorCode
+        ?? (stopSignal.aborted
+          ? 'WORKER_STOPPED'
+          : 'NETWORK_OR_TIMEOUT'),
       httpStatus: response.status,
     };
   }
