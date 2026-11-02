@@ -4,6 +4,12 @@ import { AppError } from '../errors/AppError.js';
 const conversationIdSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const conversationTokenSchema = z.string().regex(/^v1\.[A-Za-z0-9_-]{43}$/);
 const commerceFactFreshnessSchema = z.enum(['live', 'cached', 'unverified']);
+const maxResponseBytes = 512 * 1_024;
+
+const invalidConversationResponseSchema = z.object({
+  success: z.literal(false),
+  code: z.literal('WEBSITE_CONVERSATION_INVALID'),
+}).passthrough();
 
 const orderBridgeProductSchema = z.object({
   id: z.union([z.string(), z.number()]).transform(String),
@@ -68,6 +74,22 @@ const unavailable = (): AppError => new AppError(
   'The shopping assistant is temporarily unavailable.',
 );
 
+async function readBoundedJson(response: Response): Promise<unknown> {
+  const announcedLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(announcedLength) && announcedLength > maxResponseBytes) {
+    throw unavailable();
+  }
+
+  try {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > maxResponseBytes) throw unavailable();
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw unavailable();
+  }
+}
+
 function resolveEndpoint(configuration: OrderBridgeWebsiteClientConfiguration): URL {
   const { baseUrl, businessId, integrationKey } = configuration;
   if (!baseUrl || !businessId || !integrationKey) {
@@ -130,17 +152,21 @@ export function createOrderBridgeWebsiteClient(
         throw unavailable();
       }
 
-      if (!response.ok) throw unavailable();
-
-      let parsed: unknown;
-      try {
-        const text = await response.text();
-        if (Buffer.byteLength(text, 'utf8') > 512 * 1_024) throw unavailable();
-        parsed = JSON.parse(text);
-      } catch (error) {
-        if (error instanceof AppError) throw error;
+      if (!response.ok) {
+        if (input.conversation && response.status === 401) {
+          const parsedError = await readBoundedJson(response);
+          if (invalidConversationResponseSchema.safeParse(parsedError).success) {
+            throw new AppError(
+              404,
+              'CONVERSATION_NOT_FOUND',
+              'The conversation has expired. Start a new chat.',
+            );
+          }
+        }
         throw unavailable();
       }
+
+      const parsed = await readBoundedJson(response);
       const result = responseSchema.safeParse(parsed);
       if (!result.success || !result.data.success) throw unavailable();
       return result.data;

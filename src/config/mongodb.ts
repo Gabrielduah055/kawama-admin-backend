@@ -5,10 +5,14 @@ import { CustomerModel } from '../models/CustomerSchema.js';
 import { OrderModel } from '../models/OrderSchema.js';
 import { PaymentAttemptModel } from '../models/PaymentAttemptSchema.js';
 import { ChatConversationModel } from '../models/ChatConversationSchema.js';
+import { ensureOrderBridgePaidOrderOutboxStorage } from '../models/OrderBridgePaidOrderOutboxSchema.js';
 import { logger } from '../utils/logger.js';
 
 export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): Promise<void> => {
-  if (mongoose.connection.readyState === 1) return;
+  if (mongoose.connection.readyState === 1) {
+    await ensureOrderBridgePaidOrderOutboxStorage();
+    return;
+  }
   const configuredDnsServers = getEnvironment().MONGODB_DNS_SERVERS
     ?.split(',')
     .map((server) => server.trim())
@@ -18,6 +22,9 @@ export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): 
     autoIndex: process.env.NODE_ENV !== 'production',
     serverSelectionTimeoutMS: 10_000,
   });
+  // Payment finalization writes to this collection transactionally, so its
+  // collection and unique delivery-identity indexes must exist before listen.
+  await ensureOrderBridgePaidOrderOutboxStorage();
   if (getEnvironment().NODE_ENV === 'production') {
     await Promise.all([
       CustomerModel.createIndexes(),
