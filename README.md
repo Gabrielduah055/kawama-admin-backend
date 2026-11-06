@@ -22,7 +22,21 @@ npm run seed:dry-run
 npm run seed
 ```
 
-The seed command imports the existing four categories, twelve products, and six approved reviews. Existing Cloudinary images and MongoDB records are reused by slug, so the command is safe to rerun.
+The seed command imports the existing four categories and twelve products. It no longer creates reviews. Existing Cloudinary images and MongoDB catalog records are reused by slug, so the command is safe to rerun.
+
+Review fixtures created by older seed runs remain in MongoDB until cleanup is explicitly applied. Preview the exact legacy fixture matches without changing records:
+
+```text
+npm run seed:cleanup-reviews
+```
+
+After reviewing the preview, archive only those exact `moderatedBy: "seed"` fixtures that have no order or invitation association:
+
+```text
+npm run seed:cleanup-reviews -- --apply
+```
+
+The cleanup does not delete reviews and does not match genuine purchase-linked reviews.
 
 ## Postman authentication
 
