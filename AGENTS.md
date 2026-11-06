@@ -46,13 +46,13 @@ A browser redirect, callback query, or client assertion is not payment proof. Fi
 
 The owner account is database-backed. `npm run seed:admin` hashes the configured password with bcrypt; login issues a JWT with the expected issuer and audience, and protected requests verify both the token and an active database administrator. Do not weaken strict schemas, identifier checks, checkout consent, duplicate-item rejection, or rate limits.
 
-Public review submissions begin pending; only approved reviews are public, and moderation is administrative. Preserve product/category archive and restore semantics. Cloudinary uploads use signed parameters from a protected endpoint. Deletion is limited to the configured Kawama folder and is rejected while an asset is referenced by a product or category.
+Public review submissions require a valid, single-use invitation for a verified paid order and purchased product. New reviews publish immediately with `approved` status; administrator review approval/rejection is retired, while owner replies and review archiving remain administrative. Preserve historical review statuses without bulk changes. Preserve product/category archive and restore semantics. Cloudinary uploads use signed parameters from a protected endpoint. Deletion is limited to the configured Kawama folder and is rejected while an asset is referenced by a product or category.
 
 ## Secrets and configuration
 
 Actual credentials belong only in ignored local environment files or the deployment platform's environment settings. Never read or commit `.env`; `.env.example` must contain variable names and unmistakably synthetic placeholders only. Local environment changes do not configure Render, and deployment changes generally require a backend restart or redeploy.
 
-Relevant settings include `MONGODB_URI`, `MONGODB_DNS_SERVERS`, `FRONTEND_ORIGINS`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, the `CLOUDINARY_*` variables, and `PAYSTACK_SECRET_KEY`, `PAYSTACK_BASE_URL`, and `PAYSTACK_CALLBACK_URL`. The hosted backend checkout does not require an Angular Paystack public key. Never log or expose secret keys, tokens, Authorization headers, checkout tokens, full provider bodies, or customer details. Tests must use synthetic credentials and mocked Paystack requests.
+Relevant settings include `MONGODB_URI`, `MONGODB_DNS_SERVERS`, `FRONTEND_ORIGINS`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, the `CLOUDINARY_*` variables, `PAYSTACK_SECRET_KEY`, `PAYSTACK_BASE_URL`, `PAYSTACK_CALLBACK_URL`, `REVIEW_LINK_SECRET`, and `STOREFRONT_BASE_URL`. The hosted backend checkout does not require an Angular Paystack public key. Never log or expose secret keys, tokens, Authorization headers, checkout tokens, full review links, full provider bodies, or customer details. Tests must use synthetic credentials and mocked Paystack requests.
 
 ## Commands and verification
 

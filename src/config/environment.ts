@@ -68,6 +68,14 @@ const environmentSchema = z.object({
     emptyStringToUndefined,
     z.string().trim().min(32).max(512).optional(),
   ),
+  REVIEW_LINK_SECRET: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().min(32).max(512).optional(),
+  ),
+  STOREFRONT_BASE_URL: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().url().optional(),
+  ),
   STOREFRONT_PRODUCT_URL_TEMPLATE: optionalContactText(2_000),
   STORE_CONTACT_EMAIL: optionalContactEmail,
   STORE_CONTACT_PHONE: optionalContactText(40),

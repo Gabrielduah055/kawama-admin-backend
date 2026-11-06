@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import { getPublicCategories } from '../controllers/categoryController.js';
 import { getPublicProductBySlug, getPublicProducts } from '../controllers/productController.js';
-import { getApprovedReviews, submitReview } from '../controllers/reviewController.js';
+import { getApprovedReviews, getReviewLink, submitReview } from '../controllers/reviewController.js';
 
 const reviewLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -21,6 +21,7 @@ const reviewLimiter = rateLimit({
 export const publicRouter = Router();
 publicRouter.get('/categories', getPublicCategories);
 publicRouter.get('/products', getPublicProducts);
+publicRouter.get('/review-links/:token', getReviewLink);
 publicRouter.get('/products/:productId/reviews', getApprovedReviews);
 publicRouter.post('/products/:productId/reviews', reviewLimiter, submitReview);
 publicRouter.get('/products/:slug', getPublicProductBySlug);

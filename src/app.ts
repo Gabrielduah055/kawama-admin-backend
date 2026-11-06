@@ -54,6 +54,7 @@ function isPublicStorefrontRequest(request: Request): boolean {
   if (method === 'GET' && (path === '/' || path.startsWith('/health/') || path === '/openapi.json')) return true;
   if (method === 'GET' && (path === '/api/product' || path.startsWith('/api/product/'))) return true;
   if (method === 'GET' && (path === '/api/v1/categories' || path === '/api/v1/products' || path.startsWith('/api/v1/products/'))) return true;
+  if (method === 'GET' && path.startsWith('/api/v1/review-links/')) return true;
   if (method === 'GET' && path.startsWith('/api/v1/checkout/sessions/')) return true;
   if (method === 'POST' && path === '/api/v1/checkout/sessions') return true;
   if (method === 'POST' && path === '/api/ai/chat') return true;

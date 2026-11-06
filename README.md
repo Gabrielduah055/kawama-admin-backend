@@ -1,6 +1,6 @@
 # Kawama API
 
-Express/TypeScript backend for the Kawama customer storefront. It exposes a public catalog and approved reviews while protecting product, category, review-moderation, and media operations with a database-backed administrator account and JWT bearer tokens.
+Express/TypeScript backend for the Kawama customer storefront. It exposes a public catalog and purchase-linked reviews while protecting product, category, review-reply, and media operations with a database-backed administrator account and JWT bearer tokens.
 
 ## Local setup
 
@@ -62,6 +62,42 @@ The OrderBridge business must be an active or trial ecommerce business with the 
 Set `ORDERBRIDGE_PAID_ORDER_EVENTS_ENABLED=true` to durably forward newly verified paid orders to the configured OrderBridge business. This requires the HTTPS `ORDERBRIDGE_BASE_URL`, `ORDERBRIDGE_BUSINESS_ID`, and `ORDERBRIDGE_WEBSITE_INTEGRATION_KEY`. Payment finalization stores one immutable event in MongoDB before committing; a background worker then delivers it with an expiring lease. Network, timeout, rate-limit, and server failures retry with exponential backoff capped at 15 minutes. Conflicts, other non-success responses, and invalid acknowledgements remain retained as failed outbox records for diagnosis. Pending records remain bound to their persisted business ID and are never redirected by a later configuration change. Enabling this does not backfill orders that were already paid.
 
 Set `AI_CHAT_ENGINE=legacy` for an explicit rollback to the previous chatbot; then configure `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and `OPENROUTER_TIMEOUT_MS` as before. One request is sent to only the selected engine. `AI_CHAT_ENABLED=false` disables the chat route without affecting catalogue or checkout routes, and `AI_CHAT_CONVERSATION_TTL_HOURS` controls the lifetime of visitor-bound conversation state.
+
+## Purchase review links
+
+Set `REVIEW_LINK_SECRET` to a server-only random value of at least 32 characters and `STOREFRONT_BASE_URL` to the storefront origin. Missing values do not prevent startup, checkout, receipts, or catalog access; review-link operations return `REVIEW_LINKS_NOT_CONFIGURED` until both are present. Tokens contain only a purpose-bound invitation identifier, are never stored raw, do not expire automatically, and cannot authenticate administrator routes.
+
+OrderBridge uses its existing `Authorization: Bearer <ORDERBRIDGE_API_KEY>` credential to issue or retrieve stable links for any verified paid order:
+
+```http
+POST /api/integrations/orderbridge/orders/000000000000000000000000/review-links
+```
+
+```json
+{
+  "orderNumber": "KW-EXAMPLE",
+  "products": [
+    {
+      "productId": "111111111111111111111111",
+      "name": "Example product",
+      "reviewState": "available",
+      "reviewUrl": "https://shop.example/review/example-product?token=v1.example.signature"
+    },
+    {
+      "productId": "222222222222222222222222",
+      "name": "Already reviewed product",
+      "reviewState": "submitted",
+      "reviewUrl": null
+    }
+  ]
+}
+```
+
+Each distinct purchased product has one invitation regardless of quantity. Repeated issuance returns the same usable URL, and existing paid orders can be issued links without another payment. This endpoint does not modify the existing `order.paid` event contract.
+
+The storefront may call `GET /api/v1/review-links/:token` repeatedly without consuming the invitation. Its `{ message, data }` response contains only `data.product` (`id`, `name`, `slug`) and `data.alreadySubmitted`. Submit once to `POST /api/v1/products/:productId/reviews` with `token`, `reviewerName`, integer `rating` from 1–5, and `comment`. Success is `201` with `{ "message": "Review submitted successfully", "data": { "id": "...", "status": "approved" } }`; the review is immediately public. Reuse returns `409 REVIEW_ALREADY_SUBMITTED`, and a token for another product returns `409 REVIEW_PRODUCT_MISMATCH`.
+
+Owners can create or edit one public reply using `PATCH /api/v1/admin/reviews/:id/reply` with `{ "text": "..." }` (1–1000 characters). Public and admin review DTOs include `reply` as either `null` or `{ text, createdAt, updatedAt }`; no administrator identity is exposed. Approval/rejection endpoints are retired. Historical review statuses are preserved, and archiving remains available.
 
 `google/gemma-4-31b-it:free` remains the default legacy model. `OPENROUTER_MODEL` may explicitly select another OpenRouter model without a source change; the legacy provider sends exactly that one model ID and never adds automatic fallback or upgrade models.
 
@@ -175,6 +211,8 @@ In the Render dashboard for the deployed backend, set these service environment 
 - `PAYSTACK_BASE_URL`: `https://api.paystack.co`.
 - `PAYSTACK_CALLBACK_URL`: the deployed Angular storefront origin plus `/checkout/result` (the developer must enter the real deployed frontend URL).
 - `FRONTEND_ORIGINS`: the exact deployed Angular origin(s), comma-separated when more than one is required.
+- `REVIEW_LINK_SECRET`: a server-only random value of at least 32 characters.
+- `STOREFRONT_BASE_URL`: the deployed storefront origin used to build `/review/<product-slug>?token=...` links.
 
 Save the Render environment changes, then restart or manually redeploy the backend service so the running process reads them. Editing `.env` on a laptop does **not** configure Render. In the Paystack dashboard's matching test/live mode, configure the deployed webhook URL shown above and confirm the selected API keys and webhook belong to the same mode.
 
@@ -207,4 +245,4 @@ See `/openapi.json` or the Postman collection for the complete request and respo
 
 ## Deployment
 
-`render.yaml` defines the Render web service and readiness health check. Add every secret marked `sync: false` in Render, including `JWT_SECRET` and `PAYSTACK_SECRET_KEY`; keep MongoDB Atlas near the Render region, allow Render to connect to Atlas, and set `FRONTEND_ORIGINS` to the comma-separated production/preview storefront origins. Run `npm run seed:admin` from a trusted environment whenever the production owner password must be created or rotated; do not store `ADMIN_PASSWORD` in Render after bootstrap.
+`render.yaml` defines the Render web service and readiness health check. Add every secret marked `sync: false` in Render, including `JWT_SECRET`, `PAYSTACK_SECRET_KEY`, and `REVIEW_LINK_SECRET`; set `STOREFRONT_BASE_URL` to the deployed storefront origin, keep MongoDB Atlas near the Render region, allow Render to connect to Atlas, and set `FRONTEND_ORIGINS` to the comma-separated production/preview storefront origins. Run `npm run seed:admin` from a trusted environment whenever the production owner password must be created or rotated; do not store `ADMIN_PASSWORD` in Render after bootstrap.

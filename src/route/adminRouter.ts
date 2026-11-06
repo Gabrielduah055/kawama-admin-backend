@@ -25,7 +25,7 @@ import {
   restoreProduct,
   updateProduct,
 } from '../controllers/productController.js';
-import { archiveReview, getAllReviews, updateReviewStatus } from '../controllers/reviewController.js';
+import { archiveReview, getAllReviews, replyToReview } from '../controllers/reviewController.js';
 import { createUploadSignature, deleteUpload } from '../controllers/uploadController.js';
 import type { MediaService } from '../services/cloudinary.service.js';
 
@@ -58,7 +58,7 @@ export const createAdminRouter = (mediaService: MediaService): Router => {
   router.post('/categories/:id/restore', restoreCategory);
 
   router.get('/reviews', getAllReviews);
-  router.patch('/reviews/:id/status', updateReviewStatus);
+  router.patch('/reviews/:id/reply', replyToReview);
   router.delete('/reviews/:id', archiveReview);
 
   router.post('/uploads/signature', createUploadSignature(mediaService));

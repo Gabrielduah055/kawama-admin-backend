@@ -76,8 +76,20 @@ export const openApiDocument = {
       get: { tags: ['Public catalog'], parameters: [{ name: 'slug', in: 'path', required: true, schema: { type: 'string' } }], responses: { '200': { description: 'Active product.', content: { 'application/json': { schema: { type: 'object', properties: { data: { $ref: '#/components/schemas/Product' } } } } } }, '404': { $ref: '#/components/responses/NotFound' } } },
     },
     '/api/v1/products/{productId}/reviews': {
-      get: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], responses: { '200': { description: 'Approved reviews.' }, '404': { $ref: '#/components/responses/NotFound' } } },
-      post: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ReviewInput' } } } }, responses: { '202': { description: 'Review accepted for moderation.' }, '400': { $ref: '#/components/responses/BadRequest' }, '429': { description: 'Review rate limit exceeded.' } } },
+      get: { tags: ['Public reviews'], parameters: [{ $ref: '#/components/parameters/ProductId' }], responses: { '200': { description: 'Approved reviews including safe owner replies.', content: { 'application/json': { schema: { type: 'object', required: ['message', 'data'], properties: { message: { type: 'string' }, data: { type: 'array', items: { $ref: '#/components/schemas/Review' } } } } } } }, '404': { $ref: '#/components/responses/NotFound' } } },
+      post: { tags: ['Public reviews'], description: 'Atomically publishes one review and consumes its paid-purchase invitation.', parameters: [{ $ref: '#/components/parameters/ProductId' }], requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ReviewInput' } } } }, responses: { '201': { description: 'Review published with approved status.' }, '404': { description: 'INVALID_REVIEW_LINK or product not found.' }, '409': { description: 'REVIEW_ALREADY_SUBMITTED, REVIEW_PRODUCT_MISMATCH, or REVIEW_ORDER_INELIGIBLE.' }, '422': { $ref: '#/components/responses/BadRequest' }, '429': { description: 'Review rate limit exceeded.' }, '503': { description: 'REVIEW_LINKS_NOT_CONFIGURED.' } } },
+    },
+    '/api/v1/review-links/{token}': {
+      get: {
+        tags: ['Public reviews'],
+        description: 'Returns product context and submission state without consuming the invitation.',
+        parameters: [{ name: 'token', in: 'path', required: true, schema: { type: 'string', maxLength: 200 } }],
+        responses: {
+          '200': { description: 'Review invitation context.', content: { 'application/json': { schema: { $ref: '#/components/schemas/ReviewLinkLookup' } } } },
+          '404': { description: 'INVALID_REVIEW_LINK.' },
+          '503': { description: 'REVIEW_LINKS_NOT_CONFIGURED.' },
+        },
+      },
     },
     '/api/ai/chat': {
       post: {
@@ -161,6 +173,21 @@ export const openApiDocument = {
         responses: {
           '200': { description: 'Approved customer-facing store policies.', content: { 'application/json': { schema: { type: 'object', required: ['policies'], properties: { policies: { type: 'array', maxItems: 20, items: { $ref: '#/components/schemas/OrderBridgePolicy' } } } } } } },
           '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/orders/{orderId}/review-links': {
+      post: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        description: 'Creates or reuses one stable review invitation per distinct product on a verified paid order. Already submitted products never receive a usable URL.',
+        parameters: [{ name: 'orderId', in: 'path', required: true, schema: { type: 'string', pattern: '^[a-fA-F0-9]{24}$' } }],
+        responses: {
+          '200': { description: 'Stable review links and product review states.', content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderReviewLinks' } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '404': { description: 'ORDER_NOT_FOUND.' },
+          '409': { description: 'ORDER_NOT_PAID.' },
+          '503': { description: 'REVIEW_LINKS_NOT_CONFIGURED.' },
         },
       },
     },
@@ -316,8 +343,8 @@ export const openApiDocument = {
     },
     '/api/v1/admin/categories/order': { patch: { tags: ['Admin categories'], security: [{ bearerAuth: [] }], requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['items'], properties: { items: { type: 'array', items: { type: 'object', required: ['id', 'displayOrder'], properties: { id: { type: 'string' }, displayOrder: { type: 'integer', minimum: 0 } } } } } } } } }, responses: { '200': { description: 'Display order updated.' } } } },
     '/api/v1/admin/categories/{id}/restore': { post: { tags: ['Admin categories'], security: [{ bearerAuth: [] }], parameters: [{ $ref: '#/components/parameters/Id' }], responses: { '200': { description: 'Category restored.' } } } },
-    '/api/v1/admin/reviews': { get: { tags: ['Admin reviews'], security: [{ bearerAuth: [] }], parameters: [{ name: 'status', in: 'query', schema: { enum: ['pending', 'approved', 'rejected', 'archived'] } }, { name: 'productId', in: 'query', schema: { type: 'string' } }, { $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/Limit' }], responses: { '200': { description: 'Paginated moderation queue.' } } } },
-    '/api/v1/admin/reviews/{id}/status': { patch: { tags: ['Admin reviews'], security: [{ bearerAuth: [] }], parameters: [{ $ref: '#/components/parameters/Id' }], requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['status'], properties: { status: { enum: ['approved', 'rejected', 'archived'] } } } } } }, responses: { '200': { description: 'Review moderated.' }, '404': { $ref: '#/components/responses/NotFound' } } } },
+    '/api/v1/admin/reviews': { get: { tags: ['Admin reviews'], security: [{ bearerAuth: [] }], parameters: [{ name: 'status', in: 'query', schema: { enum: ['pending', 'approved', 'rejected', 'archived'] }, description: 'Historical statuses remain filterable.' }, { name: 'productId', in: 'query', schema: { type: 'string' } }, { $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/Limit' }], responses: { '200': { description: 'Paginated reviews including safe public reply data.' } } } },
+    '/api/v1/admin/reviews/{id}/reply': { patch: { tags: ['Admin reviews'], security: [{ bearerAuth: [] }], parameters: [{ $ref: '#/components/parameters/Id' }], requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', additionalProperties: false, required: ['text'], properties: { text: { type: 'string', minLength: 1, maxLength: 1000 } } } } } }, responses: { '200': { description: 'Owner reply created or edited without changing the customer review.' }, '404': { $ref: '#/components/responses/NotFound' }, '422': { $ref: '#/components/responses/BadRequest' } } } },
     '/api/v1/admin/reviews/{id}': { delete: { tags: ['Admin reviews'], security: [{ bearerAuth: [] }], parameters: [{ $ref: '#/components/parameters/Id' }], responses: { '200': { description: 'Review archived.' } } } },
     '/api/v1/admin/uploads/signature': { post: { tags: ['Admin uploads'], security: [{ bearerAuth: [] }], responses: { '200': { description: 'Short-lived direct Cloudinary upload signature.' }, '503': { description: 'Cloudinary is not configured.' } } } },
     '/api/v1/admin/uploads': { delete: { tags: ['Admin uploads'], security: [{ bearerAuth: [] }], requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['publicId'], properties: { publicId: { type: 'string' } } } } } }, responses: { '200': { description: 'Unreferenced asset destroyed.' }, '409': { description: 'ASSET_IN_USE.' } } } },
@@ -456,7 +483,11 @@ export const openApiDocument = {
           status: { enum: ['active', 'blocked'] },
         },
       },
-      ReviewInput: { type: 'object', required: ['reviewerName', 'rating', 'comment'], properties: { reviewerName: { type: 'string', minLength: 2, maxLength: 60 }, rating: { type: 'integer', minimum: 1, maximum: 5 }, comment: { type: 'string', minLength: 10, maxLength: 500 } } },
+      ReviewReply: { type: ['object', 'null'], required: ['text', 'createdAt', 'updatedAt'], properties: { text: { type: 'string', maxLength: 1000 }, createdAt: { type: 'string', format: 'date-time' }, updatedAt: { type: 'string', format: 'date-time' } } },
+      Review: { type: 'object', required: ['id', 'productId', 'reviewerName', 'rating', 'comment', 'reply', 'createdAt'], properties: { id: { type: 'string' }, productId: { type: 'string' }, reviewerName: { type: 'string' }, rating: { type: 'integer', minimum: 1, maximum: 5 }, comment: { type: 'string' }, reply: { $ref: '#/components/schemas/ReviewReply' }, createdAt: { type: 'string', format: 'date-time' } } },
+      ReviewInput: { type: 'object', additionalProperties: false, required: ['token', 'reviewerName', 'rating', 'comment'], properties: { token: { type: 'string', maxLength: 200 }, reviewerName: { type: 'string', minLength: 2, maxLength: 60 }, rating: { type: 'integer', minimum: 1, maximum: 5 }, comment: { type: 'string', minLength: 10, maxLength: 500 } } },
+      ReviewLinkLookup: { type: 'object', required: ['message', 'data'], properties: { message: { type: 'string' }, data: { type: 'object', required: ['product', 'alreadySubmitted'], properties: { product: { type: 'object', required: ['id', 'name', 'slug'], properties: { id: { type: 'string' }, name: { type: 'string' }, slug: { type: 'string' } } }, alreadySubmitted: { type: 'boolean' } } } } },
+      OrderReviewLinks: { type: 'object', required: ['orderNumber', 'products'], properties: { orderNumber: { type: 'string' }, products: { type: 'array', items: { type: 'object', required: ['productId', 'name', 'reviewState', 'reviewUrl'], properties: { productId: { type: 'string' }, name: { type: 'string' }, reviewState: { enum: ['available', 'submitted'] }, reviewUrl: { type: ['string', 'null'], format: 'uri' } } } } } },
       CheckoutInput: {
         type: 'object',
         required: ['customer', 'items'],

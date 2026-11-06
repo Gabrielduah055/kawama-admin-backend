@@ -1,4 +1,5 @@
 import type { RequestHandler } from 'express';
+import { issueReviewLinks } from '../services/review-links.service.js';
 import {
   getOrderBridgePolicies,
   getOrderBridgeProduct,
@@ -38,4 +39,8 @@ export const getProductAvailabilityForOrderBridge: RequestHandler = async (reque
 export const getPoliciesForOrderBridge: RequestHandler = async (request, response) => {
   const { topic } = orderBridgePoliciesQuerySchema.parse(request.query);
   response.status(200).json(getOrderBridgePolicies(topic));
+};
+
+export const issueOrderReviewLinks: RequestHandler = async (request, response) => {
+  response.status(200).json(await issueReviewLinks(String(request.params.orderId)));
 };

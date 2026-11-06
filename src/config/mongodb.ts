@@ -5,6 +5,8 @@ import { CustomerModel } from '../models/CustomerSchema.js';
 import { OrderModel } from '../models/OrderSchema.js';
 import { PaymentAttemptModel } from '../models/PaymentAttemptSchema.js';
 import { ChatConversationModel } from '../models/ChatConversationSchema.js';
+import { ReviewInvitationModel } from '../models/ReviewInvitationSchema.js';
+import { ReviewModel } from '../models/ReviewSchema.js';
 import { ensureOrderBridgePaidOrderOutboxStorage } from '../models/OrderBridgePaidOrderOutboxSchema.js';
 import { logger } from '../utils/logger.js';
 
@@ -31,6 +33,8 @@ export const connectDatabase = async (uri = requireEnvironment('MONGODB_URI')): 
       OrderModel.createIndexes(),
       PaymentAttemptModel.createIndexes(),
       ChatConversationModel.createIndexes(),
+      ReviewInvitationModel.createIndexes(),
+      ReviewModel.createIndexes(),
     ]);
   }
   logger.info('mongodb_connected');
