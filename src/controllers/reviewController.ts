@@ -80,14 +80,12 @@ export const submitReview: RequestHandler = async (request, response) => {
         throw new AppError(409, 'REVIEW_PRODUCT_MISMATCH', 'This review link is for a different product.');
       }
 
-      const [order, product] = await Promise.all([
-        OrderModel.findOne({
-          _id: invitation.order,
-          paymentStatus: 'paid',
-          'items.product': invitation.product,
-        }).session(session).lean(),
-        ProductModel.findById(invitation.product).session(session).lean(),
-      ]);
+      const order = await OrderModel.findOne({
+        _id: invitation.order,
+        paymentStatus: 'paid',
+        'items.product': invitation.product,
+      }).session(session).lean();
+      const product = await ProductModel.findById(invitation.product).session(session).lean();
       if (!order) {
         throw new AppError(409, 'REVIEW_ORDER_INELIGIBLE', 'This order is not eligible for a review.');
       }
