@@ -6,7 +6,7 @@ import { logger } from '../utils/logger.js';
 
 function pathForLogging(path: string): string {
   return path.replace(
-    /^\/api\/v1\/review-links\/[^/]+$/,
+    /^\/api\/v1\/review-links\/[^/]+/i,
     '/api/v1/review-links/[REDACTED]',
   );
 }
