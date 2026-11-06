@@ -5,9 +5,8 @@ import { getEnvironment } from '../config/environment.js';
 import { toPesewas } from '../lib/catalog.js';
 import { CategoryModel } from '../models/CategorySchema.js';
 import { ProductModel } from '../models/ProductSchema.js';
-import { ReviewModel } from '../models/ReviewSchema.js';
 import { cloudinaryMediaService } from '../services/cloudinary.service.js';
-import { seedCategories, seedProducts, seedReviews } from '../data/seed-data.js';
+import { seedCategories, seedProducts } from '../data/seed-data.js';
 
 const dryRun = process.argv.includes('--dry-run');
 const environment = getEnvironment();
@@ -34,7 +33,7 @@ async function seed(): Promise<void> {
       ...seedCategories.map((category) => assetPath(category.imageFile)),
       ...seedProducts.flatMap((product) => product.imageFiles.map((image) => assetPath(image.file))),
     ]);
-    console.log(`Dry run passed: ${seedCategories.length} categories, ${seedProducts.length} products, ${seedReviews.length} reviews.`);
+    console.log(`Dry run passed: ${seedCategories.length} categories, ${seedProducts.length} products.`);
     return;
   }
 
@@ -63,7 +62,6 @@ async function seed(): Promise<void> {
     categoryIds.set(category.slug, String(saved._id));
   }
 
-  const productIds = new Map<string, string>();
   for (const product of seedProducts) {
     const existing = await ProductModel.findOne({ slug: product.slug }).lean();
     const images = existing?.images?.length
@@ -73,7 +71,7 @@ async function seed(): Promise<void> {
             uploadImage(image.file, `products/${product.slug}-${index + 1}`, image.alt, index),
           ),
         );
-    const saved = await ProductModel.findOneAndUpdate(
+    await ProductModel.findOneAndUpdate(
       { slug: product.slug },
       {
         $set: {
@@ -99,21 +97,8 @@ async function seed(): Promise<void> {
       },
       { returnDocument: 'after', upsert: true, runValidators: true },
     );
-    productIds.set(product.slug, String(saved._id));
   }
-
-  for (const review of seedReviews) {
-    const productId = productIds.get(review.product);
-    await ReviewModel.findOneAndUpdate(
-      { product: productId, reviewerName: review.reviewerName, comment: review.comment },
-      {
-        $set: { rating: review.rating, status: 'approved', moderatedBy: 'seed', moderatedAt: new Date(review.createdAt) },
-        $setOnInsert: { product: productId, reviewerName: review.reviewerName, comment: review.comment, createdAt: new Date(review.createdAt) },
-      },
-      { upsert: true, runValidators: true },
-    );
-  }
-  console.log(`Seed complete: ${seedCategories.length} categories, ${seedProducts.length} products, ${seedReviews.length} reviews.`);
+  console.log(`Seed complete: ${seedCategories.length} categories, ${seedProducts.length} products.`);
 }
 
 try {

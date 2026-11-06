@@ -4,6 +4,13 @@ import { ZodError } from 'zod';
 import { AppError } from '../errors/AppError.js';
 import { logger } from '../utils/logger.js';
 
+function pathForLogging(path: string): string {
+  return path.replace(
+    /^\/api\/v1\/review-links\/[^/]+/i,
+    '/api/v1/review-links/[REDACTED]',
+  );
+}
+
 export const notFoundHandler: RequestHandler = (request, _response, next) => {
   next(new AppError(404, 'ROUTE_NOT_FOUND', `Route ${request.method} ${request.path} was not found`));
 };
@@ -33,7 +40,7 @@ export const errorHandler: ErrorRequestHandler = (error: unknown, request, respo
     logger.error('request_failed', {
       code: normalized.code,
       method: request.method,
-      path: request.path,
+      path: pathForLogging(request.path),
       requestId: String(response.locals.requestId),
     });
   }

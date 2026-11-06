@@ -61,11 +61,14 @@ export const productCreateSchema = productBaseSchema
 
 export const productUpdateSchema = productBaseSchema.omit({ slug: true }).partial().strict();
 export const reviewCreateSchema = z.object({
+  token: z.string().trim().min(1).max(200),
   reviewerName: z.string().trim().min(2).max(60),
   rating: z.number().int().min(1).max(5),
   comment: z.string().trim().min(10).max(500),
-});
-export const reviewStatusSchema = z.object({ status: z.enum(['approved', 'rejected', 'archived']) });
+}).strict();
+export const reviewReplySchema = z.object({
+  text: z.string().trim().min(1).max(1000),
+}).strict();
 
 export const paginationSchema = z.object({
   page: z.coerce.number().int().positive().default(1),

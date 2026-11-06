@@ -15,6 +15,10 @@ services:
         sync: false
       - key: FRONTEND_ORIGINS
         sync: false
+      - key: REVIEW_LINK_SECRET
+        sync: false
+      - key: STOREFRONT_BASE_URL
+        sync: false
       - key: JWT_SECRET
         sync: false
       - key: JWT_EXPIRES_IN

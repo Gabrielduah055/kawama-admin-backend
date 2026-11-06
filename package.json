@@ -12,6 +12,7 @@
     "test": "vitest run",
     "seed": "tsx src/scripts/seed.ts",
     "seed:dry-run": "tsx src/scripts/seed.ts --dry-run",
+    "seed:cleanup-reviews": "tsx src/scripts/cleanup-seeded-reviews.ts",
     "seed:admin": "tsx src/scripts/seed-admin.ts"
   },
   "keywords": [
