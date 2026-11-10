@@ -37,6 +37,10 @@ export const orderBridgeProductSearchSchema = z.object({
   }
 });
 
+export const orderBridgeCatalogOverviewQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(10).default(5),
+}).strict();
+
 export const orderBridgeProductIdSchema = objectIdSchema.transform((value) => value.toLowerCase());
 
 export const orderBridgePoliciesQuerySchema = z.object({

@@ -1,16 +1,23 @@
 import type { RequestHandler } from 'express';
 import { issueReviewLinks } from '../services/review-links.service.js';
 import {
+  getOrderBridgeCatalogOverview,
   getOrderBridgePolicies,
   getOrderBridgeProduct,
   getOrderBridgeProductAvailability,
   searchOrderBridgeProducts,
 } from '../services/orderbridge.service.js';
 import {
+  orderBridgeCatalogOverviewQuerySchema,
   orderBridgePoliciesQuerySchema,
   orderBridgeProductIdSchema,
   orderBridgeProductSearchSchema,
 } from '../validation/orderbridge.schemas.js';
+
+export const getCatalogOverviewForOrderBridge: RequestHandler = async (request, response) => {
+  const { limit } = orderBridgeCatalogOverviewQuerySchema.parse(request.query);
+  response.status(200).json(await getOrderBridgeCatalogOverview(limit));
+};
 
 export const searchProductsForOrderBridge: RequestHandler = async (request, response) => {
   const input = orderBridgeProductSearchSchema.parse(request.query);
