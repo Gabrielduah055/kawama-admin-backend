@@ -141,6 +141,38 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/integrations/orderbridge/catalog/overview': {
+      get: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        description: 'Returns a bounded overview of the active public Kawama catalog.',
+        parameters: [
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 10, default: 5 } },
+        ],
+        responses: {
+          '200': {
+            description: 'Active category names and featured products with uncapped catalog totals.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['categories', 'products', 'totalCategories', 'totalProducts'],
+                  properties: {
+                    categories: { type: 'array', maxItems: 100, uniqueItems: true, items: { type: 'string' } },
+                    products: { type: 'array', maxItems: 10, items: { $ref: '#/components/schemas/OrderBridgeProduct' } },
+                    totalCategories: { type: 'integer', minimum: 0 },
+                    totalProducts: { type: 'integer', minimum: 0 },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+          '503': { description: 'The API key or canonical storefront URL is not configured.' },
+        },
+      },
+    },
     '/api/integrations/orderbridge/products/{productId}': {
       get: {
         tags: ['OrderBridge integration'],

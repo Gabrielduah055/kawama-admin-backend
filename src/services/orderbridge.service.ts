@@ -1,6 +1,7 @@
 import { getEnvironment } from '../config/environment.js';
 import { AppError } from '../errors/AppError.js';
 import {
+  getActivePublicCategoryOverview,
   getPublicProductAvailabilityByIdentifiers,
   getPublicProductsByIdentifiers,
   searchPublicProducts,
@@ -20,7 +21,7 @@ export interface OrderBridgeProductSearchInput {
   sort: 'relevance' | 'price_asc' | 'price_desc';
 }
 
-interface OrderBridgeProduct {
+export interface OrderBridgeProduct {
   id: string;
   name: string;
   description?: string | undefined;
@@ -91,6 +92,24 @@ function toOrderBridgeProduct(
     ...(stockQuantity !== undefined ? { stockQuantity } : {}),
     ...(specifications ? { specifications } : {}),
     canonicalUrl: canonicalProductUrl(String(product.slug)),
+  };
+}
+
+export async function getOrderBridgeCatalogOverview(limit: number) {
+  const [categoryOverview, productResult] = await Promise.all([
+    getActivePublicCategoryOverview(100),
+    searchPublicProducts({ sort: 'featured', page: 1, limit }),
+  ]);
+  const availability = await getPublicProductAvailabilityByIdentifiers(
+    productResult.products.map((product) => String(product.id)),
+  );
+
+  return {
+    categories: categoryOverview.categories,
+    products: productResult.products.map((product) =>
+      toOrderBridgeProduct(product, availability.get(String(product.id))?.stockQuantity)),
+    totalCategories: categoryOverview.total,
+    totalProducts: productResult.total,
   };
 }
 

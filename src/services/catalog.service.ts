@@ -33,6 +33,11 @@ export interface PublicProductAvailability {
   stockQuantity: number;
 }
 
+export interface ActivePublicCategoryOverview {
+  categories: string[];
+  total: number;
+}
+
 function normalizeQueryWords(value: string): string[] {
   return value
     .normalize('NFKD')
@@ -123,6 +128,39 @@ function buildBaseFilter(input: PublicProductSearchInput, categoryId: unknown | 
     filter.$expr = { $lte: [{ $subtract: ['$stockQuantity', { $ifNull: ['$reservedQuantity', 0] }] }, 0] };
   }
   return filter;
+}
+
+export async function getActivePublicCategoryOverview(limit = 100): Promise<ActivePublicCategoryOverview> {
+  const categoryLimit = Math.max(1, Math.min(Math.trunc(limit), 100));
+  const [overview] = await CategoryModel.aggregate<{
+    categories: Array<{ name: string }>;
+    totals: Array<{ count: number }>;
+  }>([
+    { $match: { status: 'active', name: { $type: 'string' } } },
+    {
+      $project: {
+        name: { $trim: { input: '$name' } },
+        displayOrder: { $ifNull: ['$displayOrder', 0] },
+      },
+    },
+    { $match: { name: { $ne: '' } } },
+    { $group: { _id: '$name', displayOrder: { $min: '$displayOrder' } } },
+    { $sort: { displayOrder: 1, _id: 1 } },
+    {
+      $facet: {
+        categories: [
+          { $limit: categoryLimit },
+          { $project: { _id: 0, name: '$_id' } },
+        ],
+        totals: [{ $count: 'count' }],
+      },
+    },
+  ]).collation({ locale: 'en', strength: 2 });
+
+  return {
+    categories: overview?.categories.map(({ name }) => name) ?? [],
+    total: overview?.totals[0]?.count ?? 0,
+  };
 }
 
 export async function getActivePublicCategoryNames(limit = 8): Promise<string[]> {
