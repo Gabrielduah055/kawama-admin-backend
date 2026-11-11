@@ -25,11 +25,12 @@ export const orderBridgeProductSearchSchema = z.object({
   preference: preferencesSchema,
   sort: z.enum(['relevance', 'price_asc', 'price_desc']).default('relevance'),
 }).strict().superRefine((value, context) => {
-  if (!value.query && !value.category && value.preference.length === 0) {
+  const isCatalogWidePriceSearch = value.sort === 'price_asc' || value.sort === 'price_desc';
+  if (!value.query && !value.category && value.preference.length === 0 && !isCatalogWidePriceSearch) {
     context.addIssue({
       code: 'custom',
       path: ['query'],
-      message: 'At least one of query, category, or preference is required.',
+      message: 'At least one of query, category, or preference is required unless sorting by price.',
     });
   }
   if (value.minPrice !== undefined && value.maxPrice !== undefined && value.minPrice > value.maxPrice) {

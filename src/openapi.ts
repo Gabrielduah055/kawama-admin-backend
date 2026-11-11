@@ -122,7 +122,7 @@ export const openApiDocument = {
       get: {
         tags: ['OrderBridge integration'],
         security: [{ orderBridgeApiKey: [] }],
-        description: 'Searches active Kawama products using the external OrderBridge commerce API contract.',
+        description: 'Searches active Kawama products using the external OrderBridge commerce API contract. At least one of query, category, or preference is required unless sort is explicitly price_asc or price_desc. Catalog-wide price searches are sorted in the database before the bounded result limit is applied.',
         parameters: [
           { name: 'query', in: 'query', schema: { type: 'string', maxLength: 300 } },
           { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 10, default: 10 } },
@@ -131,7 +131,7 @@ export const openApiDocument = {
           { name: 'category', in: 'query', schema: { type: 'string', maxLength: 100 } },
           { name: 'available', in: 'query', schema: { type: 'boolean' } },
           { name: 'preference', in: 'query', schema: { type: 'array', maxItems: 10, items: { type: 'string', maxLength: 100 } }, style: 'form', explode: true },
-          { name: 'sort', in: 'query', schema: { enum: ['relevance', 'price_asc', 'price_desc'], default: 'relevance' } },
+          { name: 'sort', in: 'query', schema: { enum: ['relevance', 'price_asc', 'price_desc'], default: 'relevance' }, description: 'price_asc or price_desc may be used without query, category, or preference to search across the active catalog.' },
         ],
         responses: {
           '200': { description: 'Matching active products.', content: { 'application/json': { schema: { type: 'object', required: ['products', 'total'], properties: { products: { type: 'array', items: { $ref: '#/components/schemas/OrderBridgeProduct' } }, total: { type: 'integer', minimum: 0 } } } } } },
