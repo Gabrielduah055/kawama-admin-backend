@@ -494,7 +494,7 @@ export async function createCheckoutSession(
   let attempt: any;
   try {
     await mongoose.connection.transaction(async (session) => {
-      const draft = await buildPendingOrderDraft(input, session, { source: options.source });
+      const draft = await buildPendingOrderDraft(input, session, options);
       await options.validateDraft?.(draft, session);
       for (const item of draft.items) {
         const reserved = await ProductModel.updateOne(
