@@ -68,6 +68,12 @@ const environmentSchema = z.object({
     emptyStringToUndefined,
     z.string().trim().min(32).max(512).optional(),
   ),
+  ORDERBRIDGE_CHECKOUT_ENABLED: z.enum(['true', 'false']).default('false')
+    .transform((value) => value === 'true'),
+  ORDERBRIDGE_WHATSAPP_CALLBACK_URL: z.preprocess(
+    emptyStringToUndefined,
+    z.string().trim().url().optional(),
+  ),
   REVIEW_LINK_SECRET: z.preprocess(
     emptyStringToUndefined,
     z.string().trim().min(32).max(512).optional(),

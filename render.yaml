@@ -39,6 +39,14 @@ services:
         value: https://api.paystack.co
       - key: AI_CHAT_ENABLED
         value: true
+      - key: ORDERBRIDGE_BUSINESS_ID
+        sync: false
+      - key: ORDERBRIDGE_API_KEY
+        sync: false
+      - key: ORDERBRIDGE_CHECKOUT_ENABLED
+        value: false
+      - key: ORDERBRIDGE_WHATSAPP_CALLBACK_URL
+        sync: false
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_MODEL

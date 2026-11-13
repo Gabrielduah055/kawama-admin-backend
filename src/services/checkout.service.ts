@@ -6,7 +6,7 @@ import { CustomerModel } from '../models/CustomerSchema.js';
 import { OrderModel } from '../models/OrderSchema.js';
 import { PaymentAttemptModel } from '../models/PaymentAttemptSchema.js';
 import { ProductModel } from '../models/ProductSchema.js';
-import { buildPendingOrderDraft, type CheckoutInput } from './order.service.js';
+import { buildPendingOrderDraft, type CheckoutInput, type BuildOrderDraftOptions } from './order.service.js';
 import { createPaidOrderOutboxEvent } from './orderbridge-paid-order-events.service.js';
 import type { PaystackGateway, PaystackVerification } from './paystack.service.js';
 
@@ -461,16 +461,31 @@ function duplicateKeyError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 11000;
 }
 
+export interface CreateCheckoutSessionOptions extends BuildOrderDraftOptions {
+  callbackUrl?: string;
+  integrationSessionId?: string;
+  integrationBusinessId?: string;
+  integrationCustomerKey?: string;
+  integrationQuoteId?: string;
+  validateExisting?: (order: any) => void;
+  validateDraft?: (draft: Awaited<ReturnType<typeof buildPendingOrderDraft>>, session: ClientSession) => Promise<void>;
+  afterOrderCreated?: (orderId: unknown, session: ClientSession) => Promise<void>;
+}
+
 export async function createCheckoutSession(
   input: CheckoutInput,
   checkoutToken: string,
   gateway: PaystackGateway,
   requestId?: string,
+  options: CreateCheckoutSessionOptions = {},
 ): Promise<CheckoutSession> {
   await releaseExpiredCheckoutReservations();
   const idempotencyKeyHash = hashCheckoutToken(checkoutToken);
   const existing = await OrderModel.findOne({ idempotencyKeyHash }).lean();
-  if (existing) return existingCheckoutSession(existing, checkoutToken, gateway, requestId);
+  if (existing) {
+    options.validateExisting?.(existing);
+    return existingCheckoutSession(existing, checkoutToken, gateway, requestId);
+  }
   // This preflight must run before any new order, payment attempt, or stock reservation is created.
   // Existing idempotent sessions remain recoverable if configuration changes later.
   gateway.assertConfigured(requestId);
@@ -479,7 +494,8 @@ export async function createCheckoutSession(
   let attempt: any;
   try {
     await mongoose.connection.transaction(async (session) => {
-      const draft = await buildPendingOrderDraft(input, session);
+      const draft = await buildPendingOrderDraft(input, session, { source: options.source });
+      await options.validateDraft?.(draft, session);
       for (const item of draft.items) {
         const reserved = await ProductModel.updateOne(
           {
@@ -508,15 +524,21 @@ export async function createCheckoutSession(
           paymentReference: draft.orderNumber,
           stockReservationStatus: 'active',
           stockReservationExpiresAt: expiresAt,
+          ...(options.integrationSessionId ? { integrationSessionId: options.integrationSessionId } : {}),
+          ...(options.integrationBusinessId ? { integrationBusinessId: options.integrationBusinessId } : {}),
+          ...(options.integrationCustomerKey ? { integrationCustomerKey: options.integrationCustomerKey } : {}),
+          ...(options.integrationQuoteId ? { integrationQuoteId: options.integrationQuoteId } : {}),
         }],
         { session },
       );
+      await options.afterOrderCreated?.(order._id, session);
       [attempt] = await PaymentAttemptModel.create(
         [{
           order: order._id,
           reference: draft.orderNumber,
           amountPesewas: draft.productPaymentTotalPesewas,
           currency: 'GHS',
+          source: draft.source,
           status: 'initializing',
         }],
         { session },
@@ -525,7 +547,10 @@ export async function createCheckoutSession(
   } catch (error) {
     if (duplicateKeyError(error)) {
       const duplicate = await OrderModel.findOne({ idempotencyKeyHash }).lean();
-      if (duplicate) return existingCheckoutSession(duplicate, checkoutToken, gateway, requestId);
+      if (duplicate) {
+        options.validateExisting?.(duplicate);
+        return existingCheckoutSession(duplicate, checkoutToken, gateway, requestId);
+      }
     }
     throw error;
   }
@@ -539,7 +564,8 @@ export async function createCheckoutSession(
       amountPesewas: order.productPaymentTotalPesewas,
       currency: 'GHS',
       reference: order.paymentReference,
-      metadata: { order_id: String(order._id), order_number: order.orderNumber, source: 'kawama_storefront' },
+      metadata: { order_id: String(order._id), order_number: order.orderNumber, source: options.source ?? 'kawama_storefront' },
+      ...(options.callbackUrl ? { callbackUrl: options.callbackUrl } : {}),
       ...(requestId ? { requestId } : {}),
     });
   } catch (error) {
@@ -582,6 +608,10 @@ export async function createCheckoutSession(
 
 export async function getCheckoutStatus(checkoutToken: string): Promise<CheckoutStatus> {
   const idempotencyKeyHash = hashCheckoutToken(checkoutToken);
+  return getCheckoutStatusByHash(idempotencyKeyHash);
+}
+
+export async function getCheckoutStatusByHash(idempotencyKeyHash: string): Promise<CheckoutStatus> {
   let order = await OrderModel.findOne({ idempotencyKeyHash }).lean();
   if (!order) throw new AppError(404, 'CHECKOUT_NOT_FOUND', 'Checkout not found.');
 
