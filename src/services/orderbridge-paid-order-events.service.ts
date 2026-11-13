@@ -172,7 +172,10 @@ export function buildPaidOrderOutboxRecord(order: any, businessId: string, now =
 export async function createPaidOrderOutboxEvent(order: any, session: ClientSession): Promise<void> {
   const configuration = resolveConfiguration(getEnvironment());
   if (!configuration) return;
-  const record = buildPaidOrderOutboxRecord(order, configuration.businessId);
+  // Integration-created orders stay bound to the business that created their
+  // quote even if server configuration changes before payment is verified.
+  const destinationBusinessId = order.integrationBusinessId ?? configuration.businessId;
+  const record = buildPaidOrderOutboxRecord(order, destinationBusinessId);
   await OrderBridgePaidOrderOutboxModel.create([record], { session });
 }
 

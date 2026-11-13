@@ -34,6 +34,7 @@ export interface InitializePaystackInput {
   currency: 'GHS';
   reference: string;
   metadata: Record<string, string>;
+  callbackUrl?: string;
   requestId?: string;
 }
 
@@ -106,7 +107,7 @@ export class HttpPaystackGateway implements PaystackGateway {
           currency: input.currency,
           reference: input.reference,
           metadata: JSON.stringify(input.metadata),
-          ...(configuration.callbackUrl ? { callback_url: configuration.callbackUrl } : {}),
+          ...((input.callbackUrl ?? configuration.callbackUrl) ? { callback_url: input.callbackUrl ?? configuration.callbackUrl } : {}),
         }),
         signal: AbortSignal.timeout(10_000),
       });

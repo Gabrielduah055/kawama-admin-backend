@@ -197,6 +197,63 @@ An idempotent `POST` retry reconciles an uncertain attempt by calling Paystack's
 
 The storefront can poll `GET /api/v1/checkout/sessions/:checkoutToken`. This endpoint returns limited status information and never treats a browser callback as proof of payment. Reservations otherwise expire through the existing 30-minute request-triggered cleanup path if no verified payment arrives.
 
+### OrderBridge WhatsApp checkout
+
+OrderBridge uses the existing `Authorization: Bearer <ORDERBRIDGE_API_KEY>` server credential for all three purchasing operations. Purchasing is unavailable until `ORDERBRIDGE_CHECKOUT_ENABLED=true`. `ORDERBRIDGE_BUSINESS_ID` supplies the authoritative business scope; callers cannot choose it. On every request OrderBridge must supply a stable `customerKey` derived from its authenticated WhatsApp customer session: in the JSON body for both POST operations and as the `customerKey` query parameter for the GET operation. The same value must be reused throughout one customer's flow, and cannot access another customer's quote or session.
+
+Create a ten-minute, side-effect-free quote:
+
+```http
+POST /api/integrations/orderbridge/checkout/quotes
+Authorization: Bearer <server-only key>
+Content-Type: application/json
+
+{
+  "customerKey": "whatsapp:+233200000000",
+  "customer": {
+    "fullName": "Example Customer",
+    "email": "customer@example.invalid",
+    "whatsappNumber": "+233200000000",
+    "deliveryAddress": "Example delivery address, Accra",
+    "whatsappConsent": true
+  },
+  "orderNotes": "Call on arrival",
+  "items": [
+    { "productId": "000000000000000000000001", "quantity": 1 },
+    { "productId": "000000000000000000000002", "quantity": 2 }
+  ]
+}
+```
+
+The response contains `quoteId`, authoritative item prices and totals in integer pesewas, `currency: "GHS"`, `expiresAt`, and `deliveryFee: "arranged_separately"`. Quoting validates active products and sellable stock but does not create an order, reserve stock, or contact Paystack.
+
+After explicit customer confirmation, create or resume checkout using only the saved quote:
+
+```http
+POST /api/integrations/orderbridge/checkout/sessions
+Authorization: Bearer <server-only key>
+Idempotency-Key: 00000000-0000-4000-8000-000000000000
+Content-Type: application/json
+
+{
+  "quoteId": "000000000000000000000010",
+  "customerKey": "whatsapp:+233200000000"
+}
+```
+
+The backend atomically binds the quote to one idempotency key and one scoped `sessionId`. A different key cannot consume the same quote, and one key cannot be reused for another quote, customer, or website checkout. Current prices are compared with the quote inside the order/reservation transaction; `QUOTE_CHANGED` or `QUOTE_EXPIRED` requires a new quote and fresh confirmation before payment can be initialized. The response includes only `sessionId`, order number, product-payment amount, currency, payment and fulfillment states, the separate-delivery marker, and `paymentUrl` when Paystack supplied one. It never exposes the private storefront `checkoutToken`, Paystack access code, or payment reference.
+
+If initialization is uncertain, keep the same quote and `Idempotency-Key` and repeat the POST. The existing checkout recovery verifies the stored Paystack reference at most three times and never initializes a replacement. Then poll scoped status:
+
+```http
+GET /api/integrations/orderbridge/checkout/sessions/obs_00000000000000000000000000000000/status?customerKey=whatsapp%3A%2B233200000000
+Authorization: Bearer <server-only key>
+```
+
+Status returns the server-authoritative payment, fulfillment, delivery-fee, amount, currency, and optional receipt state. Customer messages, browser redirects, and callback parameters are never payment proof; signed Paystack webhooks plus server verification continue through the existing inventory commit, paid-order outbox, receipt, manager notification, and review-invitation workflow.
+
+Expected integration errors include `ORDERBRIDGE_CHECKOUT_NOT_ENABLED`, `ORDERBRIDGE_CHECKOUT_NOT_CONFIGURED`, `QUOTE_NOT_FOUND`, `QUOTE_ACCESS_DENIED`, `QUOTE_EXPIRED`, `QUOTE_ALREADY_BOUND`, `QUOTE_CHANGED`, `QUOTE_BINDING_LOST`, `IDEMPOTENCY_KEY_CONFLICT`, `SESSION_NOT_FOUND`, `SESSION_ACCESS_DENIED`, `PRODUCT_UNAVAILABLE`, `INSUFFICIENT_STOCK`, and the existing checkout/Paystack recovery errors such as `CHECKOUT_INITIALIZATION_UNCERTAIN`. Configure `ORDERBRIDGE_CHECKOUT_ENABLED`, `ORDERBRIDGE_API_KEY`, `ORDERBRIDGE_BUSINESS_ID`, `ORDERBRIDGE_WHATSAPP_CALLBACK_URL`, `PAYSTACK_SECRET_KEY`, and `PAYSTACK_BASE_URL`; the callback is server-controlled and must be HTTPS outside local development.
+
 For the currently named deployed test API, set this webhook URL in the Paystack **test mode** dashboard:
 
 ```text

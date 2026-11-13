@@ -14,6 +14,7 @@ export const fulfillmentStatuses = [
 ] as const;
 export const deliveryFeeStatuses = ['not_quoted', 'quoted', 'collected', 'waived'] as const;
 export const stockReservationStatuses = ['active', 'committed', 'released'] as const;
+export const orderSources = ['kawama_storefront', 'whatsapp'] as const;
 
 const orderCustomerSchema = new Schema(
   {
@@ -72,6 +73,7 @@ const orderSchema = new Schema(
     deliveryPaymentMethod: { type: String, enum: ['pay_on_delivery'], default: 'pay_on_delivery' },
     deliveryFeeStatus: { type: String, enum: deliveryFeeStatuses, default: 'not_quoted', index: true },
     paymentProvider: { type: String, enum: ['paystack'], default: 'paystack' },
+    source: { type: String, enum: orderSources, default: 'kawama_storefront', immutable: true },
     paymentReference: { type: String, trim: true },
     paystackTransactionId: { type: String, trim: true },
     paymentStatus: { type: String, enum: paymentStatuses, default: 'pending', index: true },
@@ -85,6 +87,10 @@ const orderSchema = new Schema(
     deliveredAt: { type: Date },
     cancelledAt: { type: Date },
     receipt: { type: receiptSchema },
+    integrationSessionId: { type: String, trim: true, immutable: true },
+    integrationBusinessId: { type: String, trim: true, index: true, immutable: true },
+    integrationCustomerKey: { type: String, trim: true, index: true, immutable: true },
+    integrationQuoteId: { type: Schema.Types.ObjectId, ref: 'IntegrationCheckoutQuote', immutable: true },
   },
   { timestamps: true, versionKey: false },
 );
@@ -96,6 +102,8 @@ orderSchema.index({ createdAt: -1 });
 orderSchema.index({ paymentStatus: 1, fulfillmentStatus: 1, createdAt: -1 });
 orderSchema.index({ 'customer.whatsappNumber': 1, createdAt: -1 });
 orderSchema.index({ 'customer.email': 1, createdAt: -1 });
+orderSchema.index({ integrationSessionId: 1 }, { unique: true, sparse: true });
+orderSchema.index({ integrationQuoteId: 1 }, { unique: true, sparse: true });
 
 export const OrderModel = ((models.Order as Model<any> | undefined) ??
   model<any>('Order', orderSchema)) as Model<any>;

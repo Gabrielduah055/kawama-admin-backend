@@ -223,6 +223,60 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/integrations/orderbridge/checkout/quotes': {
+      post: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        description: 'Creates a ten-minute authoritative quote bound to the configured business and the stable customerKey supplied by the trusted OrderBridge server. customerKey must identify the authenticated WhatsApp customer and must be reused in the session request and status query. Quoting does not create an order, reserve stock, or initialize payment; delivery fees remain arranged separately.',
+        requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeQuoteInput' } } } },
+        responses: {
+          '201': { description: 'Authoritative quote created.', content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeQuoteResponse' } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '409': { description: 'PRODUCT_UNAVAILABLE or INSUFFICIENT_STOCK.', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+          '422': { $ref: '#/components/responses/BadRequest' },
+          '503': { description: 'ORDERBRIDGE_CHECKOUT_NOT_ENABLED or ORDERBRIDGE_CHECKOUT_NOT_CONFIGURED.' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/checkout/sessions': {
+      post: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        description: 'After explicit customer confirmation, creates or resumes checkout exclusively from the saved quote. The quote, configured business, customerKey, and Idempotency-Key are bound one-to-one. Current quote prices are compared inside the order/reservation transaction before Paystack initialization. Reuse the identical key and body after CHECKOUT_INITIALIZATION_UNCERTAIN; retries verify the stored reference and never initialize a replacement.',
+        parameters: [{ name: 'Idempotency-Key', in: 'header', required: true, schema: { type: 'string', minLength: 16, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeCheckoutInput' } } } },
+        responses: {
+          '201': { description: 'Order created, inventory reserved, and Paystack initialized.', content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeCheckoutResponse' } } } },
+          '200': { description: 'Existing or reconciled session returned.', content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeCheckoutResponse' } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '403': { description: 'QUOTE_ACCESS_DENIED.' },
+          '404': { description: 'QUOTE_NOT_FOUND.' },
+          '409': { description: 'QUOTE_EXPIRED, QUOTE_ALREADY_BOUND, QUOTE_CHANGED, QUOTE_BINDING_LOST, IDEMPOTENCY_KEY_CONFLICT, INSUFFICIENT_STOCK, CHECKOUT_INITIALIZING, CHECKOUT_EXPIRED, or CHECKOUT_INITIALIZATION_UNCERTAIN.' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+          '502': { description: 'Paystack definitively rejected initialization.' },
+          '503': { description: 'Checkout, business scope, callback URL, or Paystack is not configured.' },
+        },
+      },
+    },
+    '/api/integrations/orderbridge/checkout/sessions/{sessionId}/status': {
+      get: {
+        tags: ['OrderBridge integration'],
+        security: [{ orderBridgeApiKey: [] }],
+        description: 'Returns limited server-authoritative status for a session bound to the configured business and customerKey. customerKey is required as a query parameter. Browser callbacks and customer statements are not accepted as payment proof.',
+        parameters: [
+          { name: 'sessionId', in: 'path', required: true, schema: { type: 'string', minLength: 16, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' } },
+          { name: 'customerKey', in: 'query', required: true, description: 'Stable key for the authenticated WhatsApp customer, supplied by the trusted OrderBridge server on every status request.', schema: { $ref: '#/components/schemas/OrderBridgeCustomerKey' } },
+        ],
+        responses: {
+          '200': { description: 'Current scoped checkout status.', content: { 'application/json': { schema: { $ref: '#/components/schemas/OrderBridgeStatusResponse' } } } },
+          '401': { $ref: '#/components/responses/OrderBridgeUnauthorized' },
+          '403': { description: 'SESSION_ACCESS_DENIED.' },
+          '404': { description: 'SESSION_NOT_FOUND.' },
+          '422': { $ref: '#/components/responses/BadRequest' },
+          '503': { description: 'ORDERBRIDGE_CHECKOUT_NOT_ENABLED or ORDERBRIDGE_CHECKOUT_NOT_CONFIGURED.' },
+        },
+      },
+    },
     '/api/v1/checkout/sessions': {
       post: {
         tags: ['Public checkout'],
@@ -476,6 +530,146 @@ export const openApiDocument = {
       },
       OrderBridgeAvailability: { type: 'object', required: ['productId', 'available', 'stockQuantity'], properties: { productId: { type: 'string' }, available: { type: 'boolean' }, stockQuantity: { type: 'integer', minimum: 0 } } },
       OrderBridgePolicy: { type: 'object', required: ['name', 'content'], properties: { name: { type: 'string', maxLength: 200 }, content: { type: 'string', maxLength: 8_000 }, url: { type: 'string', format: 'uri' } } },
+      OrderBridgeCustomerKey: {
+        type: 'string',
+        minLength: 4,
+        maxLength: 200,
+        pattern: '^[A-Za-z0-9._:@+\\-]+$',
+        description: 'Stable identifier derived by the trusted OrderBridge server from the authenticated WhatsApp customer session. It is sent in each POST body and as the status GET query parameter.',
+      },
+      OrderBridgeQuoteInput: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['customerKey', 'customer', 'items'],
+        properties: {
+          customerKey: { $ref: '#/components/schemas/OrderBridgeCustomerKey' },
+          customer: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['fullName', 'email', 'whatsappNumber', 'deliveryAddress', 'whatsappConsent'],
+            properties: {
+              fullName: { type: 'string', minLength: 2, maxLength: 120 },
+              email: { type: 'string', format: 'email', maxLength: 254 },
+              whatsappNumber: { type: 'string', description: 'Normalized by the backend to E.164.' },
+              deliveryAddress: { type: 'string', minLength: 5, maxLength: 500 },
+              whatsappConsent: { const: true },
+            },
+          },
+          orderNotes: { type: 'string', maxLength: 500, default: '' },
+          items: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['productId', 'quantity'],
+              properties: {
+                productId: { type: 'string', pattern: '^[a-fA-F0-9]{24}$' },
+                quantity: { type: 'integer', minimum: 1, maximum: 20 },
+              },
+            },
+          },
+        },
+      },
+      OrderBridgeCheckoutInput: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['quoteId', 'customerKey'],
+        properties: {
+          quoteId: { type: 'string', pattern: '^[a-fA-F0-9]{24}$' },
+          customerKey: { $ref: '#/components/schemas/OrderBridgeCustomerKey' },
+        },
+      },
+      OrderBridgeQuoteResponse: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message', 'data'],
+        properties: {
+          message: { type: 'string' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['quoteId', 'items', 'subtotalPesewas', 'totalPesewas', 'currency', 'deliveryFee', 'expiresAt'],
+            properties: {
+              quoteId: { type: 'string', pattern: '^[a-fA-F0-9]{24}$' },
+              items: {
+                type: 'array',
+                minItems: 1,
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['productId', 'name', 'unitPricePesewas', 'quantity', 'lineTotalPesewas'],
+                  properties: {
+                    productId: { type: 'string' },
+                    name: { type: 'string' },
+                    unitPricePesewas: { type: 'integer', minimum: 0 },
+                    quantity: { type: 'integer', minimum: 1, maximum: 20 },
+                    lineTotalPesewas: { type: 'integer', minimum: 0 },
+                  },
+                },
+              },
+              subtotalPesewas: { type: 'integer', minimum: 0 },
+              totalPesewas: { type: 'integer', minimum: 0 },
+              currency: { const: 'GHS' },
+              deliveryFee: { const: 'arranged_separately' },
+              expiresAt: { type: 'string', format: 'date-time' },
+            },
+          },
+        },
+      },
+      OrderBridgeCheckoutResponse: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message', 'data'],
+        properties: {
+          message: { type: 'string' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['created', 'sessionId', 'orderNumber', 'amountPesewas', 'currency', 'paymentStatus', 'fulfillmentStatus', 'deliveryFee'],
+            properties: {
+              created: { type: 'boolean' },
+              sessionId: { type: 'string' },
+              orderNumber: { type: 'string' },
+              amountPesewas: { type: 'integer', minimum: 0 },
+              currency: { const: 'GHS' },
+              paymentStatus: { enum: ['pending', 'paid', 'failed', 'refunded', 'needs_attention'] },
+              fulfillmentStatus: { enum: ['awaiting_payment', 'paid_awaiting_delivery', 'processing', 'out_for_delivery', 'delivered', 'cancelled', 'needs_attention'] },
+              deliveryFee: { const: 'arranged_separately' },
+              paymentUrl: { type: 'string', format: 'uri' },
+            },
+          },
+        },
+      },
+      OrderBridgeStatusResponse: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message', 'data'],
+        properties: {
+          message: { type: 'string' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['sessionId', 'orderNumber', 'paymentStatus', 'fulfillmentStatus', 'deliveryFeeStatus', 'amountPesewas', 'currency', 'deliveryFee'],
+            properties: {
+              sessionId: { type: 'string' },
+              orderNumber: { type: 'string' },
+              paymentStatus: { enum: ['pending', 'paid', 'failed', 'refunded', 'needs_attention'] },
+              fulfillmentStatus: { enum: ['awaiting_payment', 'paid_awaiting_delivery', 'processing', 'out_for_delivery', 'delivered', 'cancelled', 'needs_attention'] },
+              deliveryFeeStatus: { enum: ['not_quoted', 'quoted', 'collected', 'waived'] },
+              amountPesewas: { type: 'integer', minimum: 0 },
+              currency: { const: 'GHS' },
+              deliveryFee: { const: 'arranged_separately' },
+              receipt: {
+                type: 'object',
+                additionalProperties: false,
+                properties: { number: { type: 'string' }, url: { type: 'string', format: 'uri' } },
+              },
+            },
+          },
+        },
+      },
       ProductInput: { type: 'object', required: ['slug', 'name', 'categoryId'], properties: { slug: { type: 'string' }, name: { type: 'string' }, categoryId: { type: 'string' }, shortDescription: { type: 'string' }, description: { type: 'string' }, price: { type: 'number', minimum: 0 }, compareAtPrice: { type: 'number' }, images: { type: 'array', maxItems: 8, items: { $ref: '#/components/schemas/Image' } }, stockQuantity: { type: 'integer', minimum: 0 }, lowStockThreshold: { type: 'integer', minimum: 0 }, featured: { type: 'boolean' }, isNew: { type: 'boolean' }, isBestSeller: { type: 'boolean' }, complementaryCategoryIds: { type: 'array', items: { type: 'string' } }, details: { type: 'array', items: { type: 'string' } }, specifications: { type: 'array', items: { type: 'object', required: ['label', 'value'], properties: { label: { type: 'string' }, value: { type: 'string' } } } }, status: { enum: ['draft', 'active'] } } },
       ProductPatch: { allOf: [{ $ref: '#/components/schemas/ProductInput' }], description: 'All properties optional; slug is not accepted.' },
       AdminOrderSummary: {

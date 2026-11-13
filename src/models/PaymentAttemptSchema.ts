@@ -16,6 +16,7 @@ const paymentAttemptSchema = new Schema(
   {
     order: { type: Schema.Types.ObjectId, ref: 'Order', required: true, index: true },
     provider: { type: String, enum: ['paystack'], default: 'paystack', immutable: true },
+    source: { type: String, enum: ['kawama_storefront', 'whatsapp'], default: 'kawama_storefront', immutable: true },
     reference: { type: String, trim: true, required: true, immutable: true },
     amountPesewas: { type: Number, min: 0, required: true, immutable: true },
     currency: { type: String, enum: ['GHS'], default: 'GHS', immutable: true },

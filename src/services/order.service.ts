@@ -28,9 +28,18 @@ export interface PendingOrderDraft {
   paymentProvider: 'paystack';
   paymentStatus: 'pending';
   fulfillmentStatus: 'awaiting_payment';
+  source: 'kawama_storefront' | 'whatsapp';
 }
 
-export async function buildPendingOrderDraft(input: CheckoutInput, session?: ClientSession): Promise<PendingOrderDraft> {
+export interface BuildOrderDraftOptions {
+  source?: 'kawama_storefront' | 'whatsapp';
+}
+
+export async function buildPendingOrderDraft(
+  input: CheckoutInput,
+  session?: ClientSession,
+  options: BuildOrderDraftOptions = {},
+): Promise<PendingOrderDraft> {
   const productIds = input.items.map((item) => item.productId);
   const query = ProductModel.find({ _id: { $in: productIds }, status: 'active' });
   if (session) query.session(session);
@@ -85,5 +94,6 @@ export async function buildPendingOrderDraft(input: CheckoutInput, session?: Cli
     paymentProvider: 'paystack',
     paymentStatus: 'pending',
     fulfillmentStatus: 'awaiting_payment',
+    source: options.source ?? 'kawama_storefront',
   };
 }

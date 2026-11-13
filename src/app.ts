@@ -16,7 +16,7 @@ import { authRouter } from './route/authRouter.js';
 import { createCheckoutRouter, createPaystackWebhookRouter } from './route/checkoutRouter.js';
 import { createChatRouter } from './route/chatRouter.js';
 import { createProductRouter } from './route/productRouter.js';
-import { orderBridgeRouter } from './route/orderbridgeRouter.js';
+import { createOrderBridgeRouter } from './route/orderbridgeRouter.js';
 import { publicRouter } from './route/publicRouter.js';
 import { verifyDatabaseAdminToken, type AdminTokenVerifier } from './services/auth.service.js';
 import { runShoppingChat } from './services/chat.service.js';
@@ -152,7 +152,7 @@ export function createApp(dependencies: ApplicationDependencies = {}) {
   app.use(
     '/api/integrations/orderbridge',
     createOrderBridgeAuthentication(dependencies.orderBridgeApiKey ?? environment.ORDERBRIDGE_API_KEY),
-    orderBridgeRouter,
+    createOrderBridgeRouter(selectedPaystackGateway),
   );
   app.use('/api/v1', publicRouter);
   app.use(
